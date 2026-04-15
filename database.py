@@ -43,7 +43,7 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
 
-            -- ── Engage-for-Engage tables ─────────────────────────────
+            -- ── Engage-for-Engage tables (regular users) ─────────────
             CREATE TABLE IF NOT EXISTS engage_links (
                 link_id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id         INTEGER NOT NULL,
@@ -65,6 +65,28 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
 
+            -- ── Engage-for-Engage tables (creators) ──────────────────
+            CREATE TABLE IF NOT EXISTS creator_engage_links (
+                link_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                tweet_link      TEXT NOT NULL,
+                source          TEXT NOT NULL DEFAULT 'submit',
+                submitted_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at      TIMESTAMP NOT NULL,
+                active          INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
+            CREATE TABLE IF NOT EXISTS creator_engage_participation (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                link_id         INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                tasks_completed TEXT,
+                points_earned   INTEGER NOT NULL DEFAULT 0,
+                confirmed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (link_id) REFERENCES creator_engage_links(link_id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
+
             -- ── Config table (central settings) ─────────────────────
             CREATE TABLE IF NOT EXISTS config (
                 key             TEXT PRIMARY KEY,
@@ -74,6 +96,7 @@ def init_db():
 
         # Default config values (only inserted if not already set)
         defaults = {
+            # regular user pool
             "engage_link_lifetime_hours": "24",
             "engage_links_per_request": "10",
             "engage_daily_limit": "0",
@@ -82,6 +105,13 @@ def init_db():
             "engage_weight_comment": "40.0",
             "engage_weight_retweet": "47.5",
             "engage_points_per_link": "10",
+            # creator pool
+            "creator_engage_link_lifetime_hours": "24",
+            "creator_engage_links_per_request": "10",
+            "creator_engage_points_per_link": "10",
+            "creator_engage_weight_like": "12.5",
+            "creator_engage_weight_comment": "40.0",
+            "creator_engage_weight_retweet": "47.5",
         }
         for k, v in defaults.items():
             try:
@@ -97,6 +127,7 @@ def init_db():
             "ALTER TABLE users ADD COLUMN x_username TEXT",
             "ALTER TABLE users ADD COLUMN x_username_set_at TIMESTAMP",
             "ALTER TABLE users ADD COLUMN engage_points INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN creator_engage_points INTEGER NOT NULL DEFAULT 0",
         ]:
             try:
                 conn.execute(migration)
