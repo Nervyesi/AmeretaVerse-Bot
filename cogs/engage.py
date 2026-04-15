@@ -2,17 +2,16 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import json
-import random
 import re
-from datetime import datetime, timezone, timedelta, time as dtime
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass, field
 from database import get_connection
 
 LOGO_URL = "https://i.imgur.com/FNE8Li0.png"
-PROGRESS_BAR_URL = "https://i.imgur.com/5Mg2BIE.png"
 ENGAGE_CHANNEL_NAME = "engage"
 
 
-# ── config helper ─────────────────────────────────────────────────────────────
+# ── config helpers ─────────────────────────────────────────────────────────────
 
 def get_config(key: str, default: str = "0") -> str:
     with get_connection() as conn:
@@ -28,36 +27,20 @@ def get_config_float(key: str, default: float = 0.0) -> float:
     return float(get_config(key, str(default)))
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────────
 
-def extract_tweet_id(url: str) -> str | None:
-    match = re.search(r"/status/(\d+)", url)
-    return match.group(1) if match else None
+def extract_twitter_handle(url: str) -> str:
+    match = re.search(r"https?://(?:x\.com|twitter\.com)/(\w+)/status/", url)
+    return match.group(1) if match else "unknown"
 
 
 def validate_tweet_link(url: str) -> bool:
     return bool(re.match(r"https?://(x\.com|twitter\.com)/\w+/status/\d+", url))
 
 
-# In-memory toggle state: {(link_id, user_id): set[str]}
-engage_states: dict = {}
-
-
-def toggle_engage_task(link_id: int, user_id: int, task: str) -> set:
-    key = (link_id, user_id)
-    s = engage_states.setdefault(key, set())
-    s.discard(task) if task in s else s.add(task)
-    return s
-
-
-def get_engage_state(link_id: int, user_id: int) -> set:
-    return engage_states.get((link_id, user_id), set())
-
-
 def calc_engage_points(done: set) -> int:
-    """Calculate engage points based on config weights."""
     weights = {
-        "like": get_config_float("engage_weight_like", 12.5),
+        "like":    get_config_float("engage_weight_like", 12.5),
         "comment": get_config_float("engage_weight_comment", 40.0),
         "retweet": get_config_float("engage_weight_retweet", 47.5),
     }
@@ -79,16 +62,8 @@ def upsert_user(user_id: int, username: str):
 
 
 def get_available_links(user_id: int, limit: int = 10) -> list:
-    """
-    Get links for a user to engage with:
-    1. Links submitted by OTHER users (not self)
-    2. Unfinished raid links (user hasn't participated in those raids)
-    3. Exclude links the user already engaged with
-    4. Only active, non-expired links
-    """
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
-        # Get engage links from other users, not yet engaged by this user
         submitted_links = conn.execute(
             """
             SELECT el.link_id, el.tweet_link, el.user_id AS owner_id, 'engage' AS source
@@ -106,8 +81,6 @@ def get_available_links(user_id: int, limit: int = 10) -> list:
         ).fetchall()
 
         remaining = limit - len(submitted_links)
-
-        # Fill remaining slots with unfinished raid links
         raid_links = []
         if remaining > 0:
             raid_links = conn.execute(
@@ -133,185 +106,277 @@ def get_available_links(user_id: int, limit: int = 10) -> list:
     return list(submitted_links) + list(raid_links)
 
 
-# ── per-link task panel ──────────────────────────────────────────────────────
+# ── session state ──────────────────────────────────────────────────────────────
 
-class EngageLinkView(discord.ui.View):
-    """Ephemeral panel for a single link — toggle tasks and confirm."""
+@dataclass
+class EngageSession:
+    links: list
+    index: int = 0
+    task_state: dict = field(default_factory=dict)  # index -> set[str]
+    submitted: dict = field(default_factory=dict)   # index -> points_earned
+    skipped: set = field(default_factory=set)        # indices the user Next'd past
 
-    def __init__(self, link_id: int, user_id: int, tweet_link: str, source: str):
-        super().__init__(timeout=600)
-        self.link_id = link_id
+    def current_link(self):
+        return self.links[self.index] if self.index < len(self.links) else None
+
+    def is_done(self) -> bool:
+        return self.index >= len(self.links)
+
+    def total_points(self) -> int:
+        return sum(self.submitted.values())
+
+    def toggle_task(self, task: str):
+        s = self.task_state.setdefault(self.index, set())
+        s.discard(task) if task in s else s.add(task)
+
+    def current_tasks(self) -> set:
+        return self.task_state.get(self.index, set())
+
+
+# user_id -> EngageSession
+active_sessions: dict[int, EngageSession] = {}
+
+
+# ── step 2: list view ─────────────────────────────────────────────────────────
+
+class EngageListView(discord.ui.View):
+    """Shows the tweet list and a single 'Start Engage' button."""
+
+    def __init__(self, user_id: int, session: EngageSession):
+        super().__init__(timeout=300)
         self.user_id = user_id
-        self.tweet_link = tweet_link
-        self.source = source  # 'engage' or 'raid'
+        self.session = session
+
+    @discord.ui.button(label="Start Engage ⚡", style=discord.ButtonStyle.success, row=0)
+    async def start_engage(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This is not your panel.", ephemeral=True)
+            return
+        self.session.index = 0
+        view = EngageTweetView(self.user_id, self.session)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    async def on_timeout(self):
+        active_sessions.pop(self.user_id, None)
+
+
+# ── steps 3-5: per-tweet view ─────────────────────────────────────────────────
+
+class EngageTweetView(discord.ui.View):
+    """Toggle tasks and navigate through the tweet queue."""
+
+    def __init__(self, user_id: int, session: EngageSession):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.session = session
         self._rebuild()
 
     def _rebuild(self):
         self.clear_items()
-        state = get_engage_state(self.link_id, self.user_id)
-        TASK_META = [
-            ("like",    "👍 Like"),
-            ("comment", "💬 Comment"),
-            ("retweet", "🔁 Retweet"),
-        ]
-        for task, label in TASK_META:
-            active = task in state
+        tasks = self.session.current_tasks()
+        index = self.session.index
+
+        # Row 0: task toggle buttons
+        for task, label, emoji in [
+            ("like",    "Like",    "👍"),
+            ("comment", "Comment", "💬"),
+            ("retweet", "Retweet", "🔁"),
+        ]:
+            active = task in tasks
             btn = discord.ui.Button(
-                label=label,
-                style=discord.ButtonStyle.success if active else discord.ButtonStyle.primary,
+                label=f"{emoji} {label}",
+                style=discord.ButtonStyle.success if active else discord.ButtonStyle.secondary,
                 row=0,
             )
             btn.callback = self._make_toggle(task)
             self.add_item(btn)
 
-        confirm = discord.ui.Button(
-            label="Confirm",
-            style=discord.ButtonStyle.success,
-            emoji="✅",
-            row=0,
+        # Row 1: navigation buttons
+        prev_btn = discord.ui.Button(
+            label="◀ Previous",
+            style=discord.ButtonStyle.primary,
+            disabled=(index == 0),
+            row=1,
         )
-        confirm.callback = self._confirm
-        self.add_item(confirm)
+        prev_btn.callback = self._on_prev
+        self.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(
+            label="Next ▶",
+            style=discord.ButtonStyle.primary,
+            row=1,
+        )
+        next_btn.callback = self._on_next
+        self.add_item(next_btn)
+
+        submit_btn = discord.ui.Button(
+            label="Submit ✅",
+            style=discord.ButtonStyle.success,
+            row=1,
+        )
+        submit_btn.callback = self._on_submit
+        self.add_item(submit_btn)
+
+    def build_embed(self) -> discord.Embed:
+        session = self.session
+        if session.is_done():
+            return self._summary_embed()
+
+        index = session.index
+        link = session.current_link()
+        total = len(session.links)
+        handle = extract_twitter_handle(link["tweet_link"])
+        tasks = session.current_tasks()
+
+        check = {t: "✅" if t in tasks else "⬜" for t in ("like", "comment", "retweet")}
+        pts = calc_engage_points(tasks)
+
+        already = index in session.submitted
+        status_note = f"\n✔ Submitted (+{session.submitted[index]} pts)" if already else ""
+
+        embed = discord.Embed(
+            title=f"Tweet {index + 1} of {total} ⚡",
+            color=0x94730D,
+        )
+        embed.add_field(
+            name=f"@{handle}",
+            value=f"[Open Tweet]({link['tweet_link']})\n`{link['tweet_link']}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="Tasks",
+            value=f"{check['like']} Like\n{check['comment']} Comment\n{check['retweet']} Retweet",
+            inline=True,
+        )
+        embed.add_field(
+            name="Points Preview",
+            value=f"`+{pts} pts`{status_note}",
+            inline=True,
+        )
+        embed.set_footer(text="AmeretaVerse • Engage-for-Engage | Toggle tasks → Submit  |  Next to skip")
+        return embed
+
+    def _summary_embed(self) -> discord.Embed:
+        session = self.session
+        total_pts = session.total_points()
+        lines = []
+        for i, link in enumerate(session.links):
+            handle = extract_twitter_handle(link["tweet_link"])
+            if i in session.submitted:
+                lines.append(f"✅ @{handle} — +{session.submitted[i]} pts")
+            elif i in session.skipped:
+                lines.append(f"⏭ @{handle} — skipped")
+            else:
+                lines.append(f"⬜ @{handle} — not reached")
+
+        embed = discord.Embed(
+            title="engage session complete. 🔥",
+            description="\n".join(lines),
+            color=0x94730D,
+        )
+        embed.add_field(name="Engaged", value=f"`{len(session.submitted)}`", inline=True)
+        embed.add_field(name="Skipped", value=f"`{len(session.skipped)}`", inline=True)
+        embed.add_field(name="Total Points", value=f"`+{total_pts} pts`", inline=True)
+        embed.set_thumbnail(url=LOGO_URL)
+        embed.set_footer(text="AmeretaVerse • Engage-for-Engage | keep grinding, habibi 💰")
+        return embed
 
     def _make_toggle(self, task: str):
         async def callback(interaction: discord.Interaction):
             if interaction.user.id != self.user_id:
-                await interaction.response.send_message("❌ This is not your panel.", ephemeral=True)
+                await interaction.response.send_message("❌ Not your panel.", ephemeral=True)
                 return
-            toggle_engage_task(self.link_id, self.user_id, task)
+            self.session.toggle_task(task)
             self._rebuild()
-            await interaction.response.edit_message(
-                embed=self._status_embed(),
-                view=self,
-            )
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
         return callback
 
-    def _status_embed(self) -> discord.Embed:
-        state = get_engage_state(self.link_id, self.user_id)
-        lines = []
-        for t in ["like", "comment", "retweet"]:
-            icon = "✅" if t in state else "⬜"
-            lines.append(f"{icon} {t.capitalize()}")
-        pts = calc_engage_points(state)
-        embed = discord.Embed(
-            title="engage this tweet 🔗",
-            description=(
-                f"**[Open Tweet]({self.tweet_link})**\n\n"
-                + "\n".join(lines)
-                + f"\n\n**Points:** `+{pts}` engage pts"
-            ),
-            color=0x94730D,
-        )
-        embed.set_footer(text="AmeretaVerse • Engage-for-Engage")
-        return embed
-
-    async def _confirm(self, interaction: discord.Interaction):
+    async def _on_prev(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ This is not your panel.", ephemeral=True)
+            await interaction.response.send_message("❌ Not your panel.", ephemeral=True)
+            return
+        if self.session.index > 0:
+            self.session.index -= 1
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_next(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your panel.", ephemeral=True)
+            return
+        self.session.skipped.add(self.session.index)
+        self.session.index += 1
+        if self.session.is_done():
+            active_sessions.pop(self.user_id, None)
+            self.stop()
+            await interaction.response.edit_message(embed=self.build_embed(), view=None)
+        else:
+            self._rebuild()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your panel.", ephemeral=True)
             return
 
-        state = get_engage_state(self.link_id, self.user_id)
-        if not state:
-            await interaction.response.edit_message(
-                content="⚠️ Select at least one task first.", embed=None, view=None
+        tasks = self.session.current_tasks()
+        if not tasks:
+            await interaction.response.send_message(
+                "⚠️ Toggle at least one task before submitting, habibi.", ephemeral=True
             )
             return
 
-        # Check if already participated
+        index = self.session.index
+        link = self.session.current_link()
+        points = calc_engage_points(tasks)
+        user_id = interaction.user.id
+
+        upsert_user(user_id, str(interaction.user))
         with get_connection() as conn:
             existing = conn.execute(
-                "SELECT id FROM engage_participation WHERE link_id=? AND user_id=?",
-                (self.link_id, self.user_id),
+                "SELECT id, points_earned FROM engage_participation WHERE link_id=? AND user_id=?",
+                (link["link_id"], user_id),
             ).fetchone()
 
-        if existing:
-            await interaction.response.edit_message(
-                content="⚠️ You already engaged with this link.", embed=None, view=None
-            )
-            return
-
-        points = calc_engage_points(state)
-
-        upsert_user(interaction.user.id, str(interaction.user))
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO engage_participation (link_id, user_id, tasks_completed, points_earned) "
-                "VALUES (?,?,?,?)",
-                (self.link_id, self.user_id, json.dumps(sorted(state)), points),
-            )
-            conn.execute(
-                "UPDATE users SET engage_points = engage_points + ? WHERE user_id=?",
-                (points, self.user_id),
-            )
-
-        engage_states.pop((self.link_id, self.user_id), None)
-
-        embed = discord.Embed(
-            title="engaged. 🔥",
-            description=(
-                f"Tasks: {', '.join(t.capitalize() for t in sorted(state))}\n"
-                f"**+{points} engage points** credited.\n\n"
-                f"keep grinding, habibi. 💰"
-            ),
-            color=0x94730D,
-        )
-        embed.set_footer(text="AmeretaVerse • Engage-for-Engage")
-        await interaction.response.edit_message(content=None, embed=embed, view=None)
-
-
-# ── link selector (dropdown) ────────────────────────────────────────────────
-
-class LinkSelectView(discord.ui.View):
-    """Shows available links as a select dropdown."""
-
-    def __init__(self, user_id: int, links: list):
-        super().__init__(timeout=300)
-        self.user_id = user_id
-        self.links = links
-
-        options = []
-        for i, link in enumerate(links):
-            tweet_id = extract_tweet_id(link["tweet_link"]) or "unknown"
-            short_id = tweet_id[-8:]  # last 8 digits
-            source_tag = "📌 Raid" if link["source"] == "raid" else "🔗 User"
-            options.append(
-                discord.SelectOption(
-                    label=f"{source_tag} — ...{short_id}",
-                    description=link["tweet_link"][:80],
-                    value=str(i),
+            if existing:
+                old_pts = existing["points_earned"]
+                conn.execute(
+                    "UPDATE engage_participation SET tasks_completed=?, points_earned=? "
+                    "WHERE link_id=? AND user_id=?",
+                    (json.dumps(sorted(tasks)), points, link["link_id"], user_id),
                 )
-            )
+                conn.execute(
+                    "UPDATE users SET engage_points = engage_points + ? WHERE user_id=?",
+                    (points - old_pts, user_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO engage_participation (link_id, user_id, tasks_completed, points_earned) "
+                    "VALUES (?,?,?,?)",
+                    (link["link_id"], user_id, json.dumps(sorted(tasks)), points),
+                )
+                conn.execute(
+                    "UPDATE users SET engage_points = engage_points + ? WHERE user_id=?",
+                    (points, user_id),
+                )
 
-        select = discord.ui.Select(
-            placeholder="pick a tweet to engage with 👇",
-            options=options,
-            min_values=1,
-            max_values=1,
-        )
-        select.callback = self._on_select
-        self.add_item(select)
+        self.session.submitted[index] = points
+        self.session.skipped.discard(index)
+        self.session.index += 1
 
-    async def _on_select(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ This is not your panel.", ephemeral=True)
-            return
+        if self.session.is_done():
+            active_sessions.pop(self.user_id, None)
+            self.stop()
+            await interaction.response.edit_message(embed=self.build_embed(), view=None)
+        else:
+            self._rebuild()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-        idx = int(interaction.data["values"][0])
-        link = self.links[idx]
-
-        view = EngageLinkView(
-            link_id=link["link_id"],
-            user_id=self.user_id,
-            tweet_link=link["tweet_link"],
-            source=link["source"],
-        )
-        await interaction.response.edit_message(
-            embed=view._status_embed(),
-            view=view,
-        )
+    async def on_timeout(self):
+        active_sessions.pop(self.user_id, None)
 
 
-# ── submit link modal ────────────────────────────────────────────────────────
+# ── submit modal ───────────────────────────────────────────────────────────────
 
 class SubmitLinkModal(discord.ui.Modal, title="Submit Your Tweet 🔗"):
     tweet_link = discord.ui.TextInput(
@@ -332,27 +397,23 @@ class SubmitLinkModal(discord.ui.Modal, title="Submit Your Tweet 🔗"):
             )
             return
 
-        # Check submit cost
         cost = get_config_int("engage_submit_cost", 0)
         if cost > 0:
             with get_connection() as conn:
                 user = conn.execute(
-                    "SELECT engage_points FROM users WHERE user_id=?",
-                    (interaction.user.id,),
+                    "SELECT engage_points FROM users WHERE user_id=?", (interaction.user.id,)
                 ).fetchone()
             current_pts = user["engage_points"] if user else 0
             if current_pts < cost:
                 await interaction.response.send_message(
-                    f"❌ You need **{cost} engage points** to submit a link. "
-                    f"You have **{current_pts}**.\n"
-                    f"Use `/engage` to earn more points first.",
+                    f"❌ Need **{cost} engage points** to submit. You have **{current_pts}**.\n"
+                    f"Use `/engage` to earn more first.",
                     ephemeral=True,
                 )
                 return
 
-        # Check duplicate active link
+        now = datetime.now(timezone.utc).isoformat()
         with get_connection() as conn:
-            now = datetime.now(timezone.utc).isoformat()
             dup = conn.execute(
                 "SELECT link_id FROM engage_links WHERE tweet_link=? AND active=1 AND expires_at>?",
                 (url, now),
@@ -360,12 +421,10 @@ class SubmitLinkModal(discord.ui.Modal, title="Submit Your Tweet 🔗"):
 
         if dup:
             await interaction.response.send_message(
-                "⚠️ This tweet is already in the engage pool.",
-                ephemeral=True,
+                "⚠️ This tweet is already in the engage pool.", ephemeral=True
             )
             return
 
-        # Submit
         lifetime = get_config_int("engage_link_lifetime_hours", 24)
         expires = datetime.now(timezone.utc) + timedelta(hours=lifetime)
 
@@ -375,7 +434,6 @@ class SubmitLinkModal(discord.ui.Modal, title="Submit Your Tweet 🔗"):
                 "INSERT INTO engage_links (user_id, tweet_link, source, expires_at) VALUES (?,?,?,?)",
                 (interaction.user.id, url, "submit", expires.isoformat()),
             )
-            # Deduct cost if set
             if cost > 0:
                 conn.execute(
                     "UPDATE users SET engage_points = engage_points - ? WHERE user_id=?",
@@ -389,7 +447,7 @@ class SubmitLinkModal(discord.ui.Modal, title="Submit Your Tweet 🔗"):
                 f"**Link:** {url}\n"
                 f"**Expires in:** {lifetime}h\n"
                 + (f"**Cost:** -{cost} engage pts\n" if cost > 0 else "")
-                + "\nother users will engage with it. let's grow together. 🔥"
+                + "\nothers will engage with it. let's grow together. 🔥"
             ),
             color=0x94730D,
         )
@@ -398,7 +456,7 @@ class SubmitLinkModal(discord.ui.Modal, title="Submit Your Tweet 🔗"):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── cog ──────────────────────────────────────────────────────────────────────
+# ── cog ────────────────────────────────────────────────────────────────────────
 
 class EngageCog(commands.Cog):
     def __init__(self, bot):
@@ -408,11 +466,20 @@ class EngageCog(commands.Cog):
     def cog_unload(self):
         self.cleanup_expired.cancel()
 
-    # ── /engage ────────────────────────────────────────────────────────────────
+    # ── /engage ───────────────────────────────────────────────────────────────
 
     @app_commands.command(name="engage", description="Get tweets to engage with and earn points")
     async def engage(self, interaction: discord.Interaction):
-        # Check daily limit
+        if (
+            not isinstance(interaction.channel, discord.TextChannel)
+            or interaction.channel.name != ENGAGE_CHANNEL_NAME
+        ):
+            await interaction.response.send_message(
+                f"❌ Use `/engage` in the **#{ENGAGE_CHANNEL_NAME}** channel only.",
+                ephemeral=True,
+            )
+            return
+
         daily_limit = get_config_int("engage_daily_limit", 0)
         if daily_limit > 0:
             today_start = datetime.now(timezone.utc).replace(
@@ -426,7 +493,7 @@ class EngageCog(commands.Cog):
                 ).fetchone()
             if today_count and today_count["c"] >= daily_limit:
                 await interaction.response.send_message(
-                    f"⏳ You've hit your daily engage limit (**{daily_limit}** today). "
+                    f"⏳ You've hit your daily limit (**{daily_limit}** today). "
                     f"Come back tomorrow, habibi.",
                     ephemeral=True,
                 )
@@ -449,60 +516,81 @@ class EngageCog(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
+        session = EngageSession(links=[dict(lnk) for lnk in links])
+        active_sessions[interaction.user.id] = session
+
+        # Build tweet list embed — handle above, link below
+        lines = []
+        for i, lnk in enumerate(links, 1):
+            handle = extract_twitter_handle(lnk["tweet_link"])
+            source_tag = "📌" if lnk["source"] == "raid" else "🔗"
+            lines.append(f"**{i}.** {source_tag} `@{handle}`\n{lnk['tweet_link']}")
+
         embed = discord.Embed(
-            title=f"engage time. ⚡ ({len(links)} tweets)",
-            description=(
-                "Pick a tweet from the dropdown below.\n"
-                "Engage with it, select what you did, hit confirm.\n"
-                "Each tweet earns you **engage points**. 💰\n\n"
-                "📌 = raid tweet  •  🔗 = user submitted"
-            ),
+            title=f"engage time. ⚡ — {len(links)} tweets ready",
+            description="\n\n".join(lines),
             color=0x94730D,
         )
         embed.set_thumbnail(url=LOGO_URL)
-        embed.set_footer(text="AmeretaVerse • Engage-for-Engage")
+        embed.set_footer(text="AmeretaVerse • Engage-for-Engage | 📌 raid  •  🔗 user submitted")
 
-        view = LinkSelectView(interaction.user.id, links)
+        view = EngageListView(interaction.user.id, session)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    # ── /submit ────────────────────────────────────────────────────────────────
+    # ── /submit ───────────────────────────────────────────────────────────────
 
     @app_commands.command(name="submit", description="Submit your tweet for others to engage with")
     async def submit(self, interaction: discord.Interaction):
+        if (
+            not isinstance(interaction.channel, discord.TextChannel)
+            or interaction.channel.name != ENGAGE_CHANNEL_NAME
+        ):
+            await interaction.response.send_message(
+                f"❌ Use `/submit` in the **#{ENGAGE_CHANNEL_NAME}** channel only.",
+                ephemeral=True,
+            )
+            return
         modal = SubmitLinkModal()
         await interaction.response.send_modal(modal)
 
-    # ── /engage-stats ──────────────────────────────────────────────────────────
+    # ── /engage-stats ─────────────────────────────────────────────────────────
 
     @app_commands.command(name="engage-stats", description="View your engage points and stats")
     @app_commands.describe(member="Member to look up (defaults to yourself)")
-    async def engage_stats(self, interaction: discord.Interaction, member: discord.Member = None):
+    async def engage_stats(
+        self, interaction: discord.Interaction, member: discord.Member = None
+    ):
         target = member or interaction.user
         with get_connection() as conn:
             user = conn.execute(
                 "SELECT engage_points FROM users WHERE user_id=?", (target.id,)
             ).fetchone()
-            engages_done = conn.execute(
+            done_count = conn.execute(
                 "SELECT COUNT(*) as c FROM engage_participation WHERE user_id=?", (target.id,)
             ).fetchone()
-            links_submitted = conn.execute(
+            sub_count = conn.execute(
                 "SELECT COUNT(*) as c FROM engage_links WHERE user_id=?", (target.id,)
             ).fetchone()
 
         points = user["engage_points"] if user else 0
-        done_count = engages_done["c"] if engages_done else 0
-        submitted_count = links_submitted["c"] if links_submitted else 0
-
         name = "your" if target == interaction.user else f"{target.display_name}'s"
         embed = discord.Embed(title=f"{name} engage stats ⚡", color=0x94730D)
         embed.add_field(name="Engage Points", value=f"`{points} pts`", inline=True)
-        embed.add_field(name="Tweets Engaged", value=f"`{done_count}`", inline=True)
-        embed.add_field(name="Links Submitted", value=f"`{submitted_count}`", inline=True)
+        embed.add_field(
+            name="Tweets Engaged",
+            value=f"`{done_count['c'] if done_count else 0}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Links Submitted",
+            value=f"`{sub_count['c'] if sub_count else 0}`",
+            inline=True,
+        )
         embed.set_thumbnail(url=target.display_avatar.url)
         embed.set_footer(text="AmeretaVerse • Engage-for-Engage")
         await interaction.response.send_message(embed=embed)
 
-    # ── /engage-leaderboard ────────────────────────────────────────────────────
+    # ── /engage-leaderboard ───────────────────────────────────────────────────
 
     @app_commands.command(name="engage-leaderboard", description="Top 10 users by engage points")
     async def engage_leaderboard(self, interaction: discord.Interaction):
@@ -535,19 +623,16 @@ class EngageCog(commands.Cog):
     # ── /engage-config (admin) ────────────────────────────────────────────────
 
     @app_commands.command(name="engage-config", description="View or change engage settings (admin)")
-    @app_commands.describe(
-        setting="Which setting to change",
-        value="New value",
-    )
+    @app_commands.describe(setting="Which setting to change", value="New value")
     @app_commands.choices(setting=[
         app_commands.Choice(name="Link lifetime (hours)", value="engage_link_lifetime_hours"),
-        app_commands.Choice(name="Links per /engage", value="engage_links_per_request"),
+        app_commands.Choice(name="Links per /engage",     value="engage_links_per_request"),
         app_commands.Choice(name="Daily limit (0=unlimited)", value="engage_daily_limit"),
         app_commands.Choice(name="Submit cost (points)", value="engage_submit_cost"),
-        app_commands.Choice(name="Points per link", value="engage_points_per_link"),
-        app_commands.Choice(name="Weight: Like %", value="engage_weight_like"),
-        app_commands.Choice(name="Weight: Comment %", value="engage_weight_comment"),
-        app_commands.Choice(name="Weight: Retweet %", value="engage_weight_retweet"),
+        app_commands.Choice(name="Points per link",       value="engage_points_per_link"),
+        app_commands.Choice(name="Weight: Like %",        value="engage_weight_like"),
+        app_commands.Choice(name="Weight: Comment %",     value="engage_weight_comment"),
+        app_commands.Choice(name="Weight: Retweet %",     value="engage_weight_retweet"),
     ])
     @app_commands.default_permissions(administrator=True)
     async def engage_config(
@@ -567,7 +652,6 @@ class EngageCog(commands.Cog):
                 f"✅ **{setting.name}** set to `{value}`.", ephemeral=True
             )
         else:
-            # Show all config
             with get_connection() as conn:
                 rows = conn.execute(
                     "SELECT key, value FROM config WHERE key LIKE 'engage_%' ORDER BY key"
@@ -578,19 +662,19 @@ class EngageCog(commands.Cog):
                 description="\n".join(lines) or "No settings found.",
                 color=0x94730D,
             )
-            embed.set_footer(text="AmeretaVerse • Engage-for-Engage | Use /engage-config to change")
+            embed.set_footer(
+                text="AmeretaVerse • Engage-for-Engage | Use /engage-config to change"
+            )
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── cleanup expired links ────────────────────────────────────────────────
+    # ── cleanup expired links ──────────────────────────────────────────────────
 
     @tasks.loop(hours=1)
     async def cleanup_expired(self):
-        """Deactivate expired engage links every hour."""
         now = datetime.now(timezone.utc).isoformat()
         with get_connection() as conn:
             conn.execute(
-                "UPDATE engage_links SET active=0 WHERE active=1 AND expires_at<=?",
-                (now,),
+                "UPDATE engage_links SET active=0 WHERE active=1 AND expires_at<=?", (now,)
             )
 
     @cleanup_expired.before_loop
