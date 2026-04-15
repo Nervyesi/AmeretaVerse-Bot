@@ -306,6 +306,18 @@ async def _process_confirm(interaction: discord.Interaction, raid_id: int, ephem
         return
 
     with get_connection() as conn:
+        user_row = conn.execute(
+            "SELECT x_username FROM users WHERE user_id=?", (interaction.user.id,)
+        ).fetchone()
+    if not user_row or not user_row["x_username"]:
+        msg = "⚠️ you need to link your X account first, habibi. use /setx to set your username."
+        if ephemeral_edit:
+            await interaction.response.edit_message(content=msg, embed=None, view=None)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    with get_connection() as conn:
         existing = conn.execute(
             "SELECT id FROM raid_participation WHERE raid_id=? AND user_id=?",
             (raid_id, interaction.user.id),

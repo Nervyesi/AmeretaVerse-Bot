@@ -13,14 +13,18 @@ intents.presences = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-async def load_cogs():
+@bot.event
+async def setup_hook():
     await bot.load_extension('cogs.verify')
     await bot.load_extension('cogs.Maineroles')
     await bot.load_extension('cogs.creatorticket')
+    await bot.load_extension('cogs.raidbot')
+    await bot.load_extension('cogs.engage')
+    await bot.tree.sync()
+    print('Cogs loaded and command tree synced.')
 
 @bot.event
 async def on_ready():
-    await load_cogs()
     print(f'Bot is online: {bot.user}')
 
 bot.run(TOKEN)

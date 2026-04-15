@@ -480,6 +480,17 @@ class EngageCog(commands.Cog):
             )
             return
 
+        with get_connection() as conn:
+            user_row = conn.execute(
+                "SELECT x_username FROM users WHERE user_id=?", (interaction.user.id,)
+            ).fetchone()
+        if not user_row or not user_row["x_username"]:
+            await interaction.response.send_message(
+                "⚠️ you need to link your X account first, habibi. use /setx to set your username.",
+                ephemeral=True,
+            )
+            return
+
         daily_limit = get_config_int("engage_daily_limit", 0)
         if daily_limit > 0:
             today_start = datetime.now(timezone.utc).replace(
