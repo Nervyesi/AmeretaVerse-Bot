@@ -1,3 +1,4 @@
+import re
 import discord
 from discord.ext import commands
 import asyncio
@@ -122,18 +123,29 @@ class CreatorFormModal(discord.ui.Modal, title="Creator Application 🎯"):
         await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
 
 
-class TicketManageView(discord.ui.View):
-    def __init__(self, applicant_id):
-        super().__init__(timeout=None)
+# ---------------------------------------------------------------------------
+# DynamicItem buttons — applicant_id is embedded in each custom_id so the
+# bot can reconstruct the correct member reference after a restart without
+# needing bot.add_view(TicketManageView(0)).
+# ---------------------------------------------------------------------------
+
+class ApproveButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ticket_approve_(?P<id>[0-9]+)'):
+    def __init__(self, applicant_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Approve",
+                style=discord.ButtonStyle.success,
+                emoji="✅",
+                custom_id=f"ticket_approve_{applicant_id}"
+            )
+        )
         self.applicant_id = applicant_id
 
-    @discord.ui.button(
-        label="Approve",
-        style=discord.ButtonStyle.success,
-        emoji="✅",
-        custom_id="ticket_approve"
-    )
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match):
+        return cls(int(match.group('id')))
+
+    async def callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message(
                 "❌ Only admins can approve applications.", ephemeral=True
@@ -141,21 +153,21 @@ class TicketManageView(discord.ui.View):
             return
 
         member = interaction.guild.get_member(self.applicant_id)
+        print(f"[approve] applicant_id={self.applicant_id} member={member}")
         if member:
-            # Remove Creator Apply role
             creator_apply_role = discord.utils.get(interaction.guild.roles, name="Creator-apply")
+            print(f"[approve] Creator-apply role found: {creator_apply_role} | in member roles: {creator_apply_role in member.roles if creator_apply_role else 'N/A'}")
             if creator_apply_role and creator_apply_role in member.roles:
                 await member.remove_roles(creator_apply_role)
 
-            # Give Creator role
             creator_role = discord.utils.get(interaction.guild.roles, name="Creator")
+            print(f"[approve] Creator role found: {creator_role}")
             if creator_role:
                 await member.add_roles(creator_role)
 
-            # Notify the member
             try:
                 notify_embed = discord.Embed(
-                   title="you're in, creator. 🎯",
+                    title="you're in, creator. 🎯",
                     description=(
                         "application approved.\n\n"
                         "Creator hub is yours.\n"
@@ -167,6 +179,8 @@ class TicketManageView(discord.ui.View):
                 await member.send(embed=notify_embed)
             except discord.Forbidden:
                 pass
+            except Exception as e:
+                print(f"[approve] Exception sending DM: {e}")
 
         embed = discord.Embed(
             title="✅ Application Approved",
@@ -176,13 +190,24 @@ class TicketManageView(discord.ui.View):
         embed.set_footer(text="AmeretaVerse • Creator Applications")
         await interaction.response.send_message(embed=embed)
 
-    @discord.ui.button(
-        label="Reject",
-        style=discord.ButtonStyle.danger,
-        emoji="❌",
-        custom_id="ticket_reject"
-    )
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+class RejectButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ticket_reject_(?P<id>[0-9]+)'):
+    def __init__(self, applicant_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Reject",
+                style=discord.ButtonStyle.danger,
+                emoji="❌",
+                custom_id=f"ticket_reject_{applicant_id}"
+            )
+        )
+        self.applicant_id = applicant_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match):
+        return cls(int(match.group('id')))
+
+    async def callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message(
                 "❌ Only admins can reject applications.", ephemeral=True
@@ -191,15 +216,13 @@ class TicketManageView(discord.ui.View):
 
         member = interaction.guild.get_member(self.applicant_id)
         if member:
-            # Remove Creator Apply role
             creator_apply_role = discord.utils.get(interaction.guild.roles, name="Creator-apply")
             if creator_apply_role and creator_apply_role in member.roles:
                 await member.remove_roles(creator_apply_role)
 
-            # Notify the member
             try:
                 notify_embed = discord.Embed(
-                   title="not this time, habibi. 🫡",
+                    title="not this time, habibi. 🫡",
                     description=(
                         "application didn't go through.\n\n"
                         "but the community is still yours,\n"
@@ -220,13 +243,24 @@ class TicketManageView(discord.ui.View):
         embed.set_footer(text="AmeretaVerse • Creator Applications")
         await interaction.response.send_message(embed=embed)
 
-    @discord.ui.button(
-        label="Close Ticket",
-        style=discord.ButtonStyle.secondary,
-        emoji="🔒",
-        custom_id="ticket_close"
-    )
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+class CloseButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ticket_close_(?P<id>[0-9]+)'):
+    def __init__(self, applicant_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Close Ticket",
+                style=discord.ButtonStyle.secondary,
+                emoji="🔒",
+                custom_id=f"ticket_close_{applicant_id}"
+            )
+        )
+        self.applicant_id = applicant_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match):
+        return cls(int(match.group('id')))
+
+    async def callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message(
                 "❌ Only admins can close tickets.", ephemeral=True
@@ -237,13 +271,24 @@ class TicketManageView(discord.ui.View):
         await asyncio.sleep(5)
         await interaction.channel.delete()
 
-    @discord.ui.button(
-        label="Add Member",
-        style=discord.ButtonStyle.primary,
-        emoji="➕",
-        custom_id="ticket_add"
-    )
-    async def add_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+class AddMemberButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ticket_add_(?P<id>[0-9]+)'):
+    def __init__(self, applicant_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Add Member",
+                style=discord.ButtonStyle.primary,
+                emoji="➕",
+                custom_id=f"ticket_add_{applicant_id}"
+            )
+        )
+        self.applicant_id = applicant_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match):
+        return cls(int(match.group('id')))
+
+    async def callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message(
                 "❌ Only admins can add members.", ephemeral=True
@@ -273,6 +318,15 @@ class TicketManageView(discord.ui.View):
             pass
 
 
+class TicketManageView(discord.ui.View):
+    def __init__(self, applicant_id: int):
+        super().__init__(timeout=None)
+        self.add_item(ApproveButton(applicant_id))
+        self.add_item(RejectButton(applicant_id))
+        self.add_item(CloseButton(applicant_id))
+        self.add_item(AddMemberButton(applicant_id))
+
+
 class ApplyButton(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -294,8 +348,8 @@ class ApplyButton(discord.ui.View):
 
         modal = CreatorFormModal()
         await interaction.response.send_modal(modal)
- 
- 
+
+
 class CreatorTicketCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -322,4 +376,4 @@ class CreatorTicketCog(commands.Cog):
 async def setup(bot):
     await bot.add_cog(CreatorTicketCog(bot))
     bot.add_view(ApplyButton())
-    bot.add_view(TicketManageView(0))
+    bot.add_dynamic_items(ApproveButton, RejectButton, CloseButton, AddMemberButton)
