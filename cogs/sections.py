@@ -4,17 +4,17 @@ from discord.ext import commands
 LOGO_URL = "https://i.imgur.com/FNE8Li0.png"
 
 SECTION_ROLE_NAMES = [
-    "Section-NFT",
-    "Section-Raid",
-    "Section-Trade",
-    "Section-Degen",
-    "Section-AI",
+    "NFTs",
+    "Engage",
+    "Trade",
+    "Degen",
+    "AI",
 ]
 
 SECTIONS = [
     {
         "label":          "NFTs | Culture | Collab",
-        "role":           "Section-NFT",
+        "role":           "NFTs",
         "custom_id":      "section_nft",
         "emoji":          "🎨",
         "get_confirm":    "joining the culture room, habibi?\n\nmints drop here. art talks here. collabs cook here.\nyour pfp game's about to level up.\n\ntap confirm — you're on the guest list.\ntap cancel — stay in the shadows.",
@@ -24,7 +24,7 @@ SECTIONS = [
     },
     {
         "label":          "Raid | Engage | Support",
-        "role":           "Section-Raid",
+        "role":           "Engage",
         "custom_id":      "section_raid",
         "emoji":          "⚔️",
         "get_confirm":    "suiting up for the frontline, habibi?\n\nraids. pushes. community warfare.\nwhen the squad moves, you move. no lurkers here.\n\ntap confirm — you're on the roster.\ntap cancel — stay on the bench.",
@@ -34,7 +34,7 @@ SECTIONS = [
     },
     {
         "label":          "Trade | Markets | News",
-        "role":           "Section-Trade",
+        "role":           "Trade",
         "custom_id":      "section_trade",
         "emoji":          "📈",
         "get_confirm":    "stepping into the trading floor, habibi?\n\ncharts. flows. macro moves. news that matters.\nno noise. just signal.\n\ntap confirm — you're watching the tape now.\ntap cancel — stay off the desk.",
@@ -44,7 +44,7 @@ SECTIONS = [
     },
     {
         "label":          "Degen | Alpha | Memes",
-        "role":           "Section-Degen",
+        "role":           "Degen",
         "custom_id":      "section_degen",
         "emoji":          "🃏",
         "get_confirm":    "entering the degen pit, habibi?\n\nalpha leaks. low caps. meme warfare.\nthis room is NOT for the weak hands.\npure chaos energy only.\n\ntap confirm — welcome to the jungle.\ntap cancel — go back to safety.",
@@ -54,7 +54,7 @@ SECTIONS = [
     },
     {
         "label":          "AI | Vibecoding",
-        "role":           "Section-AI",
+        "role":           "AI",
         "custom_id":      "section_ai",
         "emoji":          "🤖",
         "get_confirm":    "joining the build room, habibi?\n\nAI tools. vibe coding. ship-or-die energy.\nprompts fly. stacks stack. builders only.\n\ntap confirm — terminal's open.\ntap cancel — stay a user.",
