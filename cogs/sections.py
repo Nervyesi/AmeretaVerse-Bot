@@ -13,7 +13,7 @@ SECTION_ROLE_NAMES = [
 
 SECTIONS = [
     {
-        "label":          "NFTs | Culture | Collab",
+        "label":          "NFTs",
         "role":           "NFTs",
         "custom_id":      "section_nft",
         "emoji":          "🎨",
@@ -23,7 +23,7 @@ SECTIONS = [
         "remove_success": "role dropped. culture room locked behind you.\n\nthe gallery closes for now.\ncome back when your taste returns. (☞ﾟヮﾟ)☞",
     },
     {
-        "label":          "Raid | Engage | Support",
+        "label":          "Engage",
         "role":           "Engage",
         "custom_id":      "section_raid",
         "emoji":          "⚔️",
@@ -33,7 +33,7 @@ SECTIONS = [
         "remove_success": "role dropped. you're off the roster.\n\nthe war continues without you.\nhelmet's on the shelf — grab it when you're ready to fight again.",
     },
     {
-        "label":          "Trade | Markets | News",
+        "label":          "Trade",
         "role":           "Trade",
         "custom_id":      "section_trade",
         "emoji":          "📈",
@@ -43,7 +43,7 @@ SECTIONS = [
         "remove_success": "role dropped. desk's closed for you.\n\ncharts keep moving. markets don't wait.\ncome back when you're ready to trade again. 📉📈",
     },
     {
-        "label":          "Degen | Alpha | Memes",
+        "label":          "Degen",
         "role":           "Degen",
         "custom_id":      "section_degen",
         "emoji":          "🃏",
@@ -53,7 +53,7 @@ SECTIONS = [
         "remove_success": "role dropped. pit's behind you now.\n\nthe degens move on. the alpha keeps flowing.\nyou'll be back. they always come back. (☞ﾟヮﾟ)☞",
     },
     {
-        "label":          "AI | Vibecoding",
+        "label":          "AI",
         "role":           "AI",
         "custom_id":      "section_ai",
         "emoji":          "🤖",
@@ -65,37 +65,13 @@ SECTIONS = [
 ]
 
 SECTIONS_TEXT = (
-    "pick your poison, habibi.\n"
-    "five rooms. five vibes.\n"
-    "grab the ones you want — skip the ones you don't.\n"
-    "your pings, your rules. no noise you didn't sign up for.\n"
-    "changed your mind later? hit the button again, role's gone.\n"
-    "no commitment issues here. (☞ﾟヮﾟ)☞\n"
-    "━━━━━━━━━━━━━━━━━━━\n"
-    "🎨  **NFTs | Culture | Collab**\n"
-    "mints. drops. art that hits.\n"
-    "culture talk and collab plays.\n"
-    "if you live for the pfp game — you belong here.\n\n"
-    "⚔️  **Raid | Engage | Support**\n"
-    "the frontline, degen.\n"
-    "raids, engagement pushes, community power moves.\n"
-    "tag in when the squad calls. we move together.\n\n"
-    "📈  **Trade | Markets | News**\n"
-    "charts. flows. macro noise that matters.\n"
-    "market updates, trade ideas, what's moving and why.\n"
-    "for the ones watching the tape.\n\n"
-    "🃏  **Degen | Alpha | Memes**\n"
-    "the wild room.\n"
-    "alpha leaks, degen plays, meme warfare.\n"
-    "low cap gems, high cap dreams, zero chill.\n"
-    "enter at your own risk, habibi.\n\n"
-    "🤖  **AI | Vibecoding**\n"
-    "build season.\n"
-    "AI tools, vibe coding, ship-or-die energy.\n"
-    "prompts, stacks, launches, builders only.\n"
-    "━━━━━━━━━━━━━━━━━━━\n"
-    "tap what fits. skip what doesn't.\n"
-    "we'll ping you only where you asked to be."
+    "**five rooms, habibi. pick your pings.** 🎯\n\n"
+    "🎨  **NFTs | Culture | Collab** — mints, Giveaway, pfp game\n"
+    "⚔️  **Raid | Engage | Support** — Community points, Mutual support\n"
+    "📈  **Trade | Markets | News** — signal over noise\n"
+    "🃏  **Degen | Alpha | Memes** — alpha, low caps, chaos\n"
+    "🤖  **AI | Vibecoding** — builders only, ship or die\n\n"
+    "*tap to join. tap again to leave. no commitment.* (☞ﾟヮﾟ)☞"
 )
 
 
@@ -184,7 +160,7 @@ class SectionsView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="NFTs | Culture | Collab",
+        label="NFTs",
         style=discord.ButtonStyle.primary,
         custom_id="section_nft",
         emoji="🎨",
@@ -193,7 +169,7 @@ class SectionsView(discord.ui.View):
         await _handle_section_toggle(interaction, SECTIONS[0])
 
     @discord.ui.button(
-        label="Raid | Engage | Support",
+        label="Engage",
         style=discord.ButtonStyle.primary,
         custom_id="section_raid",
         emoji="⚔️",
@@ -202,7 +178,7 @@ class SectionsView(discord.ui.View):
         await _handle_section_toggle(interaction, SECTIONS[1])
 
     @discord.ui.button(
-        label="Trade | Markets | News",
+        label="Trade",
         style=discord.ButtonStyle.primary,
         custom_id="section_trade",
         emoji="📈",
@@ -211,7 +187,7 @@ class SectionsView(discord.ui.View):
         await _handle_section_toggle(interaction, SECTIONS[2])
 
     @discord.ui.button(
-        label="Degen | Alpha | Memes",
+        label="Degen",
         style=discord.ButtonStyle.primary,
         custom_id="section_degen",
         emoji="🃏",
@@ -220,7 +196,7 @@ class SectionsView(discord.ui.View):
         await _handle_section_toggle(interaction, SECTIONS[3])
 
     @discord.ui.button(
-        label="AI | Vibecoding",
+        label="AI",
         style=discord.ButtonStyle.primary,
         custom_id="section_ai",
         emoji="🤖",
