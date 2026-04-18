@@ -2,3 +2,7 @@ discord.py
 python-dotenv
 captcha
 Pillow
+fastapi
+uvicorn[standard]
+pyjwt
+aiohttp

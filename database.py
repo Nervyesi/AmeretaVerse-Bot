@@ -102,6 +102,16 @@ def init_db():
                 detail      TEXT,
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- ── OAuth sessions (dashboard login) ─────────────────────
+            CREATE TABLE IF NOT EXISTS oauth_sessions (
+                user_id       INTEGER PRIMARY KEY,
+                access_token  TEXT NOT NULL,
+                refresh_token TEXT NOT NULL DEFAULT '',
+                expires_at    TEXT NOT NULL,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
 
         # Default config values (only inserted if not already set)
