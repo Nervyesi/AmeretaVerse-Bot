@@ -92,6 +92,16 @@ def init_db():
                 key             TEXT PRIMARY KEY,
                 value           TEXT NOT NULL
             );
+
+            -- ── Protection action log ─────────────────────────────────
+            CREATE TABLE IF NOT EXISTS protection_actions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                user_id     INTEGER NOT NULL DEFAULT 0,
+                detail      TEXT,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
 
         # Default config values (only inserted if not already set)
@@ -112,6 +122,23 @@ def init_db():
             "creator_engage_weight_like": "12.5",
             "creator_engage_weight_comment": "40.0",
             "creator_engage_weight_retweet": "47.5",
+            # ── Protection module defaults ──────────────────────────
+            "protection_link_detection":          "1",
+            "protection_link_whitelist":           "twitter.com,x.com,discord.gg,youtube.com",
+            "protection_spam_detection":           "1",
+            "protection_spam_threshold":           "5",
+            "protection_spam_window":              "10",
+            "protection_suspicious_users":         "1",
+            "protection_suspicious_action":        "flag",
+            "protection_suspicious_account_age":   "7",
+            "protection_phishing_detection":       "1",
+            "protection_anti_raid":                "1",
+            "protection_anti_raid_threshold":      "10",
+            "protection_anti_raid_window":         "60",
+            "protection_banned_words":             "0",
+            "protection_banned_words_list":        "",
+            "protection_log_channel":              "mod-log",
+            "protection_mute_role":                "Muted",
         }
         for k, v in defaults.items():
             try:

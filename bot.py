@@ -21,6 +21,7 @@ async def setup_hook():
     await bot.load_extension('cogs.raidbot')
     await bot.load_extension('cogs.engage')
     await bot.load_extension('cogs.sections')
+    await bot.load_extension('cogs.protection')
     await bot.tree.sync()
     print('Cogs loaded and command tree synced.')
 
