@@ -112,6 +112,34 @@ def init_db():
                 created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- ── Analytics snapshots (daily rolled-up stats) ───────────
+            CREATE TABLE IF NOT EXISTS analytics_snapshots (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id          INTEGER NOT NULL,
+                snapshot_date     DATE NOT NULL,
+                member_count      INTEGER DEFAULT 0,
+                online_count      INTEGER DEFAULT 0,
+                verified_count    INTEGER DEFAULT 0,
+                message_count_24h INTEGER DEFAULT 0,
+                voice_minutes_24h INTEGER DEFAULT 0,
+                joins_24h         INTEGER DEFAULT 0,
+                leaves_24h        INTEGER DEFAULT 0,
+                created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, snapshot_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapshots_guild_date
+                ON analytics_snapshots(guild_id, snapshot_date DESC);
+
+            -- ── Intraday counters (auto-cleaned after 3 days) ─────────
+            CREATE TABLE IF NOT EXISTS message_counters (
+                guild_id      INTEGER NOT NULL,
+                date          DATE NOT NULL,
+                message_count INTEGER DEFAULT 0,
+                joins         INTEGER DEFAULT 0,
+                leaves        INTEGER DEFAULT 0,
+                PRIMARY KEY (guild_id, date)
+            );
         """)
 
         # Default config values (only inserted if not already set)

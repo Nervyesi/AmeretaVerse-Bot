@@ -7,7 +7,7 @@ The bot instance is shared via shared_bot.py so guild data is available live.
 import os
 import json
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 
 import aiohttp
@@ -269,65 +269,141 @@ async def server_stats(server_id: int, user: dict = Depends(get_current_user)):
 
 
 @app.get('/api/servers/{server_id}/analytics')
-async def server_analytics(server_id: int, user: dict = Depends(get_current_user)):
+async def server_analytics(
+    server_id: int,
+    timeframe: str = 'week',
+    user: dict = Depends(get_current_user),
+):
     """
-    Analytics from the database for this guild.
-    Returns real data for what's tracked; null for what isn't (message counts, voice).
+    Multi-timeframe analytics. Returns all four timeframe arrays at once.
+    Reads from analytics_snapshots + message_counters (populated by cogs/analytics.py).
     """
     require_guild_admin(user, server_id)
 
+    today = date.today()
+
+    def day_label(d):   return d.strftime('%a')
+    def date_label(d):  return d.strftime('%b ') + str(d.day)
+    def month_label(d): return d.strftime('%b')
+    def hour_label(h):  return f'{h:02d}:00'
+
     with get_connection() as conn:
-        # Member registrations over last 30 days
-        member_growth = conn.execute("""
-            SELECT date(created_at) as day, COUNT(*) as joins
-            FROM users
-            WHERE created_at >= date('now','-30 days')
-            GROUP BY day
-            ORDER BY day
-        """).fetchall()
+        # ── Pull snapshots ────────────────────────────────────────────────
+        snaps_7 = conn.execute("""
+            SELECT snapshot_date, member_count, joins_24h, leaves_24h, message_count_24h
+            FROM analytics_snapshots WHERE guild_id=?
+            ORDER BY snapshot_date DESC LIMIT 7
+        """, (server_id,)).fetchall()
 
-        # Points distributed over last 30 days (raids)
-        points_trend = conn.execute("""
-            SELECT date(confirmed_at) as day, SUM(points_earned) as points
-            FROM raid_participation
-            WHERE confirmed_at >= date('now','-30 days')
-            GROUP BY day
-            ORDER BY day
-        """).fetchall()
+        snaps_30 = conn.execute("""
+            SELECT snapshot_date, member_count, joins_24h, leaves_24h, message_count_24h
+            FROM analytics_snapshots WHERE guild_id=?
+            ORDER BY snapshot_date DESC LIMIT 30
+        """, (server_id,)).fetchall()
 
-        # Top chatters (by total_points as proxy)
+        snaps_12mo = conn.execute("""
+            SELECT strftime('%Y-%m', snapshot_date) as ym,
+                   AVG(member_count) as avg_members,
+                   SUM(message_count_24h) as total_msgs
+            FROM analytics_snapshots WHERE guild_id=?
+            GROUP BY ym ORDER BY ym DESC LIMIT 13
+        """, (server_id,)).fetchall()
+
+        first_snap = conn.execute("""
+            SELECT MIN(snapshot_date) as first_date
+            FROM analytics_snapshots WHERE guild_id=?
+        """, (server_id,)).fetchone()
+
+        # ── Leaderboard + raids + engage (always live) ────────────────────
         leaderboard = conn.execute("""
-            SELECT user_id, username, total_points
-            FROM users
-            ORDER BY total_points DESC
-            LIMIT 10
+            SELECT user_id, username, total_points FROM users
+            ORDER BY total_points DESC LIMIT 10
         """).fetchall()
 
-        # Raid activity
         raid_stats = conn.execute("""
-            SELECT
-                COUNT(*) as total_raids,
-                SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) as active_raids,
-                SUM(total_points) as total_points_offered
+            SELECT COUNT(*) as total_raids,
+                   SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) as active_raids,
+                   SUM(total_points) as total_points_offered
             FROM raids
         """).fetchone()
 
-        # E4E stats
         e4e_stats = conn.execute("""
             SELECT COUNT(*) as total_links,
                    SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) as active_links
             FROM engage_links
         """).fetchone()
 
-        e4e_participations = conn.execute("""
+        e4e_part = conn.execute("""
             SELECT COUNT(*) as total, SUM(points_earned) as points
             FROM engage_participation
         """).fetchone()
 
+    has_data = len(snaps_7) > 0 or len(snaps_30) > 0
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def build_week():
+        by_date = {r['snapshot_date']: r for r in snaps_7}
+        mg, msgs = [], []
+        for i in range(6, -1, -1):
+            d = today - timedelta(days=i)
+            snap = by_date.get(d.isoformat())
+            mg.append({'label': day_label(d),
+                        'joins':  snap['joins_24h']         if snap else 0,
+                        'leaves': snap['leaves_24h']        if snap else 0})
+            msgs.append({'label': day_label(d),
+                          'messages': snap['message_count_24h'] if snap else 0})
+        return mg, msgs
+
+    def build_month():
+        by_date = {r['snapshot_date']: r for r in snaps_30}
+        mg, msgs = [], []
+        for i in range(29, -1, -1):
+            d = today - timedelta(days=i)
+            snap = by_date.get(d.isoformat())
+            mg.append({'label': date_label(d),
+                        'joins':  snap['joins_24h']         if snap else 0,
+                        'leaves': snap['leaves_24h']        if snap else 0})
+            msgs.append({'label': date_label(d),
+                          'messages': snap['message_count_24h'] if snap else 0})
+        return mg, msgs
+
+    def build_year():
+        by_ym = {r['ym']: r for r in snaps_12mo}
+        mg, msgs = [], []
+        for i in range(11, -1, -1):
+            y, m = today.year, today.month - i
+            while m <= 0:
+                m += 12; y -= 1
+            d = date(y, m, 1)
+            snap = by_ym.get(d.strftime('%Y-%m'))
+            mg.append({'label': month_label(d),
+                        'members': int(snap['avg_members'] or 0) if snap else 0})
+            msgs.append({'label': month_label(d),
+                          'messages': int(snap['total_msgs'] or 0) if snap else 0})
+        return mg, msgs
+
+    def build_day():
+        guild  = bot.get_guild(server_id)
+        cur_mc = guild.member_count if guild else 0
+        mg   = [{'label': hour_label(h), 'joins': 0} for h in range(24)]
+        msgs = [{'label': hour_label(h), 'messages': 0} for h in range(24)]
+        return mg, msgs
+
+    if not has_data:
+        member_growth = {'day': [], 'week': [], 'month': [], 'year': []}
+        messages      = {'day': [], 'week': [], 'month': [], 'year': []}
+    else:
+        mg_week,  msgs_week  = build_week()
+        mg_month, msgs_month = build_month()
+        mg_year,  msgs_year  = build_year()
+        mg_day,   msgs_day   = build_day()
+        member_growth = {'day': mg_day, 'week': mg_week, 'month': mg_month, 'year': mg_year}
+        messages      = {'day': msgs_day, 'week': msgs_week, 'month': msgs_month, 'year': msgs_year}
+
     return {
-        'member_growth': [dict(r) for r in member_growth],
-        'points_trend':  [dict(r) for r in points_trend],
-        'leaderboard':   [dict(r) for r in leaderboard],
+        'member_growth': member_growth,
+        'messages':      messages,
         'raids': {
             'total':          raid_stats['total_raids'],
             'active':         raid_stats['active_raids'],
@@ -336,12 +412,12 @@ async def server_analytics(server_id: int, user: dict = Depends(get_current_user
         'engage': {
             'total_links':       e4e_stats['total_links'],
             'active_links':      e4e_stats['active_links'],
-            'total_engagements': e4e_participations['total'],
-            'total_points':      e4e_participations['points'] or 0,
+            'total_engagements': e4e_part['total'],
+            'total_points':      e4e_part['points'] or 0,
         },
-        # Message & voice analytics require additional bot-side tracking
-        'messages': None,
-        'voice':    None,
+        'leaderboard':  [dict(r) for r in leaderboard],
+        'data_started': first_snap['first_date'] if first_snap else None,
+        'voice':        None,
     }
 
 
@@ -440,6 +516,79 @@ async def protection_log(
             LIMIT ?
         """, (server_id, min(limit, 200))).fetchall()
     return [dict(r) for r in rows]
+
+@app.get('/api/servers/{server_id}/flagged')
+async def flagged_users(server_id: int, user: dict = Depends(get_current_user)):
+    """Flagged raid participants for this guild."""
+    require_guild_admin(user, server_id)
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT u.user_id, u.username, u.x_username,
+                   COUNT(*) as flag_count,
+                   MAX(rp.confirmed_at) as last_flagged,
+                   GROUP_CONCAT(rp.raid_id) as flagged_raids
+            FROM raid_participation rp
+            JOIN users u ON u.user_id = rp.user_id
+            WHERE rp.flagged = 1
+            GROUP BY rp.user_id
+            ORDER BY flag_count DESC
+            LIMIT 100
+        """).fetchall()
+    result = []
+    for r in rows:
+        rd = dict(r)
+        rd['flagged_raids'] = (
+            [int(x) for x in rd['flagged_raids'].split(',')]
+            if rd['flagged_raids'] else []
+        )
+        result.append(rd)
+    return result
+
+
+def _module_from_action(action_type: str) -> str:
+    if action_type in ('link_delete', 'phishing_delete'):
+        return 'protection.links'
+    if action_type == 'banned_word':
+        return 'protection.words'
+    if action_type.startswith('suspicious_'):
+        return 'protection.suspicious'
+    if action_type == 'spam_mute':
+        return 'protection.spam'
+    if action_type == 'anti_raid_lockdown':
+        return 'protection.anti-raid'
+    return action_type
+
+
+@app.get('/api/servers/{server_id}/audit-log')
+async def audit_log(
+    server_id: int,
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Normalized view of protection_actions — field names match what the frontend expects.
+    Does NOT replace /protection/log; that endpoint remains unchanged.
+    """
+    require_guild_admin(user, server_id)
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT id, action_type, user_id, detail, created_at
+            FROM protection_actions
+            WHERE guild_id=?
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (server_id, min(limit, 200))).fetchall()
+    return [
+        {
+            'id':     r['id'],
+            'action': r['action_type'],
+            'module': _module_from_action(r['action_type']),
+            'target': str(r['user_id']) if r['user_id'] else '',
+            'detail': r['detail'],
+            'time':   r['created_at'],
+        }
+        for r in rows
+    ]
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 #  ENGAGEMENT ENDPOINTS
