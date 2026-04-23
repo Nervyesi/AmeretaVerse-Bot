@@ -1,7 +1,7 @@
 """
 protection.py — AmeretaVerse Auto-Moderation Module
 Handles: link detection, spam, suspicious users, phishing, anti-raid, banned words.
-All settings stored in the config table with protection_ prefix.
+All settings stored in the config table with protection_ prefix. Zero hardcoded lists.
 """
 
 import re
@@ -14,24 +14,6 @@ from collections import defaultdict
 from database import get_connection
 
 LOGO_URL = "https://i.imgur.com/KAkfd9v.png"
-
-# ── Known phishing domains ────────────────────────────────────────────────────
-PHISHING_DOMAINS = {
-    "discorcl.com", "discordc.com", "dlscord.com", "discrod.com",
-    "disc0rd.com", "discordd.com", "discordapp.co", "discord-gift.com",
-    "discord-nitro.com", "discordnitro.gift", "free-nitro.com",
-    "steamcommunity.ru", "steampowered.ru", "csgo-skins.com",
-    "nft-free-mint.com", "free-nft.io", "opensea-drop.com",
-    "metamask-airdrop.com", "airdrop-claim.io", "walletconnect.services",
-    "claimrewards.xyz", "claim-nft.site", "free-airdrop.net",
-}
-
-# ── Scam-indicator words in names ────────────────────────────────────────────
-SCAM_NAME_WORDS = {
-    "admin", "mod", "moderator", "support", "assistance", "helpdesk",
-    "help-desk", "official", "giveaway", "airdrop", "free mint",
-    "freemint", "nft drop", "nftdrop", "staff", "team",
-}
 
 # ── URL regex ─────────────────────────────────────────────────────────────────
 URL_RE = re.compile(
@@ -70,6 +52,35 @@ def cfg_int(key: str, default: int) -> int:
         return default
 
 
+def cfg_list(key: str, default: str = "") -> list[str]:
+    raw = cfg_get(key, default)
+    return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+
+# ── Channel / role resolution by name OR ID ───────────────────────────────────
+
+def resolve_channel(guild: discord.Guild, value: str) -> discord.TextChannel | None:
+    if not value or not value.strip():
+        return None
+    v = value.strip()
+    try:
+        return guild.get_channel(int(v))
+    except (ValueError, TypeError):
+        pass
+    return discord.utils.get(guild.text_channels, name=v)
+
+
+def resolve_role(guild: discord.Guild, value: str) -> discord.Role | None:
+    if not value or not value.strip():
+        return None
+    v = value.strip()
+    try:
+        return guild.get_role(int(v))
+    except (ValueError, TypeError):
+        pass
+    return discord.utils.get(guild.roles, name=v)
+
+
 # ── DB: log protection actions ────────────────────────────────────────────────
 
 def log_action(guild_id: int, action_type: str, user_id: int, detail: str):
@@ -96,8 +107,8 @@ def extract_domains(text: str) -> list[str]:
 
 
 async def get_mod_log(guild: discord.Guild) -> discord.TextChannel | None:
-    channel_name = cfg_get("protection_log_channel", "mod-log")
-    return discord.utils.get(guild.text_channels, name=channel_name)
+    value = cfg_get("protection_log_channel", "mod-log")
+    return resolve_channel(guild, value)
 
 
 async def send_mod_log(guild: discord.Guild, embed: discord.Embed):
@@ -122,12 +133,36 @@ def protection_embed(title: str, description: str, color: int = 0x94730D) -> dis
 class ProtectionCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # spam tracking: {guild_id: {user_id: [timestamps]}}
         self._spam_buckets: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
-        # anti-raid tracking: {guild_id: [join_timestamps]}
         self._join_buckets: dict[int, list[float]] = defaultdict(list)
-        # guilds currently in raid-lockdown
         self._raid_locked: set[int] = set()
+
+    # ── DM helper ─────────────────────────────────────────────────────────────
+
+    async def _send_dm(self, member: discord.Member, template_key: str, **fmt_kwargs):
+        if not cfg_bool("protection_dm_on_action", default=False):
+            return
+        template = cfg_get(template_key, "")
+        if not template.strip():
+            return
+        try:
+            await member.send(template.format(**fmt_kwargs))
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    # ── Action helper ─────────────────────────────────────────────────────────
+
+    async def _execute_member_action(self, member: discord.Member, action: str, reason: str):
+        if action == "kick":
+            try:
+                await member.kick(reason=reason)
+            except discord.Forbidden:
+                pass
+        elif action == "ban":
+            try:
+                await member.ban(reason=reason, delete_message_days=1)
+            except discord.Forbidden:
+                pass
 
     # ── Event: message ────────────────────────────────────────────────────────
 
@@ -135,7 +170,6 @@ class ProtectionCog(commands.Cog):
     async def on_message(self, message: discord.Message):
         if not message.guild or message.author.bot:
             return
-        # Skip admins / server owner
         if message.author.guild_permissions.administrator:
             return
 
@@ -157,28 +191,49 @@ class ProtectionCog(commands.Cog):
 
         bucket = self._spam_buckets[guild_id][user_id]
         bucket.append(now)
-        # purge old timestamps
         self._spam_buckets[guild_id][user_id] = [t for t in bucket if now - t <= window]
 
         if len(self._spam_buckets[guild_id][user_id]) >= threshold:
             self._spam_buckets[guild_id][user_id].clear()
-            await self._mute_user(message.guild, message.author, reason="Spam detection triggered")
+            action   = cfg_get("protection_spam_action", "mute")
+            duration = cfg_int("protection_spam_mute_duration", 600)
+            reason   = f"Spam detection: {threshold}+ msgs in {window}s"
+
+            if action == "mute":
+                await self._mute_user(message.guild, message.author, reason, duration)
+            else:
+                await self._execute_member_action(message.author, action, reason)
+
             log_action(guild_id, "spam_mute", user_id, f"Sent {threshold}+ msgs in {window}s")
+            await self._send_dm(message.author, "protection_dm_spam_message",
+                                duration=duration)
             embed = protection_embed(
-                "🚫 Spam Detected — User Muted",
+                "🚫 Spam Detected",
                 f"**User:** {message.author.mention} (`{message.author}`)\n"
                 f"**Reason:** {threshold}+ messages in {window} seconds\n"
+                f"**Action:** `{action}`\n"
                 f"**Channel:** {message.channel.mention}",
                 color=0xFF6600,
             )
             await send_mod_log(message.guild, embed)
 
-    async def _mute_user(self, guild: discord.Guild, member: discord.Member, reason: str):
-        mute_role_name = cfg_get("protection_mute_role", "Muted")
-        mute_role = discord.utils.get(guild.roles, name=mute_role_name)
+    async def _mute_user(self, guild: discord.Guild, member: discord.Member,
+                         reason: str, duration_seconds: int = 600):
+        # Try native Discord timeout first
+        try:
+            until = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+            await member.timeout(until, reason=reason)
+            return
+        except (discord.Forbidden, AttributeError):
+            pass
+        # Fallback to role-based mute
+        mute_role_value = cfg_get("protection_mute_role", "Muted")
+        mute_role = resolve_role(guild, mute_role_value)
         if not mute_role:
             try:
-                mute_role = await guild.create_role(name=mute_role_name, reason="Auto-created by AVbot protection")
+                mute_role = await guild.create_role(
+                    name=mute_role_value, reason="Auto-created by AVbot protection"
+                )
                 for ch in guild.channels:
                     try:
                         await ch.set_permissions(mute_role, send_messages=False, speak=False)
@@ -202,31 +257,36 @@ class ProtectionCog(commands.Cog):
         if not domains:
             return
 
-        # 1. Phishing check (always active when link detection is on)
+        # 1. Phishing check
         if cfg_bool("protection_phishing_detection"):
+            phishing_domains = set(cfg_list(
+                "protection_phishing_list",
+                "discorcl.com,discord-nitro.com"
+            ))
             for d in domains:
-                if d in PHISHING_DOMAINS:
+                if d in phishing_domains:
+                    phishing_action = cfg_get("protection_phishing_action", "delete")
                     try:
                         await message.delete()
                     except discord.NotFound:
                         pass
                     log_action(message.guild.id, "phishing_delete", message.author.id, d)
+                    await self._send_dm(message.author, "protection_dm_phishing_message")
+                    if phishing_action not in ("delete", "warn"):
+                        await self._execute_member_action(
+                            message.author, phishing_action,
+                            f"Phishing link detected: {d}"
+                        )
                     embed = protection_embed(
                         "⚠️ Phishing Link Deleted",
                         f"**User:** {message.author.mention} (`{message.author}`)\n"
                         f"**Domain:** `{d}`\n"
+                        f"**Action:** `{phishing_action}`\n"
                         f"**Channel:** {message.channel.mention}",
                         color=0xFF0000,
                     )
                     await send_mod_log(message.guild, embed)
-                    try:
-                        await message.author.send(
-                            "⚠️ Your message was removed because it contained a known phishing link. "
-                            "If this was a mistake, contact a moderator."
-                        )
-                    except discord.Forbidden:
-                        pass
-                    return  # already deleted
+                    return
 
         # 2. General link detection
         if not cfg_bool("protection_link_detection"):
@@ -236,23 +296,29 @@ class ProtectionCog(commands.Cog):
         whitelist = {d.strip().lower() for d in whitelist_raw.split(",") if d.strip()}
 
         for d in domains:
-            # allow if domain or parent domain is whitelisted
             if any(d == w or d.endswith("." + w) for w in whitelist):
                 continue
+            link_action = cfg_get("protection_link_action", "delete")
             try:
                 await message.delete()
             except discord.NotFound:
                 pass
             log_action(message.guild.id, "link_delete", message.author.id, d)
+            await self._send_dm(message.author, "protection_dm_link_message")
+            if link_action not in ("delete", "warn"):
+                await self._execute_member_action(
+                    message.author, link_action, f"Non-whitelisted link: {d}"
+                )
             embed = protection_embed(
                 "🔗 Link Removed",
                 f"**User:** {message.author.mention} (`{message.author}`)\n"
                 f"**Domain:** `{d}`\n"
+                f"**Action:** `{link_action}`\n"
                 f"**Channel:** {message.channel.mention}",
                 color=0xFFAA00,
             )
             await send_mod_log(message.guild, embed)
-            return  # one delete per message
+            return
 
     # ── Banned words filter ────────────────────────────────────────────────────
 
@@ -269,15 +335,22 @@ class ProtectionCog(commands.Cog):
 
         for word in banned:
             if word in content_lower:
+                banned_action = cfg_get("protection_banned_words_action", "delete")
                 try:
                     await message.delete()
                 except discord.NotFound:
                     pass
                 log_action(message.guild.id, "banned_word", message.author.id, word)
+                await self._send_dm(message.author, "protection_dm_banned_word_message")
+                if banned_action not in ("delete", "warn"):
+                    await self._execute_member_action(
+                        message.author, banned_action, f"Banned word: {word}"
+                    )
                 embed = protection_embed(
                     "🚫 Banned Word Removed",
                     f"**User:** {message.author.mention} (`{message.author}`)\n"
                     f"**Matched:** `{word}`\n"
+                    f"**Action:** `{banned_action}`\n"
                     f"**Channel:** {message.channel.mention}",
                     color=0xFF6600,
                 )
@@ -299,27 +372,38 @@ class ProtectionCog(commands.Cog):
 
         flags: list[str] = []
 
-        # Default avatar
-        if member.avatar is None:
+        # No avatar check (if sub-toggle is on)
+        if cfg_bool("protection_suspicious_no_avatar", True) and member.avatar is None:
             flags.append("No profile picture (default avatar)")
 
-        # Account age
+        # Account age check
         min_age_days = cfg_int("protection_suspicious_account_age", 7)
-        age = datetime.now(timezone.utc) - member.created_at
-        if age < timedelta(days=min_age_days):
-            flags.append(f"Account created {age.days}d ago (minimum: {min_age_days}d)")
+        if min_age_days > 0:
+            age = datetime.now(timezone.utc) - member.created_at
+            if age < timedelta(days=min_age_days):
+                flags.append(f"Account created {age.days}d ago (minimum: {min_age_days}d)")
 
-        # Scam words in username/display name
-        name_lower = (member.name + " " + (member.display_name or "")).lower()
-        matched_words = [w for w in SCAM_NAME_WORDS if w in name_lower]
-        if matched_words:
-            flags.append(f"Suspicious name keywords: {', '.join(matched_words)}")
+        # Username keyword check (if sub-toggle is on)
+        if cfg_bool("protection_suspicious_username_keywords", True):
+            scam_words = cfg_list(
+                "protection_suspicious_keywords_list",
+                "admin,mod,moderator,support,giveaway,airdrop,staff,team"
+            )
+            name_lower = (member.name + " " + (member.display_name or "")).lower()
+            matched = [w for w in scam_words if w in name_lower]
+            if matched:
+                flags.append(f"Suspicious name keywords: {', '.join(matched)}")
+
+        # Bio keyword check (if sub-toggle is on)
+        # Note: bot cannot access user bio directly via discord.py — this toggle
+        # is reserved for future implementation when Discord exposes it.
+        # cfg_bool("protection_suspicious_bio_keywords", False) is intentionally skipped.
 
         if not flags:
             return
 
         action = cfg_get("protection_suspicious_action", "flag")
-        guild   = member.guild
+        guild  = member.guild
 
         log_action(guild.id, f"suspicious_{action}", member.id, "; ".join(flags))
 
@@ -332,17 +416,10 @@ class ProtectionCog(commands.Cog):
             color=0xFF3300,
         )
         await send_mod_log(guild, embed)
+        await self._send_dm(member, "protection_dm_suspicious_message")
 
-        if action == "kick":
-            try:
-                await member.kick(reason="Suspicious user — auto-moderation")
-            except discord.Forbidden:
-                pass
-        elif action == "ban":
-            try:
-                await member.ban(reason="Suspicious user — auto-moderation", delete_message_days=1)
-            except discord.Forbidden:
-                pass
+        if action in ("kick", "ban"):
+            await self._execute_member_action(member, action, "Suspicious user — auto-moderation")
 
     # ── Anti-raid ─────────────────────────────────────────────────────────────
 
@@ -365,11 +442,8 @@ class ProtectionCog(commands.Cog):
             await self._lockdown(member.guild, threshold, window)
 
     async def _lockdown(self, guild: discord.Guild, threshold: int, window: int):
-        """Disable community invites and alert admins."""
-        log_action(guild.id, "anti_raid_lockdown", 0,
-                   f"{threshold} joins in {window}s")
+        log_action(guild.id, "anti_raid_lockdown", 0, f"{threshold} joins in {window}s")
 
-        # Pause all invites
         try:
             invites = await guild.invites()
             for inv in invites:
@@ -391,7 +465,6 @@ class ProtectionCog(commands.Cog):
         )
         await send_mod_log(guild, embed)
 
-        # Ping admins
         ch = await get_mod_log(guild)
         if ch:
             admin_mentions = " ".join(
@@ -460,7 +533,6 @@ class ProtectionCog(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # Neither — show current value
         current = cfg_get(feature, "(not set)")
         embed = protection_embed(
             "⚙️ Protection Config",
@@ -477,18 +549,22 @@ class ProtectionCog(commands.Cog):
             return f"**{label}:** {v}"
 
         lines = [
-            row("Link Detection",      "protection_link_detection"),
-            row("Spam Detection",      "protection_spam_detection"),
-            row("Suspicious Users",    "protection_suspicious_users"),
-            row("Phishing Detection",  "protection_phishing_detection"),
-            row("Anti-Raid",           "protection_anti_raid"),
-            row("Banned Words",        "protection_banned_words"),
+            row("Link Detection",        "protection_link_detection"),
+            row("Spam Detection",        "protection_spam_detection"),
+            row("Suspicious Users",      "protection_suspicious_users"),
+            row("Phishing Detection",    "protection_phishing_detection"),
+            row("Anti-Raid",             "protection_anti_raid"),
+            row("Banned Words",          "protection_banned_words"),
             "",
-            row("Link Whitelist",      "protection_link_whitelist",        is_bool=False),
-            row("Suspicious Action",   "protection_suspicious_action",     is_bool=False),
-            row("Spam Threshold",      "protection_spam_threshold",        is_bool=False),
-            row("Anti-Raid Threshold", "protection_anti_raid_threshold",   is_bool=False),
-            row("Banned Words List",   "protection_banned_words_list",     is_bool=False),
+            row("Link Action",           "protection_link_action",         is_bool=False),
+            row("Spam Action",           "protection_spam_action",         is_bool=False),
+            row("Phishing Action",       "protection_phishing_action",     is_bool=False),
+            row("Suspicious Action",     "protection_suspicious_action",   is_bool=False),
+            row("Anti-Raid Action",      "protection_anti_raid_action",    is_bool=False),
+            row("Spam Threshold",        "protection_spam_threshold",      is_bool=False),
+            row("Anti-Raid Threshold",   "protection_anti_raid_threshold", is_bool=False),
+            row("Link Whitelist",        "protection_link_whitelist",      is_bool=False),
+            row("DM on Action",          "protection_dm_on_action"),
         ]
         embed = protection_embed("⚙️ Protection Module — Current Config", "\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -534,9 +610,7 @@ class ProtectionCog(commands.Cog):
         if not rows:
             desc = "No protection actions recorded yet."
         else:
-            desc = "\n".join(
-                f"**{r['action_type']}:** {r['cnt']}" for r in rows
-            )
+            desc = "\n".join(f"**{r['action_type']}:** {r['cnt']}" for r in rows)
 
         embed = protection_embed("🛡️ Protection Stats", desc)
         await interaction.response.send_message(embed=embed, ephemeral=True)

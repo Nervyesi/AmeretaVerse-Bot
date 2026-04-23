@@ -177,6 +177,40 @@ def init_db():
             "protection_banned_words_list":        "",
             "protection_log_channel":              "mod-log",
             "protection_mute_role":                "Muted",
+            # ── Protection action config ────────────────────────────────
+            "protection_link_action":              "delete",
+            "protection_spam_action":              "mute",
+            "protection_spam_mute_duration":       "600",
+            "protection_banned_words_action":      "delete",
+            "protection_phishing_action":          "delete",
+            "protection_phishing_list": (
+                "discorcl.com,discordc.com,dlscord.com,discrod.com,disc0rd.com,"
+                "discordd.com,discordapp.co,discord-gift.com,discord-nitro.com,"
+                "discordnitro.gift,free-nitro.com,steamcommunity.ru,steampowered.ru,"
+                "csgo-skins.com,nft-free-mint.com,free-nft.io,opensea-drop.com,"
+                "metamask-airdrop.com,airdrop-claim.io,walletconnect.services,"
+                "claimrewards.xyz,claim-nft.site,free-airdrop.net"
+            ),
+            "protection_suspicious_no_avatar":     "1",
+            "protection_suspicious_username_keywords": "1",
+            "protection_suspicious_bio_keywords":  "0",
+            "protection_suspicious_keywords_list": (
+                "admin,mod,moderator,support,assistance,helpdesk,help-desk,"
+                "official,giveaway,airdrop,free mint,freemint,nft drop,nftdrop,staff,team"
+            ),
+            "protection_anti_raid_action":         "lockdown",
+            "protection_dm_on_action":             "0",
+            "protection_dm_link_message":          "Your link was removed because it's not whitelisted on this server.",
+            "protection_dm_spam_message":          "You were muted for spamming. Duration: {duration}s.",
+            "protection_dm_banned_word_message":   "Your message contained a banned word and was removed.",
+            "protection_dm_phishing_message":      "Your message was removed — it contained a phishing link.",
+            "protection_dm_suspicious_message":    "Your account was flagged due to suspicious characteristics.",
+            "protection_main_embed_title":         "\U0001f6e1\ufe0f Server Protection",
+            "protection_main_embed_description": (
+                "This server is protected by AVbot. Attempting spam, phishing, "
+                "raids, or abuse will result in automated action."
+            ),
+            "protection_main_embed_channel":       "",
         }
         for k, v in defaults.items():
             try:

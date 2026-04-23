@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from dotenv import load_dotenv
 
+import discord
 from database import get_connection
 from shared_bot import bot
 
@@ -314,6 +315,33 @@ async def server_analytics(
             FROM analytics_snapshots WHERE guild_id=?
         """, (server_id,)).fetchone()
 
+        # ── Stat card aggregates ──────────────────────────────────────────
+        today_mc = conn.execute("""
+            SELECT message_count, joins FROM message_counters
+            WHERE guild_id=? AND date=?
+        """, (server_id, today.isoformat())).fetchone()
+
+        week_sums = conn.execute("""
+            SELECT COALESCE(SUM(joins_24h),0) as week_joins,
+                   COALESCE(SUM(message_count_24h),0) as week_msgs
+            FROM analytics_snapshots
+            WHERE guild_id=? AND snapshot_date >= date('now','-7 days')
+        """, (server_id,)).fetchone()
+
+        month_sums = conn.execute("""
+            SELECT COALESCE(SUM(joins_24h),0) as month_joins,
+                   COALESCE(SUM(message_count_24h),0) as month_msgs
+            FROM analytics_snapshots
+            WHERE guild_id=? AND snapshot_date >= date('now','-30 days')
+        """, (server_id,)).fetchone()
+
+        year_sums = conn.execute("""
+            SELECT COALESCE(SUM(message_count_24h),0) as year_msgs,
+                   COUNT(*) as days_count
+            FROM analytics_snapshots
+            WHERE guild_id=? AND snapshot_date >= date('now','-365 days')
+        """, (server_id,)).fetchone()
+
         # ── Leaderboard + raids + engage (always live) ────────────────────
         leaderboard = conn.execute("""
             SELECT user_id, username, total_points FROM users
@@ -337,6 +365,22 @@ async def server_analytics(
             SELECT COUNT(*) as total, SUM(points_earned) as points
             FROM engage_participation
         """).fetchone()
+
+    # ── Stat card values ──────────────────────────────────────────────────
+    _guild = bot.get_guild(server_id)
+    live_count = _guild.member_count if _guild else 0
+    verified_role = discord.utils.get(_guild.roles, name='Verified') if _guild else None
+    live_verified = len(verified_role.members) if verified_role else 0
+
+    today_joins = today_mc['joins']         if today_mc else 0
+    today_msgs  = today_mc['message_count'] if today_mc else 0
+    week_joins  = (week_sums['week_joins']  if week_sums  else 0) + today_joins
+    month_joins = (month_sums['month_joins'] if month_sums else 0) + today_joins
+    week_msgs   = (week_sums['week_msgs']   if week_sums  else 0) + today_msgs
+    month_msgs  = (month_sums['month_msgs'] if month_sums else 0) + today_msgs
+    year_msgs   = (year_sums['year_msgs']   if year_sums  else 0) + today_msgs
+    days_count  = (year_sums['days_count']  if year_sums  else 0) + 1
+    avg_per_day = year_msgs // days_count if days_count > 0 else 0
 
     has_data = len(snaps_7) > 0 or len(snaps_30) > 0
 
@@ -415,9 +459,23 @@ async def server_analytics(
             'total_engagements': e4e_part['total'],
             'total_points':      e4e_part['points'] or 0,
         },
-        'leaderboard':  [dict(r) for r in leaderboard],
-        'data_started': first_snap['first_date'] if first_snap else None,
-        'voice':        None,
+        'leaderboard':         [dict(r) for r in leaderboard],
+        'data_started':        first_snap['first_date'] if first_snap else None,
+        'first_snapshot_date': first_snap['first_date'] if first_snap else None,
+        'has_any_data':        has_data,
+        'voice':               None,
+        'stat_cards': {
+            'total_members':      live_count,
+            'today_joins':        today_joins,
+            'week_joins':         week_joins,
+            'month_joins':        month_joins,
+            'verified_count':     live_verified,
+            'messages_today':     today_msgs,
+            'messages_week':      week_msgs,
+            'messages_month':     month_msgs,
+            'messages_year':      year_msgs,
+            'messages_avg_per_day': avg_per_day,
+        },
     }
 
 
@@ -498,6 +556,59 @@ async def protection_stats(server_id: int, user: dict = Depends(get_current_user
             'raids_blocked':    last_week.get('anti_raid_lockdown', 0),
         },
     }
+
+
+@app.post('/api/servers/{server_id}/protection/send-message')
+async def protection_send_message(server_id: int, user: dict = Depends(get_current_user)):
+    """Send the configured protection embed to the configured channel."""
+    require_guild_admin(user, server_id)
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    with get_connection() as conn:
+        def _cfg(key, default=''):
+            row = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+            return row['value'] if row else default
+
+        title       = _cfg('protection_main_embed_title',       '🛡️ Server Protection')
+        description = _cfg('protection_main_embed_description', 'This server is protected by AVbot.')
+        ch_value    = _cfg('protection_main_embed_channel', '')
+
+    if not ch_value.strip():
+        raise HTTPException(status_code=400, detail='protection_main_embed_channel is not configured')
+
+    # Resolve channel by ID or name
+    channel = None
+    try:
+        channel = guild.get_channel(int(ch_value.strip()))
+    except (ValueError, TypeError):
+        pass
+    if channel is None:
+        channel = discord.utils.get(guild.text_channels, name=ch_value.strip())
+
+    if channel is None:
+        raise HTTPException(status_code=400, detail=f'Channel not found: {ch_value}')
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=0x94730D,
+    )
+    embed.set_footer(text='AmeretaVerse • Protection System')
+
+    try:
+        msg = await channel.send(embed=embed)
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id), 'channel_name': channel.name}
 
 
 @app.get('/api/servers/{server_id}/protection/log')
