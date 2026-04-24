@@ -2,7 +2,12 @@ import discord
 from discord.ext import commands, tasks
 from datetime import datetime, date, timedelta, timezone
 
-from database import get_connection
+from database import (
+    get_connection,
+    ensure_guild_defaults,
+    get_config as db_get_config,
+    set_config as db_set_config,
+)
 
 
 class Analytics(commands.Cog):
@@ -17,9 +22,10 @@ class Analytics(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        if message.author.bot or not message.guild:
+        if message.author.bot or not message.guild or message.webhook_id:
             return
         today = date.today().isoformat()
+        hour  = datetime.now(timezone.utc).hour
         with get_connection() as conn:
             conn.execute(
                 """INSERT INTO message_counters (guild_id, date, message_count, joins, leaves)
@@ -27,6 +33,13 @@ class Analytics(commands.Cog):
                    ON CONFLICT(guild_id, date)
                    DO UPDATE SET message_count = message_count + 1""",
                 (message.guild.id, today),
+            )
+            conn.execute(
+                """INSERT INTO message_hourly (guild_id, date, hour, count)
+                   VALUES (?, ?, ?, 1)
+                   ON CONFLICT(guild_id, date, hour)
+                   DO UPDATE SET count = count + 1""",
+                (message.guild.id, today, hour),
             )
 
     @commands.Cog.listener()
@@ -57,6 +70,7 @@ class Analytics(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_join(self, guild):
+        ensure_guild_defaults(guild.id)
         await self._backfill_history(guild)
 
     # ── Backfill on startup for guilds with no snapshots ─────────────────────
@@ -64,6 +78,7 @@ class Analytics(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         for guild in self.bot.guilds:
+            ensure_guild_defaults(guild.id)
             with get_connection() as conn:
                 count = conn.execute(
                     "SELECT COUNT(*) FROM analytics_snapshots WHERE guild_id=?",
@@ -96,13 +111,12 @@ class Analytics(commands.Cog):
             day_end   = datetime.combine(d + timedelta(days=1), datetime.min.time()).replace(tzinfo=timezone.utc)
 
             if i == 0:
-                # Today: use live values
-                member_count  = guild.member_count
-                online_count  = sum(1 for m in guild.members if str(m.status) != 'offline')
+                member_count   = guild.member_count
+                online_count   = sum(1 for m in guild.members if str(m.status) != 'offline')
                 verified_count = len(verified_role.members) if verified_role else 0
             else:
-                member_count  = sum(1 for m in members if m.joined_at <= day_end)
-                online_count  = 0
+                member_count   = sum(1 for m in members if m.joined_at <= day_end)
+                online_count   = 0
                 verified_count = sum(
                     1 for m in members
                     if m.id in verified_ids and m.joined_at <= day_end
@@ -143,52 +157,70 @@ class Analytics(commands.Cog):
 
         print(f"Backfilled {rows_inserted} days for guild {guild.name} ({guild.id})")
 
+    # ── Snapshot helper ───────────────────────────────────────────────────────
+
+    async def _take_snapshot(self, guild: discord.Guild, target_date: date):
+        guild_id = guild.id
+        date_str = target_date.isoformat()
+
+        member_count   = guild.member_count
+        online_count   = sum(1 for m in guild.members if str(m.status) != 'offline')
+        verified_role  = discord.utils.get(guild.roles, name='Verified')
+        verified_count = len(verified_role.members) if verified_role else 0
+
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT message_count, joins, leaves FROM message_counters WHERE guild_id=? AND date=?",
+                (guild_id, date_str),
+            ).fetchone()
+
+            msg_count  = row['message_count'] if row else 0
+            joins_cnt  = row['joins']         if row else 0
+            leaves_cnt = row['leaves']        if row else 0
+
+            conn.execute(
+                """INSERT OR REPLACE INTO analytics_snapshots
+                   (guild_id, snapshot_date, member_count, online_count,
+                    verified_count, message_count_24h, joins_24h, leaves_24h)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (guild_id, date_str, member_count, online_count,
+                 verified_count, msg_count, joins_cnt, leaves_cnt),
+            )
+        print(f"Snapshot: {guild.name} ({guild_id}) {date_str} - {member_count} members")
+
     # ── Daily snapshot (fires at midnight UTC) ────────────────────────────────
 
     @tasks.loop(hours=24)
     async def daily_snapshot(self):
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
-        cutoff    = (date.today() - timedelta(days=3)).isoformat()
+        yesterday     = date.today() - timedelta(days=1)
+        cutoff        = (date.today() - timedelta(days=3)).isoformat()
+        cutoff_hourly = (date.today() - timedelta(days=2)).isoformat()
 
         for guild in self.bot.guilds:
-            guild_id = guild.id
-
-            member_count = guild.member_count
-            online_count = sum(
-                1 for m in guild.members if str(m.status) != 'offline'
-            )
-
-            verified_role  = discord.utils.get(guild.roles, name='Verified')
-            verified_count = len(verified_role.members) if verified_role else 0
+            await self._take_snapshot(guild, yesterday)
 
             with get_connection() as conn:
-                row = conn.execute(
-                    """SELECT message_count, joins, leaves
-                       FROM message_counters WHERE guild_id=? AND date=?""",
-                    (guild_id, yesterday),
-                ).fetchone()
-
-                msg_count  = row['message_count'] if row else 0
-                joins_cnt  = row['joins']         if row else 0
-                leaves_cnt = row['leaves']        if row else 0
-
-                conn.execute(
-                    """INSERT OR REPLACE INTO analytics_snapshots
-                       (guild_id, snapshot_date, member_count, online_count,
-                        verified_count, message_count_24h, joins_24h, leaves_24h)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (guild_id, yesterday, member_count, online_count,
-                     verified_count, msg_count, joins_cnt, leaves_cnt),
-                )
-
                 conn.execute(
                     "DELETE FROM message_counters WHERE guild_id=? AND date < ?",
-                    (guild_id, cutoff),
+                    (guild.id, cutoff),
                 )
+                conn.execute(
+                    "DELETE FROM message_hourly WHERE guild_id=? AND date < ?",
+                    (guild.id, cutoff_hourly),
+                )
+
+            if not db_get_config(guild.id, 'analytics_leaves_tracking_started', ''):
+                db_set_config(guild.id, 'analytics_leaves_tracking_started', date.today().isoformat())
 
     @daily_snapshot.before_loop
     async def before_daily_snapshot(self):
         await self.bot.wait_until_ready()
+        today = date.today()
+        for guild in self.bot.guilds:
+            try:
+                await self._take_snapshot(guild, today)
+            except Exception as e:
+                print(f"Initial snapshot failed for {guild.name}: {e}")
         now = datetime.now(timezone.utc)
         tomorrow_midnight = (
             now.replace(hour=0, minute=0, second=0, microsecond=0)

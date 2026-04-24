@@ -8,15 +8,12 @@ import random
 import re
 import requests
 from datetime import datetime, timezone, timedelta, time as dtime
-from database import get_connection
+from database import get_connection, get_config as _db_get_config, DEFAULT_CONFIG
 
 LOGO_URL = "https://i.imgur.com/FNE8Li0.png"
 PROGRESS_BAR_URL = "https://i.imgur.com/5Mg2BIE.png"
 RAID_CHANNEL_NAME = "Raid"
 RAID_ROLE_NAME = "Raiders"
-
-# Percentage of total_points each task is worth
-TASK_WEIGHTS = {"like": 12.5, "comment": 40.0, "retweet": 47.5}
 
 # In-memory per-user toggle state: {(raid_id, user_id): set[str]}
 user_states: dict = {}
@@ -35,7 +32,7 @@ def get_state(raid_id: int, user_id: int) -> set:
     return user_states.get((raid_id, user_id), set())
 
 
-def calc_points(total: int, raid_tasks: list, done: set, mode: str) -> int:
+def calc_points(total: int, raid_tasks: list, done: set, mode: str, guild_id: int = 0) -> int:
     """
     Redistribute weights proportionally among the raid's tasks.
     mode=all:     user must complete every task → full points or 0
@@ -45,10 +42,15 @@ def calc_points(total: int, raid_tasks: list, done: set, mode: str) -> int:
     cd = {t.lower() for t in done} & rd
     if mode == "all":
         return total if cd == rd else 0
-    raid_w = sum(TASK_WEIGHTS.get(t, 0) for t in rd)
+    weights = {
+        "like":    float(_db_get_config(guild_id, "engage_weight_like")    or DEFAULT_CONFIG["engage_weight_like"]),
+        "comment": float(_db_get_config(guild_id, "engage_weight_comment") or DEFAULT_CONFIG["engage_weight_comment"]),
+        "retweet": float(_db_get_config(guild_id, "engage_weight_retweet") or DEFAULT_CONFIG["engage_weight_retweet"]),
+    }
+    raid_w = sum(weights.get(t, 0) for t in rd)
     if not raid_w:
         return 0
-    done_w = sum(TASK_WEIGHTS.get(t, 0) for t in cd)
+    done_w = sum(weights.get(t, 0) for t in cd)
     return round(total * done_w / raid_w)
 
 
@@ -356,7 +358,7 @@ async def _process_confirm(interaction: discord.Interaction, raid_id: int, ephem
                 await interaction.response.send_message(msg, ephemeral=True)
             return
 
-    points = calc_points(raid["total_points"], raid_tasks, state, raid["mode"])
+    points = calc_points(raid["total_points"], raid_tasks, state, raid["mode"], interaction.guild_id)
 
     upsert_user(interaction.user.id, str(interaction.user))
     with get_connection() as conn:

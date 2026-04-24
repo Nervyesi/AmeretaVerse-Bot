@@ -18,7 +18,12 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from dotenv import load_dotenv
 
 import discord
-from database import get_connection
+from database import (
+    get_connection,
+    get_config as db_get_config,
+    set_config as db_set_config,
+    get_all_config as db_get_all_config,
+)
 from shared_bot import bot
 
 load_dotenv()
@@ -288,6 +293,8 @@ async def server_analytics(
     def month_label(d): return d.strftime('%b')
     def hour_label(h):  return f'{h:02d}:00'
 
+    leaves_tracking_started = db_get_config(server_id, 'analytics_leaves_tracking_started', '') or ''
+
     with get_connection() as conn:
         # ── Pull snapshots ────────────────────────────────────────────────
         snaps_7 = conn.execute("""
@@ -305,7 +312,9 @@ async def server_analytics(
         snaps_12mo = conn.execute("""
             SELECT strftime('%Y-%m', snapshot_date) as ym,
                    AVG(member_count) as avg_members,
-                   SUM(message_count_24h) as total_msgs
+                   SUM(message_count_24h) as total_msgs,
+                   SUM(joins_24h) as total_joins,
+                   SUM(leaves_24h) as total_leaves
             FROM analytics_snapshots WHERE guild_id=?
             GROUP BY ym ORDER BY ym DESC LIMIT 13
         """, (server_id,)).fetchall()
@@ -317,7 +326,7 @@ async def server_analytics(
 
         # ── Stat card aggregates ──────────────────────────────────────────
         today_mc = conn.execute("""
-            SELECT message_count, joins FROM message_counters
+            SELECT message_count, joins, leaves FROM message_counters
             WHERE guild_id=? AND date=?
         """, (server_id, today.isoformat())).fetchone()
 
@@ -340,6 +349,17 @@ async def server_analytics(
                    COUNT(*) as days_count
             FROM analytics_snapshots
             WHERE guild_id=? AND snapshot_date >= date('now','-365 days')
+        """, (server_id,)).fetchone()
+
+        # ── Hourly message counts for day view ────────────────────────────
+        hourly_msgs = conn.execute("""
+            SELECT hour, count FROM message_hourly
+            WHERE guild_id=? AND date=?
+        """, (server_id, today.isoformat())).fetchall()
+
+        # ── First message tracked date ────────────────────────────────────
+        first_msg_row = conn.execute("""
+            SELECT MIN(date) as first_date FROM message_counters WHERE guild_id=?
         """, (server_id,)).fetchone()
 
         # ── Leaderboard + raids + engage (always live) ────────────────────
@@ -372,8 +392,9 @@ async def server_analytics(
     verified_role = discord.utils.get(_guild.roles, name='Verified') if _guild else None
     live_verified = len(verified_role.members) if verified_role else 0
 
-    today_joins = today_mc['joins']         if today_mc else 0
-    today_msgs  = today_mc['message_count'] if today_mc else 0
+    today_joins  = today_mc['joins']         if today_mc else 0
+    today_leaves = today_mc['leaves']        if today_mc else 0
+    today_msgs   = today_mc['message_count'] if today_mc else 0
     week_joins  = (week_sums['week_joins']  if week_sums  else 0) + today_joins
     month_joins = (month_sums['month_joins'] if month_sums else 0) + today_joins
     week_msgs   = (week_sums['week_msgs']   if week_sums  else 0) + today_msgs
@@ -388,33 +409,65 @@ async def server_analytics(
 
     def build_week():
         by_date = {r['snapshot_date']: r for r in snaps_7}
-        mg, msgs = [], []
+        mg, jl, msgs = [], [], []
+        prev_mc = live_count
         for i in range(6, -1, -1):
-            d = today - timedelta(days=i)
-            snap = by_date.get(d.isoformat())
-            mg.append({'label': day_label(d),
-                        'joins':  snap['joins_24h']         if snap else 0,
-                        'leaves': snap['leaves_24h']        if snap else 0})
-            msgs.append({'label': day_label(d),
-                          'messages': snap['message_count_24h'] if snap else 0})
-        return mg, msgs
+            d       = today - timedelta(days=i)
+            snap    = by_date.get(d.isoformat())
+            is_today = (i == 0)
+            if is_today:
+                mc  = live_count
+                j   = today_joins
+                lv  = today_leaves
+                msg = today_msgs
+            elif snap:
+                mc  = snap['member_count']
+                j   = snap['joins_24h']
+                lv  = snap['leaves_24h']
+                msg = snap['message_count_24h']
+            else:
+                mc  = prev_mc  # forward-fill gaps
+                j   = 0
+                lv  = 0
+                msg = 0
+            prev_mc = mc
+            mg.append({'label': day_label(d), 'value': mc})
+            jl.append({'label': day_label(d), 'joins': j, 'leaves': lv})
+            msgs.append({'label': day_label(d), 'value': msg})
+        return mg, jl, msgs
 
     def build_month():
         by_date = {r['snapshot_date']: r for r in snaps_30}
-        mg, msgs = [], []
+        mg, jl, msgs = [], [], []
+        prev_mc = live_count
         for i in range(29, -1, -1):
-            d = today - timedelta(days=i)
-            snap = by_date.get(d.isoformat())
-            mg.append({'label': date_label(d),
-                        'joins':  snap['joins_24h']         if snap else 0,
-                        'leaves': snap['leaves_24h']        if snap else 0})
-            msgs.append({'label': date_label(d),
-                          'messages': snap['message_count_24h'] if snap else 0})
-        return mg, msgs
+            d       = today - timedelta(days=i)
+            snap    = by_date.get(d.isoformat())
+            is_today = (i == 0)
+            if is_today:
+                mc  = live_count
+                j   = today_joins
+                lv  = today_leaves
+                msg = today_msgs
+            elif snap:
+                mc  = snap['member_count']
+                j   = snap['joins_24h']
+                lv  = snap['leaves_24h']
+                msg = snap['message_count_24h']
+            else:
+                mc  = prev_mc  # forward-fill gaps
+                j   = 0
+                lv  = 0
+                msg = 0
+            prev_mc = mc
+            mg.append({'label': date_label(d), 'value': mc})
+            jl.append({'label': date_label(d), 'joins': j, 'leaves': lv})
+            msgs.append({'label': date_label(d), 'value': msg})
+        return mg, jl, msgs
 
     def build_year():
         by_ym = {r['ym']: r for r in snaps_12mo}
-        mg, msgs = [], []
+        mg, jl, msgs = [], [], []
         for i in range(11, -1, -1):
             y, m = today.year, today.month - i
             while m <= 0:
@@ -422,32 +475,43 @@ async def server_analytics(
             d = date(y, m, 1)
             snap = by_ym.get(d.strftime('%Y-%m'))
             mg.append({'label': month_label(d),
-                        'members': int(snap['avg_members'] or 0) if snap else 0})
+                       'value': int(snap['avg_members'] or 0) if snap else 0})
+            jl.append({'label': month_label(d),
+                       'joins':  int(snap['total_joins']  or 0) if snap else 0,
+                       'leaves': int(snap['total_leaves'] or 0) if snap else 0})
             msgs.append({'label': month_label(d),
-                          'messages': int(snap['total_msgs'] or 0) if snap else 0})
-        return mg, msgs
+                         'value': int(snap['total_msgs'] or 0) if snap else 0})
+        return mg, jl, msgs
 
     def build_day():
-        guild  = bot.get_guild(server_id)
-        cur_mc = guild.member_count if guild else 0
-        mg   = [{'label': hour_label(h), 'joins': 0} for h in range(24)]
-        msgs = [{'label': hour_label(h), 'messages': 0} for h in range(24)]
-        return mg, msgs
+        guild       = bot.get_guild(server_id)
+        cur_mc      = guild.member_count if guild else 0
+        now_utc_h   = datetime.now(timezone.utc).hour
+        hourly_by_h = {r['hour']: r['count'] for r in hourly_msgs}
+        mg   = [{'label': hour_label(h), 'value': cur_mc if h <= now_utc_h else None} for h in range(24)]
+        jl   = [{'label': hour_label(h), 'joins': 0, 'leaves': 0} for h in range(24)]
+        msgs = [{'label': hour_label(h), 'value': hourly_by_h.get(h, 0) if h <= now_utc_h else None} for h in range(24)]
+        return mg, jl, msgs
 
     if not has_data:
         member_growth = {'day': [], 'week': [], 'month': [], 'year': []}
+        joins_leaves  = {'day': [], 'week': [], 'month': [], 'year': []}
         messages      = {'day': [], 'week': [], 'month': [], 'year': []}
     else:
-        mg_week,  msgs_week  = build_week()
-        mg_month, msgs_month = build_month()
-        mg_year,  msgs_year  = build_year()
-        mg_day,   msgs_day   = build_day()
+        mg_week,  jl_week,  msgs_week  = build_week()
+        mg_month, jl_month, msgs_month = build_month()
+        mg_year,  jl_year,  msgs_year  = build_year()
+        mg_day,   jl_day,   msgs_day   = build_day()
         member_growth = {'day': mg_day, 'week': mg_week, 'month': mg_month, 'year': mg_year}
+        joins_leaves  = {'day': jl_day, 'week': jl_week, 'month': jl_month, 'year': jl_year}
         messages      = {'day': msgs_day, 'week': msgs_week, 'month': msgs_month, 'year': msgs_year}
 
     return {
-        'member_growth': member_growth,
-        'messages':      messages,
+        'member_growth':             member_growth,
+        'joins_leaves':              joins_leaves,
+        'messages':                  messages,
+        'leaves_tracking_started':   leaves_tracking_started or None,
+        'first_message_tracked_date': first_msg_row['first_date'] if first_msg_row else None,
         'raids': {
             'total':          raid_stats['total_raids'],
             'active':         raid_stats['active_raids'],
@@ -480,25 +544,18 @@ async def server_analytics(
 
 
 @app.get('/api/servers/{server_id}/config')
-async def get_config(server_id: int, user: dict = Depends(get_current_user)):
-    """Return all config key/value pairs."""
+async def get_server_config(server_id: int, user: dict = Depends(get_current_user)):
+    """Return all config key/value pairs for this guild (defaults merged with overrides)."""
     require_guild_admin(user, server_id)
-    with get_connection() as conn:
-        rows = conn.execute('SELECT key, value FROM config').fetchall()
-    return {r['key']: r['value'] for r in rows}
+    return db_get_all_config(server_id)
 
 
 @app.post('/api/servers/{server_id}/config')
-async def set_config(server_id: int, body: dict, user: dict = Depends(get_current_user)):
-    """Update one or more config values. Body: {"key": "value", ...}"""
+async def set_server_config(server_id: int, body: dict, user: dict = Depends(get_current_user)):
+    """Update one or more config values for this guild. Body: {"key": "value", ...}"""
     require_guild_admin(user, server_id)
-    with get_connection() as conn:
-        for key, value in body.items():
-            conn.execute(
-                'INSERT INTO config (key,value) VALUES (?,?) '
-                'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                (key, str(value)),
-            )
+    for key, value in body.items():
+        db_set_config(server_id, key, str(value))
     return {'updated': list(body.keys())}
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
@@ -570,14 +627,9 @@ async def protection_send_message(server_id: int, user: dict = Depends(get_curre
     if guild is None:
         raise HTTPException(status_code=404, detail='Bot is not in this server')
 
-    with get_connection() as conn:
-        def _cfg(key, default=''):
-            row = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
-            return row['value'] if row else default
-
-        title       = _cfg('protection_main_embed_title',       '🛡️ Server Protection')
-        description = _cfg('protection_main_embed_description', 'This server is protected by AVbot.')
-        ch_value    = _cfg('protection_main_embed_channel', '')
+    title       = db_get_config(server_id, 'protection_main_embed_title',       '🛡️ Server Protection')
+    description = db_get_config(server_id, 'protection_main_embed_description', 'This server is protected by AVbot.')
+    ch_value    = db_get_config(server_id, 'protection_main_embed_channel',     '') or ''
 
     if not ch_value.strip():
         raise HTTPException(status_code=400, detail='protection_main_embed_channel is not configured')

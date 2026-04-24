@@ -1,5 +1,5 @@
 from shared_bot import bot
-from database import init_db
+from database import init_db, ensure_guild_defaults
 import os
 
 init_db()
@@ -19,6 +19,8 @@ async def setup_hook():
 
 @bot.event
 async def on_ready():
+    for guild in bot.guilds:
+        ensure_guild_defaults(guild.id)
     print(f'Bot is online: {bot.user}')
 
 if __name__ == '__main__':

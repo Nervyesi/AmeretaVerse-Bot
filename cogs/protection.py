@@ -1,7 +1,7 @@
 """
 protection.py — AmeretaVerse Auto-Moderation Module
 Handles: link detection, spam, suspicious users, phishing, anti-raid, banned words.
-All settings stored in the config table with protection_ prefix. Zero hardcoded lists.
+All settings stored in the per-guild config table with protection_ prefix.
 """
 
 import re
@@ -11,11 +11,14 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-from database import get_connection
+from database import (
+    get_connection,
+    get_config as _db_get_config,
+    set_config as _db_set_config,
+)
 
 LOGO_URL = "https://i.imgur.com/KAkfd9v.png"
 
-# ── URL regex ─────────────────────────────────────────────────────────────────
 URL_RE = re.compile(
     r"(https?://|www\.)\S+|"
     r"\b(?:[a-zA-Z0-9\-]+\.)+(?:com|io|xyz|net|org|gg|app|co|ru|site|club|info|biz|me)\b",
@@ -23,37 +26,31 @@ URL_RE = re.compile(
 )
 
 
-# ── Config helpers ────────────────────────────────────────────────────────────
+# ── Per-guild config helpers ──────────────────────────────────────────────────
 
-def cfg_get(key: str, default: str = "") -> str:
-    with get_connection() as conn:
-        row = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
-
-
-def cfg_set(key: str, value: str):
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO config (key,value) VALUES (?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+def cfg_get(guild_id: int, key: str, default: str = "") -> str:
+    val = _db_get_config(guild_id, key)
+    return val if val is not None else default
 
 
-def cfg_bool(key: str, default: bool = True) -> bool:
-    val = cfg_get(key, "1" if default else "0")
+def cfg_set(guild_id: int, key: str, value: str):
+    _db_set_config(guild_id, key, value)
+
+
+def cfg_bool(guild_id: int, key: str, default: bool = True) -> bool:
+    val = cfg_get(guild_id, key, "1" if default else "0")
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def cfg_int(key: str, default: int) -> int:
+def cfg_int(guild_id: int, key: str, default: int) -> int:
     try:
-        return int(cfg_get(key, str(default)))
+        return int(cfg_get(guild_id, key, str(default)))
     except ValueError:
         return default
 
 
-def cfg_list(key: str, default: str = "") -> list[str]:
-    raw = cfg_get(key, default)
+def cfg_list(guild_id: int, key: str, default: str = "") -> list[str]:
+    raw = cfg_get(guild_id, key, default)
     return [x.strip().lower() for x in raw.split(",") if x.strip()]
 
 
@@ -107,7 +104,7 @@ def extract_domains(text: str) -> list[str]:
 
 
 async def get_mod_log(guild: discord.Guild) -> discord.TextChannel | None:
-    value = cfg_get("protection_log_channel", "mod-log")
+    value = cfg_get(guild.id, "protection_log_channel", "mod-log")
     return resolve_channel(guild, value)
 
 
@@ -140,9 +137,10 @@ class ProtectionCog(commands.Cog):
     # ── DM helper ─────────────────────────────────────────────────────────────
 
     async def _send_dm(self, member: discord.Member, template_key: str, **fmt_kwargs):
-        if not cfg_bool("protection_dm_on_action", default=False):
+        guild_id = member.guild.id
+        if not cfg_bool(guild_id, "protection_dm_on_action", default=False):
             return
-        template = cfg_get(template_key, "")
+        template = cfg_get(guild_id, template_key, "")
         if not template.strip():
             return
         try:
@@ -180,12 +178,12 @@ class ProtectionCog(commands.Cog):
     # ── Spam detection ────────────────────────────────────────────────────────
 
     async def _check_spam(self, message: discord.Message):
-        if not cfg_bool("protection_spam_detection"):
+        guild_id = message.guild.id
+        if not cfg_bool(guild_id, "protection_spam_detection"):
             return
 
-        threshold = cfg_int("protection_spam_threshold", 5)
-        window    = cfg_int("protection_spam_window",    10)
-        guild_id  = message.guild.id
+        threshold = cfg_int(guild_id, "protection_spam_threshold", 5)
+        window    = cfg_int(guild_id, "protection_spam_window",    10)
         user_id   = message.author.id
         now       = time.monotonic()
 
@@ -195,8 +193,8 @@ class ProtectionCog(commands.Cog):
 
         if len(self._spam_buckets[guild_id][user_id]) >= threshold:
             self._spam_buckets[guild_id][user_id].clear()
-            action   = cfg_get("protection_spam_action", "mute")
-            duration = cfg_int("protection_spam_mute_duration", 600)
+            action   = cfg_get(guild_id, "protection_spam_action", "mute")
+            duration = cfg_int(guild_id, "protection_spam_mute_duration", 600)
             reason   = f"Spam detection: {threshold}+ msgs in {window}s"
 
             if action == "mute":
@@ -205,8 +203,7 @@ class ProtectionCog(commands.Cog):
                 await self._execute_member_action(message.author, action, reason)
 
             log_action(guild_id, "spam_mute", user_id, f"Sent {threshold}+ msgs in {window}s")
-            await self._send_dm(message.author, "protection_dm_spam_message",
-                                duration=duration)
+            await self._send_dm(message.author, "protection_dm_spam_message", duration=duration)
             embed = protection_embed(
                 "🚫 Spam Detected",
                 f"**User:** {message.author.mention} (`{message.author}`)\n"
@@ -219,15 +216,13 @@ class ProtectionCog(commands.Cog):
 
     async def _mute_user(self, guild: discord.Guild, member: discord.Member,
                          reason: str, duration_seconds: int = 600):
-        # Try native Discord timeout first
         try:
             until = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
             await member.timeout(until, reason=reason)
             return
         except (discord.Forbidden, AttributeError):
             pass
-        # Fallback to role-based mute
-        mute_role_value = cfg_get("protection_mute_role", "Muted")
+        mute_role_value = cfg_get(guild.id, "protection_mute_role", "Muted")
         mute_role = resolve_role(guild, mute_role_value)
         if not mute_role:
             try:
@@ -257,20 +252,22 @@ class ProtectionCog(commands.Cog):
         if not domains:
             return
 
+        guild_id = message.guild.id
+
         # 1. Phishing check
-        if cfg_bool("protection_phishing_detection"):
+        if cfg_bool(guild_id, "protection_phishing_detection"):
             phishing_domains = set(cfg_list(
-                "protection_phishing_list",
+                guild_id, "protection_phishing_list",
                 "discorcl.com,discord-nitro.com"
             ))
             for d in domains:
                 if d in phishing_domains:
-                    phishing_action = cfg_get("protection_phishing_action", "delete")
+                    phishing_action = cfg_get(guild_id, "protection_phishing_action", "delete")
                     try:
                         await message.delete()
                     except discord.NotFound:
                         pass
-                    log_action(message.guild.id, "phishing_delete", message.author.id, d)
+                    log_action(guild_id, "phishing_delete", message.author.id, d)
                     await self._send_dm(message.author, "protection_dm_phishing_message")
                     if phishing_action not in ("delete", "warn"):
                         await self._execute_member_action(
@@ -289,21 +286,22 @@ class ProtectionCog(commands.Cog):
                     return
 
         # 2. General link detection
-        if not cfg_bool("protection_link_detection"):
+        if not cfg_bool(guild_id, "protection_link_detection"):
             return
 
-        whitelist_raw = cfg_get("protection_link_whitelist", "twitter.com,x.com,discord.gg,youtube.com")
+        whitelist_raw = cfg_get(guild_id, "protection_link_whitelist",
+                                "twitter.com,x.com,discord.gg,youtube.com")
         whitelist = {d.strip().lower() for d in whitelist_raw.split(",") if d.strip()}
 
         for d in domains:
             if any(d == w or d.endswith("." + w) for w in whitelist):
                 continue
-            link_action = cfg_get("protection_link_action", "delete")
+            link_action = cfg_get(guild_id, "protection_link_action", "delete")
             try:
                 await message.delete()
             except discord.NotFound:
                 pass
-            log_action(message.guild.id, "link_delete", message.author.id, d)
+            log_action(guild_id, "link_delete", message.author.id, d)
             await self._send_dm(message.author, "protection_dm_link_message")
             if link_action not in ("delete", "warn"):
                 await self._execute_member_action(
@@ -323,10 +321,11 @@ class ProtectionCog(commands.Cog):
     # ── Banned words filter ────────────────────────────────────────────────────
 
     async def _check_banned_words(self, message: discord.Message):
-        if not cfg_bool("protection_banned_words"):
+        guild_id = message.guild.id
+        if not cfg_bool(guild_id, "protection_banned_words"):
             return
 
-        words_raw = cfg_get("protection_banned_words_list", "")
+        words_raw = cfg_get(guild_id, "protection_banned_words_list", "")
         if not words_raw.strip():
             return
 
@@ -335,12 +334,12 @@ class ProtectionCog(commands.Cog):
 
         for word in banned:
             if word in content_lower:
-                banned_action = cfg_get("protection_banned_words_action", "delete")
+                banned_action = cfg_get(guild_id, "protection_banned_words_action", "delete")
                 try:
                     await message.delete()
                 except discord.NotFound:
                     pass
-                log_action(message.guild.id, "banned_word", message.author.id, word)
+                log_action(guild_id, "banned_word", message.author.id, word)
                 await self._send_dm(message.author, "protection_dm_banned_word_message")
                 if banned_action not in ("delete", "warn"):
                     await self._execute_member_action(
@@ -367,26 +366,24 @@ class ProtectionCog(commands.Cog):
     # ── Suspicious user detection ─────────────────────────────────────────────
 
     async def _check_suspicious(self, member: discord.Member):
-        if not cfg_bool("protection_suspicious_users"):
+        guild_id = member.guild.id
+        if not cfg_bool(guild_id, "protection_suspicious_users"):
             return
 
         flags: list[str] = []
 
-        # No avatar check (if sub-toggle is on)
-        if cfg_bool("protection_suspicious_no_avatar", True) and member.avatar is None:
+        if cfg_bool(guild_id, "protection_suspicious_no_avatar", True) and member.avatar is None:
             flags.append("No profile picture (default avatar)")
 
-        # Account age check
-        min_age_days = cfg_int("protection_suspicious_account_age", 7)
+        min_age_days = cfg_int(guild_id, "protection_suspicious_account_age", 7)
         if min_age_days > 0:
             age = datetime.now(timezone.utc) - member.created_at
             if age < timedelta(days=min_age_days):
                 flags.append(f"Account created {age.days}d ago (minimum: {min_age_days}d)")
 
-        # Username keyword check (if sub-toggle is on)
-        if cfg_bool("protection_suspicious_username_keywords", True):
+        if cfg_bool(guild_id, "protection_suspicious_username_keywords", True):
             scam_words = cfg_list(
-                "protection_suspicious_keywords_list",
+                guild_id, "protection_suspicious_keywords_list",
                 "admin,mod,moderator,support,giveaway,airdrop,staff,team"
             )
             name_lower = (member.name + " " + (member.display_name or "")).lower()
@@ -394,15 +391,10 @@ class ProtectionCog(commands.Cog):
             if matched:
                 flags.append(f"Suspicious name keywords: {', '.join(matched)}")
 
-        # Bio keyword check (if sub-toggle is on)
-        # Note: bot cannot access user bio directly via discord.py — this toggle
-        # is reserved for future implementation when Discord exposes it.
-        # cfg_bool("protection_suspicious_bio_keywords", False) is intentionally skipped.
-
         if not flags:
             return
 
-        action = cfg_get("protection_suspicious_action", "flag")
+        action = cfg_get(guild_id, "protection_suspicious_action", "flag")
         guild  = member.guild
 
         log_action(guild.id, f"suspicious_{action}", member.id, "; ".join(flags))
@@ -424,12 +416,12 @@ class ProtectionCog(commands.Cog):
     # ── Anti-raid ─────────────────────────────────────────────────────────────
 
     async def _check_anti_raid(self, member: discord.Member):
-        if not cfg_bool("protection_anti_raid"):
+        guild_id = member.guild.id
+        if not cfg_bool(guild_id, "protection_anti_raid"):
             return
 
-        guild_id  = member.guild.id
-        threshold = cfg_int("protection_anti_raid_threshold", 10)
-        window    = cfg_int("protection_anti_raid_window",    60)
+        threshold = cfg_int(guild_id, "protection_anti_raid_threshold", 10)
+        window    = cfg_int(guild_id, "protection_anti_raid_window",    60)
         now       = time.monotonic()
 
         bucket = self._join_buckets[guild_id]
@@ -510,12 +502,14 @@ class ProtectionCog(commands.Cog):
         enabled: bool | None = None,
         value: str | None = None,
     ):
+        guild_id = interaction.guild_id
+
         if feature == "show_all":
             await self._show_config(interaction)
             return
 
         if enabled is not None:
-            cfg_set(feature, "1" if enabled else "0")
+            cfg_set(guild_id, feature, "1" if enabled else "0")
             state = "✅ Enabled" if enabled else "❌ Disabled"
             embed = protection_embed(
                 "⚙️ Protection Config Updated",
@@ -525,7 +519,7 @@ class ProtectionCog(commands.Cog):
             return
 
         if value is not None:
-            cfg_set(feature, value)
+            cfg_set(guild_id, feature, value)
             embed = protection_embed(
                 "⚙️ Protection Config Updated",
                 f"**Feature:** `{feature}`\n**Value:** `{value}`",
@@ -533,7 +527,7 @@ class ProtectionCog(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        current = cfg_get(feature, "(not set)")
+        current = cfg_get(guild_id, feature, "(not set)")
         embed = protection_embed(
             "⚙️ Protection Config",
             f"**Feature:** `{feature}`\n**Current value:** `{current}`",
@@ -541,11 +535,13 @@ class ProtectionCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def _show_config(self, interaction: discord.Interaction):
+        guild_id = interaction.guild_id
+
         def row(label: str, key: str, is_bool: bool = True) -> str:
             if is_bool:
-                v = "✅ On" if cfg_bool(key) else "❌ Off"
+                v = "✅ On" if cfg_bool(guild_id, key) else "❌ Off"
             else:
-                v = f"`{cfg_get(key, '—')}`"
+                v = f"`{cfg_get(guild_id, key, '—')}`"
             return f"**{label}:** {v}"
 
         lines = [
