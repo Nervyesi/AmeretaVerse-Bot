@@ -45,9 +45,12 @@ OAUTH_SCOPES    = 'identify guilds'
 
 app = FastAPI(title='AVbot Dashboard API', version='1.0.0')
 
+_cors_extra   = [o.strip() for o in os.getenv('CORS_ORIGINS', '').split(',') if o.strip()]
+_allow_origins = list({FRONTEND_URL, 'http://localhost:3000', 'http://localhost:3001'} | set(_cors_extra))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, 'http://localhost:3000', 'http://localhost:3001'],
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=['*'],
     allow_headers=['*'],
@@ -962,7 +965,8 @@ async def tickets_stats(server_id: int, user: dict = Depends(get_current_user)):
 @app.get('/health')
 async def health():
     return {
-        'status':    'ok',
-        'bot_ready': bot.is_ready(),
-        'bot_user':  str(bot.user) if bot.user else None,
+        'status':      'ok',
+        'bot_ready':   bot.is_ready(),
+        'bot_user':    str(bot.user) if bot.user else None,
+        'api_version': 'phase-4',
     }
