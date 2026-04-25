@@ -834,6 +834,129 @@ async def leaderboard(
         """, (min(limit, 100),)).fetchall()
     return [dict(r) for r in rows]
 
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  TICKETS ENDPOINTS
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+@app.post('/api/servers/{server_id}/tickets/send-panel')
+async def tickets_send_panel(server_id: int, user: dict = Depends(get_current_user)):
+    """Post the Open Ticket panel embed to the configured panel channel."""
+    require_guild_admin(user, server_id)
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    panel_ch_val = (db_get_config(server_id, 'tickets_panel_channel', '') or '').strip()
+    if not panel_ch_val:
+        raise HTTPException(status_code=400, detail='tickets_panel_channel is not configured')
+
+    channel = None
+    try:
+        channel = guild.get_channel(int(panel_ch_val))
+    except (ValueError, TypeError):
+        pass
+    if channel is None:
+        channel = discord.utils.get(guild.text_channels, name=panel_ch_val)
+    if channel is None:
+        raise HTTPException(status_code=400, detail=f'Channel not found: {panel_ch_val}')
+
+    title   = db_get_config(server_id, 'tickets_panel_title',       'Support Tickets') or 'Support Tickets'
+    desc    = db_get_config(server_id, 'tickets_panel_description',  'Click below to open a ticket.') or ''
+    btn_lbl = db_get_config(server_id, 'tickets_panel_button_label', 'Open Ticket') or 'Open Ticket'
+
+    embed = discord.Embed(title=title, description=desc, color=0x94730D)
+    embed.set_footer(text='AmeretaVerse • Support Tickets')
+
+    # Create a minimal persistent-compatible view (handler registered via bot.add_view at startup)
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label=btn_lbl,
+        style=discord.ButtonStyle.primary,
+        custom_id='tickets:open',
+        emoji='\U0001f3df️',
+    ))
+
+    try:
+        msg = await channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id), 'channel_name': channel.name}
+
+
+@app.get('/api/servers/{server_id}/tickets/list')
+async def list_tickets(
+    server_id: int,
+    status: str = 'open',
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+):
+    """Return tickets for this guild, filtered by status."""
+    require_guild_admin(user, server_id)
+    limit = min(limit, 200)
+    with get_connection() as conn:
+        if status == 'all':
+            rows = conn.execute(
+                "SELECT * FROM tickets WHERE guild_id=? ORDER BY opened_at DESC LIMIT ?",
+                (server_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM tickets WHERE guild_id=? AND status=? ORDER BY opened_at DESC LIMIT ?",
+                (server_id, status, limit),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get('/api/servers/{server_id}/tickets/stats')
+async def tickets_stats(server_id: int, user: dict = Depends(get_current_user)):
+    """Aggregate ticket metrics for this guild."""
+    require_guild_admin(user, server_id)
+    with get_connection() as conn:
+        open_count = conn.execute(
+            "SELECT COUNT(*) FROM tickets WHERE guild_id=? AND status='open'",
+            (server_id,),
+        ).fetchone()[0]
+
+        closed_today = conn.execute(
+            "SELECT COUNT(*) FROM tickets WHERE guild_id=? AND status='closed' "
+            "AND closed_at >= date('now')",
+            (server_id,),
+        ).fetchone()[0]
+
+        closed_week = conn.execute(
+            "SELECT COUNT(*) FROM tickets WHERE guild_id=? AND status='closed' "
+            "AND closed_at >= date('now','-7 days')",
+            (server_id,),
+        ).fetchone()[0]
+
+        avg_row = conn.execute(
+            "SELECT AVG((julianday(closed_at) - julianday(opened_at)) * 24) "
+            "FROM tickets WHERE guild_id=? AND status='closed' AND closed_at IS NOT NULL",
+            (server_id,),
+        ).fetchone()[0]
+
+        oldest_row = conn.execute(
+            "SELECT MAX((julianday('now') - julianday(opened_at)) * 24) "
+            "FROM tickets WHERE guild_id=? AND status='open'",
+            (server_id,),
+        ).fetchone()[0]
+
+    return {
+        'open_count':              open_count,
+        'closed_today':            closed_today,
+        'closed_week':             closed_week,
+        'avg_open_duration_hours': round(avg_row,    1) if avg_row    else 0,
+        'oldest_open_age_hours':   round(oldest_row, 1) if oldest_row else 0,
+    }
+
+
 # ── Health check ───────────────────────────────────────────────────────────────
 
 @app.get('/health')

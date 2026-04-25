@@ -72,6 +72,40 @@ DEFAULT_CONFIG = {
     "protection_main_embed_channel":          "",
     # ── Analytics tracking markers ─────────────────────────────────────────
     "analytics_leaves_tracking_started":      "",
+    # ── Tickets module defaults ────────────────────────────────────────────
+    "tickets_enabled":                        "0",
+    "tickets_panel_channel":                  "",
+    "tickets_panel_title":                    "Support Tickets",
+    "tickets_panel_description":              (
+        "Need help? Click the button below to open a support ticket. "
+        "A staff member will assist you shortly."
+    ),
+    "tickets_panel_button_label":             "Open Ticket",
+    "tickets_category":                       "",
+    "tickets_staff_roles":                    "",
+    "tickets_ping_role":                      "",
+    "tickets_welcome_message":                (
+        "Hi {user}, thanks for opening a ticket. A staff member will be "
+        "with you shortly. Please describe your issue in detail."
+    ),
+    "tickets_archive_channel":                "",
+    "tickets_auto_close_enabled":             "1",
+    "tickets_auto_close_warning_hours":       "48",
+    "tickets_auto_close_final_hours":         "72",
+    "tickets_auto_close_warning_message":     (
+        "⏰ This ticket has been inactive for 48 hours. "
+        "It will be auto-closed in 24 hours unless someone responds."
+    ),
+    "tickets_dm_on_open_enabled":             "1",
+    "tickets_dm_on_open_message":             (
+        "Your support ticket has been opened in {server}. "
+        "We'll be in touch soon."
+    ),
+    "tickets_dm_on_close_enabled":            "1",
+    "tickets_dm_on_close_message":            (
+        "Your support ticket in {server} has been closed. "
+        "If you need further help, feel free to open a new one."
+    ),
 }
 
 
@@ -223,6 +257,23 @@ def init_db():
                 count    INTEGER DEFAULT 0,
                 PRIMARY KEY (guild_id, date, hour)
             );
+
+            CREATE TABLE IF NOT EXISTS tickets (
+                ticket_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id         INTEGER NOT NULL,
+                channel_id       INTEGER NOT NULL,
+                user_id          INTEGER NOT NULL,
+                username         TEXT,
+                opened_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_activity_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                warned_at        TIMESTAMP,
+                closed_at        TIMESTAMP,
+                closed_by        INTEGER,
+                close_reason     TEXT,
+                status           TEXT NOT NULL DEFAULT 'open'
+            );
+            CREATE INDEX IF NOT EXISTS idx_tickets_guild_status ON tickets(guild_id, status);
+            CREATE INDEX IF NOT EXISTS idx_tickets_channel ON tickets(channel_id);
         """)
 
         for migration in [
