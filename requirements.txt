@@ -6,3 +6,4 @@ fastapi
 uvicorn[standard]
 pyjwt
 aiohttp
+requests
