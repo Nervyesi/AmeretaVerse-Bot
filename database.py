@@ -1,7 +1,8 @@
 import sqlite3
 import os
+import shutil
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'ameretaverse.db')
+DB_PATH = os.getenv("DB_PATH", "ameretaverse.db")
 
 DEFAULT_CONFIG = {
     # regular user pool
@@ -115,7 +116,17 @@ def get_connection():
     return conn
 
 
+def _migrate_to_volume():
+    target = os.getenv("DB_PATH", "ameretaverse.db")
+    legacy = "ameretaverse.db"
+    if target != legacy and not os.path.exists(target) and os.path.exists(legacy):
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(legacy, target)
+        print(f"Migrated database from {legacy} to {target}")
+
+
 def init_db():
+    _migrate_to_volume()
     with get_connection() as conn:
         # ── Migrate old global config table to per-guild if needed ─────────
         cols = [r[1] for r in conn.execute("PRAGMA table_info(config)").fetchall()]
