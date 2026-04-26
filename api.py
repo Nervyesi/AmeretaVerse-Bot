@@ -30,11 +30,14 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CLIENT_ID       = os.getenv('DISCORD_CLIENT_ID',   '')
-CLIENT_SECRET   = os.getenv('DISCORD_CLIENT_SECRET', '')
-REDIRECT_URI    = os.getenv('DISCORD_REDIRECT_URI',  'http://localhost:8000/auth/callback')
+CLIENT_ID       = os.getenv('DISCORD_CLIENT_ID')
+CLIENT_SECRET   = os.getenv('DISCORD_CLIENT_SECRET')
+REDIRECT_URI    = os.getenv('DISCORD_REDIRECT_URI')
 JWT_SECRET      = os.getenv('JWT_SECRET',            'change-me-in-production')
 FRONTEND_URL    = os.getenv('FRONTEND_URL',          'http://localhost:3000')
+
+print(f"DISCORD_CLIENT_ID loaded: {bool(CLIENT_ID)}")
+print(f"DISCORD_REDIRECT_URI: {REDIRECT_URI}")
 JWT_EXPIRE_DAYS = 7
 
 DISCORD_API     = 'https://discord.com/api/v10'
