@@ -285,6 +285,39 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_tickets_guild_status ON tickets(guild_id, status);
             CREATE INDEX IF NOT EXISTS idx_tickets_channel ON tickets(channel_id);
+
+            CREATE TABLE IF NOT EXISTS roleselect_panels (
+                panel_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    INTEGER NOT NULL,
+                channel_id  INTEGER,
+                message_id  INTEGER,
+                title       TEXT NOT NULL DEFAULT '🎯 Role Selection',
+                description TEXT DEFAULT '',
+                style       TEXT NOT NULL DEFAULT 'buttons',
+                created_at  TEXT DEFAULT (datetime('now')),
+                updated_at  TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_rs_panels_guild ON roleselect_panels(guild_id);
+
+            CREATE TABLE IF NOT EXISTS roleselect_buttons (
+                button_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                panel_id               INTEGER NOT NULL,
+                position               INTEGER NOT NULL DEFAULT 0,
+                label                  TEXT NOT NULL DEFAULT 'Click me',
+                emoji                  TEXT DEFAULT '',
+                role                   TEXT NOT NULL,
+                mode                   TEXT NOT NULL DEFAULT 'toggle',
+                confirm_give_enabled   INTEGER NOT NULL DEFAULT 0,
+                confirm_give_message   TEXT DEFAULT 'Are you sure you want this role?',
+                confirm_take_enabled   INTEGER NOT NULL DEFAULT 0,
+                confirm_take_message   TEXT DEFAULT 'Are you sure you want to remove this role?',
+                dm_give_enabled        INTEGER NOT NULL DEFAULT 0,
+                dm_give_message        TEXT DEFAULT 'You received the {role} role in {server}.',
+                dm_take_enabled        INTEGER NOT NULL DEFAULT 0,
+                dm_take_message        TEXT DEFAULT 'You no longer have the {role} role in {server}.',
+                FOREIGN KEY (panel_id) REFERENCES roleselect_panels(panel_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_rs_buttons_panel ON roleselect_buttons(panel_id);
         """)
 
         for migration in [
@@ -339,6 +372,133 @@ def get_all_config(guild_id: int) -> dict:
     for r in rows:
         result[r["key"]] = r["value"]
     return result
+
+
+# ── RoleSelect CRUD helpers ────────────────────────────────────────────────────
+
+def get_panels(guild_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM roleselect_panels WHERE guild_id=? ORDER BY panel_id",
+            (guild_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_panel(panel_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM roleselect_panels WHERE panel_id=?",
+            (panel_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_panel(guild_id: int, title: str, description: str, style: str) -> int:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO roleselect_panels (guild_id, title, description, style) "
+            "VALUES (?,?,?,?)",
+            (guild_id, title, description, style),
+        )
+        return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def update_panel(panel_id: int, **fields) -> bool:
+    allowed = {'channel_id', 'message_id', 'title', 'description', 'style'}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    set_clause = (
+        ', '.join(f"{k}=?" for k in updates)
+        + ', updated_at=CURRENT_TIMESTAMP'
+    )
+    with get_connection() as conn:
+        c = conn.execute(
+            f"UPDATE roleselect_panels SET {set_clause} WHERE panel_id=?",
+            list(updates.values()) + [panel_id],
+        )
+    return c.rowcount > 0
+
+
+def delete_panel(panel_id: int) -> bool:
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM roleselect_buttons WHERE panel_id=?", (panel_id,)
+        )
+        c = conn.execute(
+            "DELETE FROM roleselect_panels WHERE panel_id=?", (panel_id,)
+        )
+    return c.rowcount > 0
+
+
+def get_buttons(panel_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM roleselect_buttons "
+            "WHERE panel_id=? ORDER BY position, button_id",
+            (panel_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_button(button_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM roleselect_buttons WHERE button_id=?",
+            (button_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_button(panel_id: int, **fields) -> int:
+    allowed = {
+        'position', 'label', 'emoji', 'role', 'mode',
+        'confirm_give_enabled', 'confirm_give_message',
+        'confirm_take_enabled', 'confirm_take_message',
+        'dm_give_enabled', 'dm_give_message',
+        'dm_take_enabled', 'dm_take_message',
+    }
+    cols = {'panel_id': panel_id}
+    for k, v in fields.items():
+        if k in allowed:
+            cols[k] = v
+    col_list = ', '.join(cols.keys())
+    placeholders = ', '.join('?' for _ in cols)
+    with get_connection() as conn:
+        conn.execute(
+            f"INSERT INTO roleselect_buttons ({col_list}) VALUES ({placeholders})",
+            list(cols.values()),
+        )
+        return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def update_button(button_id: int, **fields) -> bool:
+    allowed = {
+        'position', 'label', 'emoji', 'role', 'mode',
+        'confirm_give_enabled', 'confirm_give_message',
+        'confirm_take_enabled', 'confirm_take_message',
+        'dm_give_enabled', 'dm_give_message',
+        'dm_take_enabled', 'dm_take_message',
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    set_clause = ', '.join(f"{k}=?" for k in updates)
+    with get_connection() as conn:
+        c = conn.execute(
+            f"UPDATE roleselect_buttons SET {set_clause} WHERE button_id=?",
+            list(updates.values()) + [button_id],
+        )
+    return c.rowcount > 0
+
+
+def delete_button(button_id: int) -> bool:
+    with get_connection() as conn:
+        c = conn.execute(
+            "DELETE FROM roleselect_buttons WHERE button_id=?", (button_id,)
+        )
+    return c.rowcount > 0
 
 
 if __name__ == '__main__':

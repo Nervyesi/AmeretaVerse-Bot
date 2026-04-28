@@ -18,11 +18,23 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from dotenv import load_dotenv
 
 import discord
+from pydantic import BaseModel
+
 from database import (
     get_connection,
     get_config as db_get_config,
     set_config as db_set_config,
     get_all_config as db_get_all_config,
+    get_panels as db_get_panels,
+    get_panel as db_get_panel,
+    create_panel as db_create_panel,
+    update_panel as db_update_panel,
+    delete_panel as db_delete_panel,
+    get_buttons as db_get_buttons,
+    get_button as db_get_button,
+    create_button as db_create_button,
+    update_button as db_update_button,
+    delete_button as db_delete_button,
 )
 from shared_bot import bot
 
@@ -960,6 +972,296 @@ async def tickets_stats(server_id: int, user: dict = Depends(get_current_user)):
         'closed_week':             closed_week,
         'avg_open_duration_hours': round(avg_row,    1) if avg_row    else 0,
         'oldest_open_age_hours':   round(oldest_row, 1) if oldest_row else 0,
+    }
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  ROLE SELECT ENDPOINTS
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+# ── Pydantic request models ───────────────────────────────────────────────────
+
+class _PanelCreate(BaseModel):
+    title: str = '🎯 Role Selection'
+    description: str = ''
+    style: str = 'buttons'
+
+
+class _PanelUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    style: Optional[str] = None
+    channel_id: Optional[int] = None
+
+
+class _ButtonCreate(BaseModel):
+    label: str = 'Click me'
+    emoji: str = ''
+    role: str
+    mode: str = 'toggle'
+    confirm_give_enabled: int = 0
+    confirm_give_message: str = 'Are you sure you want this role?'
+    confirm_take_enabled: int = 0
+    confirm_take_message: str = 'Are you sure you want to remove this role?'
+    dm_give_enabled: int = 0
+    dm_give_message: str = 'You received the {role} role in {server}.'
+    dm_take_enabled: int = 0
+    dm_take_message: str = 'You no longer have the {role} role in {server}.'
+
+
+class _ButtonUpdate(BaseModel):
+    label: Optional[str] = None
+    emoji: Optional[str] = None
+    role: Optional[str] = None
+    mode: Optional[str] = None
+    confirm_give_enabled: Optional[int] = None
+    confirm_give_message: Optional[str] = None
+    confirm_take_enabled: Optional[int] = None
+    confirm_take_message: Optional[str] = None
+    dm_give_enabled: Optional[int] = None
+    dm_give_message: Optional[str] = None
+    dm_take_enabled: Optional[int] = None
+    dm_take_message: Optional[str] = None
+
+
+class _SendPanelBody(BaseModel):
+    channel_id: int
+
+
+# ── Panel ownership guard ─────────────────────────────────────────────────────
+
+def _get_rs_panel(panel_id: int, server_id: int) -> dict:
+    panel = db_get_panel(panel_id)
+    if panel is None:
+        raise HTTPException(status_code=404, detail='Panel not found')
+    if panel['guild_id'] != server_id:
+        raise HTTPException(status_code=403, detail='Panel does not belong to this server')
+    return panel
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get('/api/servers/{server_id}/roleselect/panels')
+async def rs_list_panels(server_id: int, user: dict = Depends(get_current_user)):
+    require_guild_admin(user, server_id)
+    panels = db_get_panels(server_id)
+    for panel in panels:
+        panel['buttons'] = db_get_buttons(panel['panel_id'])
+    return {'panels': panels}
+
+
+@app.post('/api/servers/{server_id}/roleselect/panels')
+async def rs_create_panel(
+    server_id: int,
+    body: _PanelCreate,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    if body.style not in ('buttons', 'dropdown'):
+        raise HTTPException(status_code=400, detail="style must be 'buttons' or 'dropdown'")
+    panel_id = db_create_panel(server_id, body.title, body.description, body.style)
+    panel = db_get_panel(panel_id)
+    panel['buttons'] = []
+    return panel
+
+
+@app.patch('/api/servers/{server_id}/roleselect/panels/{panel_id}')
+async def rs_update_panel(
+    server_id: int,
+    panel_id: int,
+    body: _PanelUpdate,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _get_rs_panel(panel_id, server_id)
+    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if 'style' in updates and updates['style'] not in ('buttons', 'dropdown'):
+        raise HTTPException(status_code=400, detail="style must be 'buttons' or 'dropdown'")
+    if updates:
+        db_update_panel(panel_id, **updates)
+    panel = db_get_panel(panel_id)
+    panel['buttons'] = db_get_buttons(panel_id)
+    return panel
+
+
+@app.delete('/api/servers/{server_id}/roleselect/panels/{panel_id}')
+async def rs_delete_panel(
+    server_id: int,
+    panel_id: int,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    panel = _get_rs_panel(panel_id, server_id)
+
+    if panel.get('message_id') and panel.get('channel_id') and bot.is_ready():
+        guild = bot.get_guild(server_id)
+        if guild:
+            channel = guild.get_channel(int(panel['channel_id']))
+            if channel:
+                try:
+                    msg = await channel.fetch_message(int(panel['message_id']))
+                    await msg.delete()
+                except Exception:
+                    pass
+
+    db_delete_panel(panel_id)
+    return {'ok': True}
+
+
+@app.post('/api/servers/{server_id}/roleselect/panels/{panel_id}/buttons')
+async def rs_create_button(
+    server_id: int,
+    panel_id: int,
+    body: _ButtonCreate,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _get_rs_panel(panel_id, server_id)
+    if body.mode not in ('give', 'take', 'toggle'):
+        raise HTTPException(status_code=400, detail="mode must be 'give', 'take', or 'toggle'")
+    existing = db_get_buttons(panel_id)
+    if len(existing) >= 20:
+        raise HTTPException(status_code=400, detail='Maximum 20 buttons per panel')
+    button_id = db_create_button(panel_id, **body.model_dump())
+    return db_get_button(button_id)
+
+
+@app.patch('/api/servers/{server_id}/roleselect/panels/{panel_id}/buttons/{button_id}')
+async def rs_update_button(
+    server_id: int,
+    panel_id: int,
+    button_id: int,
+    body: _ButtonUpdate,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _get_rs_panel(panel_id, server_id)
+    btn = db_get_button(button_id)
+    if btn is None or btn['panel_id'] != panel_id:
+        raise HTTPException(status_code=404, detail='Button not found on this panel')
+    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if 'mode' in updates and updates['mode'] not in ('give', 'take', 'toggle'):
+        raise HTTPException(status_code=400, detail="mode must be 'give', 'take', or 'toggle'")
+    if updates:
+        db_update_button(button_id, **updates)
+    return db_get_button(button_id)
+
+
+@app.delete('/api/servers/{server_id}/roleselect/panels/{panel_id}/buttons/{button_id}')
+async def rs_delete_button(
+    server_id: int,
+    panel_id: int,
+    button_id: int,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _get_rs_panel(panel_id, server_id)
+    btn = db_get_button(button_id)
+    if btn is None or btn['panel_id'] != panel_id:
+        raise HTTPException(status_code=404, detail='Button not found on this panel')
+    db_delete_button(button_id)
+    return {'ok': True}
+
+
+@app.post('/api/servers/{server_id}/roleselect/panels/{panel_id}/send')
+async def rs_send_panel(
+    server_id: int,
+    panel_id: int,
+    body: _SendPanelBody,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    panel = _get_rs_panel(panel_id, server_id)
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    channel = guild.get_channel(body.channel_id)
+    if channel is None:
+        raise HTTPException(status_code=400, detail=f'Channel not found: {body.channel_id}')
+
+    from cogs.roleselect import build_panel_view
+
+    embed = discord.Embed(
+        title=panel['title'],
+        description=panel['description'] or '',
+        color=0x94730D,
+    )
+    embed.set_footer(text='AmeretaVerse • Role Selection')
+    view = build_panel_view(panel_id)
+
+    # Edit the existing Discord message if one was already sent
+    if panel.get('message_id') and panel.get('channel_id'):
+        existing_ch = guild.get_channel(int(panel['channel_id']))
+        if existing_ch:
+            try:
+                msg = await existing_ch.fetch_message(int(panel['message_id']))
+                await msg.edit(embed=embed, view=view)
+                db_update_panel(panel_id, channel_id=body.channel_id, message_id=msg.id)
+                return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(existing_ch.id)}
+            except Exception:
+                pass
+
+    try:
+        msg = await channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    db_update_panel(panel_id, channel_id=body.channel_id, message_id=msg.id)
+    return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
+
+
+@app.post('/api/servers/{server_id}/roleselect/panels/{panel_id}/refresh')
+async def rs_refresh_panel(
+    server_id: int,
+    panel_id: int,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    panel = _get_rs_panel(panel_id, server_id)
+
+    if not panel.get('message_id') or not panel.get('channel_id'):
+        return {'ok': False, 'detail': 'Panel has not been sent yet'}
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    channel = guild.get_channel(int(panel['channel_id']))
+    if channel is None:
+        raise HTTPException(status_code=400, detail='Panel channel no longer exists')
+
+    from cogs.roleselect import build_panel_view
+
+    embed = discord.Embed(
+        title=panel['title'],
+        description=panel['description'] or '',
+        color=0x94730D,
+    )
+    embed.set_footer(text='AmeretaVerse • Role Selection')
+    view = build_panel_view(panel_id)
+
+    try:
+        msg = await channel.fetch_message(int(panel['message_id']))
+        await msg.edit(embed=embed, view=view)
+    except discord.NotFound:
+        raise HTTPException(status_code=404, detail='Panel message no longer exists in Discord')
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to edit that message')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        'ok': True,
+        'message_id': str(panel['message_id']),
+        'channel_id': str(panel['channel_id']),
     }
 
 

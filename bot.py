@@ -7,11 +7,10 @@ init_db()
 @bot.event
 async def setup_hook():
     await bot.load_extension('cogs.verify')
-    await bot.load_extension('cogs.Maineroles')
+    await bot.load_extension('cogs.roleselect')
     await bot.load_extension('cogs.creatorticket')
     await bot.load_extension('cogs.raidbot')
     await bot.load_extension('cogs.engage')
-    await bot.load_extension('cogs.sections')
     await bot.load_extension('cogs.protection')
     await bot.load_extension('cogs.analytics')
     await bot.load_extension('cogs.tickets')
