@@ -991,7 +991,7 @@ class _PanelUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     style: Optional[str] = None
-    channel_id: Optional[int] = None
+    channel_id: Optional[str] = None
 
 
 class _ButtonCreate(BaseModel):
@@ -1025,7 +1025,7 @@ class _ButtonUpdate(BaseModel):
 
 
 class _SendPanelBody(BaseModel):
-    channel_id: int
+    channel_id: str
 
 
 # ── Panel ownership guard ─────────────────────────────────────────────────────
@@ -1077,6 +1077,14 @@ async def rs_update_panel(
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if 'style' in updates and updates['style'] not in ('buttons', 'dropdown'):
         raise HTTPException(status_code=400, detail="style must be 'buttons' or 'dropdown'")
+    # Convert channel_id string to int for DB (drop silently if not numeric — name lookup
+    # only happens at send time via resolve_channel)
+    if 'channel_id' in updates:
+        chid_str = str(updates['channel_id']).strip()
+        if chid_str.isdigit():
+            updates['channel_id'] = int(chid_str)
+        else:
+            del updates['channel_id']
     if updates:
         db_update_panel(panel_id, **updates)
     panel = db_get_panel(panel_id)
@@ -1179,11 +1187,12 @@ async def rs_send_panel(
     if guild is None:
         raise HTTPException(status_code=404, detail='Bot is not in this server')
 
-    channel = guild.get_channel(body.channel_id)
+    from cogs._utils import resolve_channel
+    from cogs.roleselect import build_panel_view
+
+    channel = resolve_channel(guild, body.channel_id)
     if channel is None:
         raise HTTPException(status_code=400, detail=f'Channel not found: {body.channel_id}')
-
-    from cogs.roleselect import build_panel_view
 
     embed = discord.Embed(
         title=panel['title'],
@@ -1200,8 +1209,8 @@ async def rs_send_panel(
             try:
                 msg = await existing_ch.fetch_message(int(panel['message_id']))
                 await msg.edit(embed=embed, view=view)
-                db_update_panel(panel_id, channel_id=body.channel_id, message_id=msg.id)
-                return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(existing_ch.id)}
+                db_update_panel(panel_id, channel_id=channel.id, message_id=msg.id)
+                return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
             except Exception:
                 pass
 
@@ -1212,7 +1221,7 @@ async def rs_send_panel(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    db_update_panel(panel_id, channel_id=body.channel_id, message_id=msg.id)
+    db_update_panel(panel_id, channel_id=channel.id, message_id=msg.id)
     return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
 
 
