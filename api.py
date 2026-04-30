@@ -3,6 +3,15 @@ api.py — AVbot Dashboard API
 FastAPI server that runs alongside the Discord bot in the same asyncio loop.
 The bot instance is shared via shared_bot.py so guild data is available live.
 """
+# DISCORD ID HANDLING:
+# Discord Snowflakes are 17-19 digit ints that overflow JS Number precision.
+# All Discord ID fields in Pydantic models are typed as `str` to accept either
+# raw IDs from the frontend (sent as strings to avoid JS truncation) or names
+# (resolved by resolve_channel / resolve_role in cogs/_utils.py). Inside
+# endpoints, always use resolve_channel/resolve_role rather than calling
+# guild.get_channel(int(x)) directly on user-supplied values.
+# Internal DB IDs (panel_id, button_id, ticket_id, etc.) are auto-increment
+# SQLite integers and remain typed as int — they are always small and safe.
 
 import os
 import json
