@@ -1211,17 +1211,23 @@ async def rs_send_panel(
     embed.set_footer(text='AmeretaVerse • Role Selection')
     view = build_panel_view(panel_id)
 
-    # Edit the existing Discord message if one was already sent
-    if panel.get('message_id') and panel.get('channel_id'):
-        existing_ch = guild.get_channel(int(panel['channel_id']))
+    # Edit the existing Discord message only if it's in the same channel the user is targeting
+    existing_channel_id = panel.get('channel_id')
+    if panel.get('message_id') and existing_channel_id and int(existing_channel_id) == channel.id:
+        existing_ch = guild.get_channel(int(existing_channel_id))
         if existing_ch:
             try:
                 msg = await existing_ch.fetch_message(int(panel['message_id']))
                 await msg.edit(embed=embed, view=view)
                 db_update_panel(panel_id, channel_id=channel.id, message_id=msg.id)
                 return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
-            except Exception:
-                pass
+            except discord.NotFound:
+                print(f'[api] Panel {panel_id} message {panel["message_id"]} not found in Discord, sending fresh')
+            except discord.Forbidden:
+                print(f'[api] Panel {panel_id}: bot lacks permission to edit existing message')
+                raise HTTPException(status_code=400, detail='Bot lacks permission to edit existing message')
+            except Exception as e:
+                print(f'[api] Panel {panel_id} edit failed: {type(e).__name__}: {e}')
 
     try:
         msg = await channel.send(embed=embed, view=view)

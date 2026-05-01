@@ -1,5 +1,6 @@
 import io
 import re
+import traceback
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -87,143 +88,155 @@ class OpenTicketView(discord.ui.View):
         self.add_item(btn)
 
     async def _on_open(self, interaction: discord.Interaction):
-        guild    = interaction.guild
-        user     = interaction.user
-        guild_id = guild.id
-
-        if not _cfg_bool(guild_id, 'tickets_enabled', '0'):
-            await interaction.response.send_message(
-                'Tickets are currently disabled.', ephemeral=True
-            )
-            return
-
-        # One open ticket per user
-        with get_connection() as conn:
-            existing = conn.execute(
-                "SELECT ticket_id, channel_id FROM tickets "
-                "WHERE guild_id=? AND user_id=? AND status='open'",
-                (guild_id, user.id),
-            ).fetchone()
-
-        if existing:
-            await interaction.response.send_message(
-                f"You already have an open ticket: <#{existing['channel_id']}>",
-                ephemeral=True,
-            )
-            return
-
-        # Resolve category
-        cat_val  = (_cfg(guild_id, 'tickets_category') or '').strip()
-        category = resolve_category(guild, cat_val)
-        if category is None:
-            await interaction.response.send_message(
-                'Ticket system is misconfigured (category not found). '
-                'Please contact an admin.',
-                ephemeral=True,
-            )
-            return
-
-        # Resolve staff roles
-        staff_raw  = _cfg(guild_id, 'tickets_staff_roles') or ''
-        staff_roles = []
-        for r_str in staff_raw.split(','):
-            r_str = r_str.strip()
-            if r_str:
-                role = resolve_role(guild, r_str)
-                if role:
-                    staff_roles.append(role)
-
-        # Defer so we have time for channel creation
-        await interaction.response.defer(ephemeral=True)
-
-        # INSERT stub row to get ticket_id before naming the channel
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO tickets (guild_id, channel_id, user_id, username, status) "
-                "VALUES (?, 0, ?, ?, 'open')",
-                (guild_id, user.id, user.name),
-            )
-            ticket_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-
-        # Permission overwrites
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            user: discord.PermissionOverwrite(
-                read_messages=True, send_messages=True,
-                embed_links=True, attach_files=True,
-            ),
-            guild.me: discord.PermissionOverwrite(
-                read_messages=True, send_messages=True,
-                manage_channels=True, manage_messages=True,
-            ),
-        }
-        for role in staff_roles:
-            overwrites[role] = discord.PermissionOverwrite(
-                read_messages=True, send_messages=True, manage_messages=True,
-            )
-
-        channel_name = f'ticket-{_safe_name(user.name)}-{ticket_id:04d}'
-
         try:
-            channel = await category.create_text_channel(
-                name=channel_name, overwrites=overwrites
-            )
-        except Exception as e:
+            guild    = interaction.guild
+            user     = interaction.user
+            guild_id = guild.id
+
+            if not _cfg_bool(guild_id, 'tickets_enabled', '0'):
+                await interaction.response.send_message(
+                    'Tickets are currently disabled.', ephemeral=True
+                )
+                return
+
+            # One open ticket per user
             with get_connection() as conn:
-                conn.execute('DELETE FROM tickets WHERE ticket_id=?', (ticket_id,))
-            await interaction.followup.send(
-                f'Failed to create ticket channel: {e}', ephemeral=True
-            )
-            return
+                existing = conn.execute(
+                    "SELECT ticket_id, channel_id FROM tickets "
+                    "WHERE guild_id=? AND user_id=? AND status='open'",
+                    (guild_id, user.id),
+                ).fetchone()
 
-        # Persist real channel_id
-        with get_connection() as conn:
-            conn.execute(
-                'UPDATE tickets SET channel_id=? WHERE ticket_id=?',
-                (channel.id, ticket_id),
-            )
+            if existing:
+                await interaction.response.send_message(
+                    f"You already have an open ticket: <#{existing['channel_id']}>",
+                    ephemeral=True,
+                )
+                return
 
-        # Welcome embed
-        welcome_tmpl = _cfg(
-            guild_id, 'tickets_welcome_message',
-            'Hi {user}, thanks for opening a ticket. A staff member will be with you shortly.',
-        )
-        embed = discord.Embed(
-            title=f'Ticket #{ticket_id:04d}',
-            description=welcome_tmpl.replace('{user}', user.mention),
-            color=BRAND,
-        )
-        embed.set_footer(text=f'AmeretaVerse • Support Tickets | ID: {ticket_id}')
+            # Resolve category
+            cat_val  = (_cfg(guild_id, 'tickets_category') or '').strip()
+            category = resolve_category(guild, cat_val)
+            if category is None:
+                await interaction.response.send_message(
+                    'Ticket system is misconfigured (category not found). '
+                    'Please contact an admin.',
+                    ephemeral=True,
+                )
+                return
 
-        # Ping content
-        ping_raw  = (_cfg(guild_id, 'tickets_ping_role') or '').strip()
-        ping_role = resolve_role(guild, ping_raw) if ping_raw else None
-        parts     = ([ping_role.mention] if ping_role else []) + [user.mention]
+            # Resolve staff roles
+            staff_raw  = _cfg(guild_id, 'tickets_staff_roles') or ''
+            staff_roles = []
+            for r_str in staff_raw.split(','):
+                r_str = r_str.strip()
+                if r_str:
+                    role = resolve_role(guild, r_str)
+                    if role:
+                        staff_roles.append(role)
 
-        close_view = discord.ui.View(timeout=None)
-        close_view.add_item(CloseTicketDynamicButton(ticket_id))
+            # Defer so we have time for channel creation
+            await interaction.response.defer(ephemeral=True)
 
-        await channel.send(
-            content=' '.join(parts),
-            embed=embed,
-            view=close_view,
-            allowed_mentions=discord.AllowedMentions(roles=True, users=True),
-        )
+            # INSERT stub row to get ticket_id before naming the channel
+            with get_connection() as conn:
+                conn.execute(
+                    "INSERT INTO tickets (guild_id, channel_id, user_id, username, status) "
+                    "VALUES (?, 0, ?, ?, 'open')",
+                    (guild_id, user.id, user.name),
+                )
+                ticket_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
 
-        # DM on open
-        if _cfg_bool(guild_id, 'tickets_dm_on_open_enabled'):
-            dm_tmpl = _cfg(
-                guild_id, 'tickets_dm_on_open_message',
-                "Your support ticket has been opened in {server}. We'll be in touch soon.",
-            )
+            # Permission overwrites
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                user: discord.PermissionOverwrite(
+                    read_messages=True, send_messages=True,
+                    embed_links=True, attach_files=True,
+                ),
+                guild.me: discord.PermissionOverwrite(
+                    read_messages=True, send_messages=True,
+                    manage_channels=True, manage_messages=True,
+                ),
+            }
+            for role in staff_roles:
+                overwrites[role] = discord.PermissionOverwrite(
+                    read_messages=True, send_messages=True, manage_messages=True,
+                )
+
+            channel_name = f'ticket-{_safe_name(user.name)}-{ticket_id:04d}'
+
             try:
-                await user.send(dm_tmpl.replace('{server}', guild.name))
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+                channel = await category.create_text_channel(
+                    name=channel_name, overwrites=overwrites
+                )
+            except Exception as e:
+                with get_connection() as conn:
+                    conn.execute('DELETE FROM tickets WHERE ticket_id=?', (ticket_id,))
+                await interaction.followup.send(
+                    f'Failed to create ticket channel: {e}', ephemeral=True
+                )
+                return
 
-        await interaction.followup.send(
-            f'✅ Ticket created: {channel.mention}', ephemeral=True
-        )
+            # Persist real channel_id
+            with get_connection() as conn:
+                conn.execute(
+                    'UPDATE tickets SET channel_id=? WHERE ticket_id=?',
+                    (channel.id, ticket_id),
+                )
+
+            # Welcome embed
+            welcome_tmpl = _cfg(
+                guild_id, 'tickets_welcome_message',
+                'Hi {user}, thanks for opening a ticket. A staff member will be with you shortly.',
+            )
+            embed = discord.Embed(
+                title=f'Ticket #{ticket_id:04d}',
+                description=welcome_tmpl.replace('{user}', user.mention),
+                color=BRAND,
+            )
+            embed.set_footer(text=f'AmeretaVerse • Support Tickets | ID: {ticket_id}')
+
+            # Ping content
+            ping_raw  = (_cfg(guild_id, 'tickets_ping_role') or '').strip()
+            ping_role = resolve_role(guild, ping_raw) if ping_raw else None
+            parts     = ([ping_role.mention] if ping_role else []) + [user.mention]
+
+            close_view = discord.ui.View(timeout=None)
+            close_view.add_item(CloseTicketDynamicButton(ticket_id))
+
+            await channel.send(
+                content=' '.join(parts),
+                embed=embed,
+                view=close_view,
+                allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+            )
+
+            # DM on open
+            if _cfg_bool(guild_id, 'tickets_dm_on_open_enabled'):
+                dm_tmpl = _cfg(
+                    guild_id, 'tickets_dm_on_open_message',
+                    "Your support ticket has been opened in {server}. We'll be in touch soon.",
+                )
+                try:
+                    await user.send(dm_tmpl.replace('{server}', guild.name))
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+            await interaction.followup.send(
+                f'✅ Ticket created: {channel.mention}', ephemeral=True
+            )
+
+        except Exception as e:
+            print(f'[tickets] _on_open error: {type(e).__name__}: {e}')
+            traceback.print_exc()
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send('An unexpected error occurred opening your ticket.', ephemeral=True)
+                else:
+                    await interaction.response.send_message('An unexpected error occurred opening your ticket.', ephemeral=True)
+            except Exception:
+                pass
 
 
 # ── Tickets Cog ────────────────────────────────────────────────────────────────

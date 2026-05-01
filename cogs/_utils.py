@@ -46,6 +46,6 @@ def resolve_category(guild: discord.Guild, value):
         return None
     if s.isdigit():
         ch = guild.get_channel(int(s))
-        if ch:
+        if isinstance(ch, discord.CategoryChannel):
             return ch
     return discord.utils.get(guild.categories, name=s)

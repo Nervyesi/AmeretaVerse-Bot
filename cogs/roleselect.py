@@ -228,8 +228,15 @@ class RoleSelectDropdown(
         return cls(panel_id, options, button_map)
 
     async def callback(self, interaction: discord.Interaction):
-        selected = self.values[0] if self.values else None
-        if not selected or selected == '__none__' or selected not in self.button_map:
+        print(f'[roleselect] dropdown interaction.data: {interaction.data}')
+        # DynamicItem reconstructs the Select fresh; self.values may be unpopulated.
+        # Read selected values directly from the interaction payload instead.
+        selected_values = interaction.data.get('values', [])
+        if not selected_values:
+            await interaction.response.send_message('❌ No selection received.', ephemeral=True)
+            return
+        selected = selected_values[0]
+        if selected == '__none__' or selected not in self.button_map:
             await interaction.response.send_message('❌ Invalid selection.', ephemeral=True)
             return
         button_id = self.button_map[selected]
