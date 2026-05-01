@@ -88,6 +88,7 @@ class OpenTicketView(discord.ui.View):
         self.add_item(btn)
 
     async def _on_open(self, interaction: discord.Interaction):
+        print(f'[tickets] open button clicked by {interaction.user.id} in guild {interaction.guild_id}')
         try:
             guild    = interaction.guild
             user     = interaction.user

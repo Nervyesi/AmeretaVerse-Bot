@@ -985,6 +985,54 @@ async def tickets_stats(server_id: int, user: dict = Depends(get_current_user)):
 
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  VERIFY ENDPOINTS
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+class _VerifySendBody(BaseModel):
+    channel_id: str
+
+
+@app.post('/api/servers/{server_id}/verify/send-message')
+async def verify_send_message(
+    server_id: int,
+    body: _VerifySendBody,
+    user: dict = Depends(get_current_user),
+):
+    """Post the verification embed with Verify button to the specified channel."""
+    require_guild_admin(user, server_id)
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    from cogs._utils import resolve_channel
+    channel = resolve_channel(guild, body.channel_id)
+    if channel is None:
+        raise HTTPException(status_code=400, detail=f'Channel not found: {body.channel_id}')
+
+    title        = db_get_config(server_id, 'verify_embed_title')        or '🔒 Verify to Enter'
+    description  = db_get_config(server_id, 'verify_embed_description')  or 'Click the button below and solve the CAPTCHA to access the server.'
+    button_label = db_get_config(server_id, 'verify_embed_button_label') or 'Verify'
+
+    embed = discord.Embed(title=title, description=description, color=0x94730D)
+    embed.set_footer(text='AmeretaVerse • Verification')
+
+    from cogs.verify import VerifyView
+    view = VerifyView(button_label=button_label)
+
+    try:
+        msg = await channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 #  ROLE SELECT ENDPOINTS
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 

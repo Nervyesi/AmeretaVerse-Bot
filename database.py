@@ -107,6 +107,22 @@ DEFAULT_CONFIG = {
         "Your support ticket in {server} has been closed. "
         "If you need further help, feel free to open a new one."
     ),
+    # ── Verification module defaults ───────────────────────────────────────────
+    "verify_enabled":               "1",
+    "verify_channel":               "",
+    "verify_success_role":          "Verified",
+    "verify_max_attempts":          "3",
+    "verify_embed_title":           "\U0001f512 Verify to Enter",
+    "verify_embed_description":     "Click the button below and solve the CAPTCHA to access the server.",
+    "verify_embed_button_label":    "Verify",
+    "verify_wrong_attempt_message": "❌ Wrong! You have {remaining} attempts left.",
+    "verify_last_chance_message":   "⚠️ Last chance! Get this one wrong and you'll be kicked.",
+    "verify_kicked_message":        "You've been kicked for failing verification. You can rejoin and try again.",
+    "verify_success_message":       "✅ Verified! Welcome to the server.",
+    "verify_dm_on_success_enabled": "1",
+    "verify_dm_on_success_message": "Welcome! You've been verified in {server}.",
+    "verify_dm_on_kick_enabled":    "1",
+    "verify_dm_on_kick_message":    "You were kicked from {server} for failing CAPTCHA. Feel free to try again.",
 }
 
 
