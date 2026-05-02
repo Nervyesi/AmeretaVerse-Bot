@@ -46,6 +46,7 @@ from database import (
     delete_button as db_delete_button,
 )
 from shared_bot import bot
+from cogs._branding import PREMIUM_GUILD_IDS
 
 load_dotenv()
 
@@ -257,10 +258,11 @@ async def list_servers(user: dict = Depends(get_current_user)):
             if guild.icon else None
         )
         result.append({
-            'id':      str(guild_id),
-            'name':    guild.name,
-            'icon':    icon_url,
-            'members': guild.member_count,
+            'id':         str(guild_id),
+            'name':       guild.name,
+            'icon':       icon_url,
+            'members':    guild.member_count,
+            'is_premium': guild_id in PREMIUM_GUILD_IDS,
         })
     return result
 

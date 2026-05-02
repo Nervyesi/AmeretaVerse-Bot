@@ -108,11 +108,28 @@ class OpenTicketView(discord.ui.View):
                 ).fetchone()
 
             if existing:
-                await interaction.response.send_message(
-                    f"You already have an open ticket: <#{existing['channel_id']}>",
-                    ephemeral=True,
+                # Verify the channel actually exists in THIS guild; if not, it's a stale row
+                existing_channel = (
+                    guild.get_channel(int(existing['channel_id']))
+                    if existing['channel_id'] else None
                 )
-                return
+                if existing_channel is None:
+                    with get_connection() as conn:
+                        conn.execute(
+                            "UPDATE tickets SET status='closed' WHERE ticket_id=?",
+                            (existing['ticket_id'],),
+                        )
+                    print(
+                        f'[tickets] auto-closed stale ticket {existing["ticket_id"]} '
+                        f'(channel missing) for user {user.id} in guild {guild_id}'
+                    )
+                    # Fall through to create a new ticket
+                else:
+                    await interaction.response.send_message(
+                        f"You already have an open ticket: <#{existing['channel_id']}>",
+                        ephemeral=True,
+                    )
+                    return
 
             # Resolve category
             cat_val  = (_cfg(guild_id, 'tickets_category') or '').strip()

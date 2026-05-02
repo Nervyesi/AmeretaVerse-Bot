@@ -369,6 +369,22 @@ def init_db():
             except sqlite3.OperationalError:
                 pass
 
+    # One-time cleanup: close orphaned tickets (NULL/0 guild_id or stub channel_id=0
+    # left behind by interrupted ticket creation before the channel was made).
+    with get_connection() as conn:
+        r1 = conn.execute(
+            "UPDATE tickets SET status='closed' "
+            "WHERE (guild_id IS NULL OR guild_id=0) AND status='open'"
+        )
+        if r1.rowcount > 0:
+            print(f'[migration] Closed {r1.rowcount} orphaned tickets with no guild_id')
+        r2 = conn.execute(
+            "UPDATE tickets SET status='closed' "
+            "WHERE channel_id=0 AND status='open'"
+        )
+        if r2.rowcount > 0:
+            print(f'[migration] Closed {r2.rowcount} stub tickets with channel_id=0')
+
 
 def ensure_guild_defaults(guild_id: int):
     """Insert default config keys for a guild if they don't already exist."""
