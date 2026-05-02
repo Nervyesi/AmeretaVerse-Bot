@@ -8,8 +8,7 @@ from datetime import datetime, timezone, timedelta
 
 from database import get_connection, get_config as db_get_config
 from cogs._utils import resolve_channel, resolve_role, resolve_category
-
-BRAND = 0x94730D
+from cogs._branding import build_branded_embed
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
@@ -191,10 +190,14 @@ class OpenTicketView(discord.ui.View):
                 guild_id, 'tickets_welcome_message',
                 'Hi {user}, thanks for opening a ticket. A staff member will be with you shortly.',
             )
-            embed = discord.Embed(
+            embed = build_branded_embed(
+                guild_id,
                 title=f'Ticket #{ticket_id:04d}',
                 description=welcome_tmpl.replace('{user}', user.mention),
-                color=BRAND,
+                cog_prefix='tickets',
+                use_thumbnail=True,
+                use_image=False,
+                use_footer=False,
             )
             embed.set_footer(text=f'AmeretaVerse • Support Tickets | ID: {ticket_id}')
 
@@ -331,14 +334,18 @@ class Tickets(commands.Cog):
                         lines.append(f'[{ts}] {m.author.display_name}: {body}')
                     transcript = '\n'.join(lines) or 'No messages.'
 
-                    arch_embed = discord.Embed(
+                    arch_embed = build_branded_embed(
+                        guild_id,
                         title=f'Ticket #{ticket_id:04d} Closed',
                         description=(
                             f'**User:** <@{user_id}>\n'
                             f'**Reason:** {close_reason}\n'
                             f'**Closed:** {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}'
                         ),
-                        color=BRAND,
+                        cog_prefix='tickets',
+                        use_thumbnail=False,
+                        use_image=False,
+                        use_footer=True,
                     )
                     buf = io.BytesIO(transcript.encode('utf-8'))
                     buf.seek(0)
@@ -480,11 +487,20 @@ class Tickets(commands.Cog):
         desc    = _cfg(guild_id, 'tickets_panel_description',  'Click below to open a ticket.')
         btn_lbl = _cfg(guild_id, 'tickets_panel_button_label', 'Open Ticket')
 
-        embed = discord.Embed(title=title, description=desc, color=BRAND)
-        embed.set_footer(text='AmeretaVerse • Support Tickets')
+        embed = build_branded_embed(
+            guild_id,
+            title=title,
+            description=desc,
+            cog_prefix='tickets',
+            use_thumbnail=True,
+            use_image=True,
+            use_footer=True,
+        )
 
         view = OpenTicketView(button_label=btn_lbl)
-        await channel.send(embed=embed, view=view)
+        msg = await channel.send(embed=embed, view=view)
+        interaction.client.add_view(view, message_id=msg.id)
+        print(f'[tickets] registered persistent view for new panel msg {msg.id}')
         await interaction.response.send_message(
             f'✅ Panel sent to {channel.mention}', ephemeral=True
         )
@@ -508,11 +524,17 @@ class Tickets(commands.Cog):
                 (guild_id,),
             ).fetchone()[0]
 
-        embed = discord.Embed(title='Ticket Statistics', color=BRAND)
+        embed = build_branded_embed(
+            guild_id,
+            title='Ticket Statistics',
+            cog_prefix='tickets',
+            use_thumbnail=False,
+            use_image=False,
+            use_footer=True,
+        )
         embed.add_field(name='Open',   value=str(open_count),              inline=True)
         embed.add_field(name='Closed', value=str(total_count - open_count), inline=True)
         embed.add_field(name='Total',  value=str(total_count),             inline=True)
-        embed.set_footer(text=f'AmeretaVerse • {interaction.guild.name}')
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

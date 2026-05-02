@@ -895,17 +895,19 @@ async def tickets_send_panel(server_id: int, user: dict = Depends(get_current_us
     desc    = db_get_config(server_id, 'tickets_panel_description',  'Click below to open a ticket.') or ''
     btn_lbl = db_get_config(server_id, 'tickets_panel_button_label', 'Open Ticket') or 'Open Ticket'
 
-    embed = discord.Embed(title=title, description=desc, color=0x94730D)
-    embed.set_footer(text='AmeretaVerse • Support Tickets')
+    from cogs._branding import build_branded_embed
+    from cogs.tickets import OpenTicketView
+    embed = build_branded_embed(
+        server_id,
+        title=title,
+        description=desc,
+        cog_prefix='tickets',
+        use_thumbnail=True,
+        use_image=True,
+        use_footer=True,
+    )
 
-    # Create a minimal persistent-compatible view (handler registered via bot.add_view at startup)
-    view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(
-        label=btn_lbl,
-        style=discord.ButtonStyle.primary,
-        custom_id='tickets:open',
-        emoji='\U0001f3df️',
-    ))
+    view = OpenTicketView(button_label=btn_lbl)
 
     try:
         msg = await channel.send(embed=embed, view=view)
@@ -913,6 +915,9 @@ async def tickets_send_panel(server_id: int, user: dict = Depends(get_current_us
         raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    bot.add_view(view, message_id=msg.id)
+    print(f'[tickets] registered persistent view for new panel msg {msg.id}')
 
     return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id), 'channel_name': channel.name}
 
@@ -1016,10 +1021,18 @@ async def verify_send_message(
     description  = db_get_config(server_id, 'verify_embed_description')  or 'Click the button below and solve the CAPTCHA to access the server.'
     button_label = db_get_config(server_id, 'verify_embed_button_label') or 'Verify'
 
-    embed = discord.Embed(title=title, description=description, color=0x94730D)
-    embed.set_footer(text='AmeretaVerse • Verification')
-
+    from cogs._branding import build_branded_embed
     from cogs.verify import VerifyView
+    embed = build_branded_embed(
+        server_id,
+        title=title,
+        description=description,
+        cog_prefix='verify',
+        use_thumbnail=True,
+        use_image=True,
+        use_footer=True,
+    )
+
     view = VerifyView(button_label=button_label)
 
     try:
@@ -1028,6 +1041,9 @@ async def verify_send_message(
         raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    bot.add_view(view, message_id=msg.id)
+    print(f'[verify] registered persistent view for new panel msg {msg.id}')
 
     return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
 
@@ -1246,17 +1262,21 @@ async def rs_send_panel(
 
     from cogs._utils import resolve_channel
     from cogs.roleselect import build_panel_view
+    from cogs._branding import build_branded_embed
 
     channel = resolve_channel(guild, body.channel_id)
     if channel is None:
         raise HTTPException(status_code=400, detail=f'Channel not found: {body.channel_id}')
 
-    embed = discord.Embed(
+    embed = build_branded_embed(
+        server_id,
         title=panel['title'],
         description=panel['description'] or '',
-        color=0x94730D,
+        cog_prefix='roleselect',
+        use_thumbnail=True,
+        use_image=False,
+        use_footer=True,
     )
-    embed.set_footer(text='AmeretaVerse • Role Selection')
     view = build_panel_view(panel_id)
 
     # Edit the existing Discord message only if it's in the same channel the user is targeting
@@ -1311,13 +1331,17 @@ async def rs_refresh_panel(
         raise HTTPException(status_code=400, detail='Panel channel no longer exists')
 
     from cogs.roleselect import build_panel_view
+    from cogs._branding import build_branded_embed
 
-    embed = discord.Embed(
+    embed = build_branded_embed(
+        server_id,
         title=panel['title'],
         description=panel['description'] or '',
-        color=0x94730D,
+        cog_prefix='roleselect',
+        use_thumbnail=True,
+        use_image=False,
+        use_footer=True,
     )
-    embed.set_footer(text='AmeretaVerse • Role Selection')
     view = build_panel_view(panel_id)
 
     try:

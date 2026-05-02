@@ -123,6 +123,27 @@ DEFAULT_CONFIG = {
     "verify_dm_on_success_message": "Welcome! You've been verified in {server}.",
     "verify_dm_on_kick_enabled":    "1",
     "verify_dm_on_kick_message":    "You were kicked from {server} for failing CAPTCHA. Feel free to try again.",
+    # ── Brand / visual customization (plan-gated) ──────────────────────────────
+    "server_plan":              "free",          # 'free' | 'premium' | 'premium_plus'
+    "brand_color":              "",              # hex like "#94730D" — empty = AVbot default
+    "brand_thumbnail_url":      "",
+    "brand_image_url":          "",
+    "brand_footer_text":        "",
+    "brand_footer_icon_url":    "",
+    "brand_author_name":        "",
+    "brand_author_icon_url":    "",
+    # per-cog overrides (fall back to brand_* then to BRAND_DEFAULTS)
+    "verify_color":             "",
+    "verify_thumbnail_url":     "",
+    "verify_image_url":         "",
+    "verify_footer_text":       "",
+    "verify_footer_icon_url":   "",
+    "tickets_color":            "",
+    "tickets_thumbnail_url":    "",
+    "tickets_image_url":        "",
+    "roleselect_color":         "",
+    "roleselect_thumbnail_url": "",
+    "roleselect_image_url":     "",
 }
 
 

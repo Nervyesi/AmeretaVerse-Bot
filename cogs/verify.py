@@ -9,10 +9,7 @@ from captcha.image import ImageCaptcha
 
 from database import get_config as db_get_config
 from cogs._utils import resolve_role, resolve_channel
-
-VERIFY_THUMB_URL = "https://i.imgur.com/FNE8Li0.png"
-LOGO_URL = "https://i.imgur.com/KAkfd9v.png"
-PROGRESS_BAR_URL = "https://i.imgur.com/5Mg2BIE.png"
+from cogs._branding import build_branded_embed
 
 user_attempts = {}
 user_captcha = {}
@@ -101,14 +98,15 @@ class CaptchaModal(discord.ui.Modal, title="Identity Check 🔍"):
                         pass
 
                 success_title = _cfg(guild_id, 'verify_success_message', '✅ Verified! Welcome to the server.')
-                embed = discord.Embed(
+                embed = build_branded_embed(
+                    guild_id,
                     title=success_title,
                     description=f"You've been granted the **{role.name}** role.\n\nWelcome to **{interaction.guild.name}** 🦁",
-                    color=0x94730D
+                    cog_prefix='verify',
+                    use_thumbnail=True,
+                    use_image=True,
+                    use_footer=True,
                 )
-                embed.set_thumbnail(url=LOGO_URL)
-                embed.set_image(url=PROGRESS_BAR_URL)
-                embed.set_footer(text=f"{interaction.guild.name} • Verification System")
                 await interaction.response.edit_message(content=None, embed=embed, view=None, attachments=[])
 
             else:
@@ -118,38 +116,45 @@ class CaptchaModal(discord.ui.Modal, title="Identity Check 🔍"):
                 if attempts_left > 1:
                     wrong_msg = _cfg(guild_id, 'verify_wrong_attempt_message',
                                      '❌ Wrong! You have {remaining} attempts left.')
-                    embed = discord.Embed(
+                    embed = build_branded_embed(
+                        guild_id,
                         title="Bruh... really? ☠️",
                         description=wrong_msg.replace('{remaining}', str(attempts_left)),
-                        color=0xFF6600
+                        cog_prefix='verify',
+                        use_thumbnail=True,
+                        use_image=False,
+                        use_footer=True,
                     )
-                    embed.set_thumbnail(url=VERIFY_THUMB_URL)
-                    embed.set_footer(text=f"{interaction.guild.name} • Verification System")
                     view = TryAgainButton(self.user_id)
                     await interaction.response.edit_message(content=None, embed=embed, view=view, attachments=[])
 
                 elif attempts_left == 1:
                     last_msg = _cfg(guild_id, 'verify_last_chance_message',
                                     "⚠️ Last chance! Get this one wrong and you'll be kicked.")
-                    embed = discord.Embed(
+                    embed = build_branded_embed(
+                        guild_id,
                         title="Again?! Seriously?! 😤",
                         description=last_msg,
-                        color=0xFF3300
+                        cog_prefix='verify',
+                        use_thumbnail=True,
+                        use_image=False,
+                        use_footer=True,
                     )
-                    embed.set_thumbnail(url=VERIFY_THUMB_URL)
-                    embed.set_footer(text=f"{interaction.guild.name} • Verification System")
                     view = TryAgainButton(self.user_id)
                     await interaction.response.edit_message(content=None, embed=embed, view=view, attachments=[])
 
                 else:
                     kicked_msg = _cfg(guild_id, 'verify_kicked_message',
                                       "You've been kicked for failing verification. You can rejoin and try again.")
-                    embed = discord.Embed(
+                    embed = build_branded_embed(
+                        guild_id,
                         title="Certified bot. 🤖",
                         description=kicked_msg,
-                        color=0xFF0000
+                        cog_prefix='verify',
+                        use_thumbnail=False,
+                        use_image=False,
+                        use_footer=True,
                     )
-                    embed.set_footer(text=f"{interaction.guild.name} • Verification System")
                     await interaction.response.edit_message(content=None, embed=embed, view=None, attachments=[])
 
                     if _cfg_bool(guild_id, 'verify_dm_on_kick_enabled'):
@@ -199,18 +204,20 @@ class TryAgainButton(discord.ui.View):
             file = discord.File(image_bytes, filename="captcha.png")
             attempts_left = max_attempts - user_attempts.get(self.user_id, 0)
 
-            embed = discord.Embed(
+            embed = build_branded_embed(
+                guild_id,
                 title="Identity Check 🔍",
                 description=(
                     f"Match the code. You get {max_attempts} shots.\n"
                     f"**Attempts left: {attempts_left}** — tick tock.\n\n"
                     "Type the code you see in the image below."
                 ),
-                color=0x94730D
+                cog_prefix='verify',
+                use_thumbnail=True,
+                use_image=False,
+                use_footer=True,
             )
-            embed.set_thumbnail(url=VERIFY_THUMB_URL)
             embed.set_image(url="attachment://captcha.png")
-            embed.set_footer(text=f"{interaction.guild.name} • Verification System")
 
             view = CaptchaInputView(self.user_id)
             await interaction.response.edit_message(content=None, embed=embed, view=view, attachments=[file])
@@ -291,18 +298,20 @@ class VerifyView(discord.ui.View):
             file = discord.File(image_bytes, filename="captcha.png")
             attempts_left = max_attempts - user_attempts[user_id]
 
-            embed = discord.Embed(
+            embed = build_branded_embed(
+                guild_id,
                 title="Identity Check 🔍",
                 description=(
                     f"Match the code. You get {max_attempts} shots.\n"
                     f"**Attempts left: {attempts_left}** — tick tock.\n\n"
                     "Type the code you see in the image below."
                 ),
-                color=0x94730D
+                cog_prefix='verify',
+                use_thumbnail=True,
+                use_image=False,
+                use_footer=True,
             )
-            embed.set_thumbnail(url=VERIFY_THUMB_URL)
             embed.set_image(url="attachment://captcha.png")
-            embed.set_footer(text=f"{interaction.guild.name} • Verification System")
 
             view = CaptchaInputView(user_id)
             await interaction.response.send_message(embed=embed, file=file, view=view, ephemeral=True)
@@ -342,18 +351,20 @@ class VerifyCog(commands.Cog):
                            'Click the button below and solve the CAPTCHA to access the server.')
         button_label = _cfg(guild_id, 'verify_embed_button_label', 'Verify')
 
-        embed = discord.Embed(title=title, description=description, color=0x94730D)
-        embed.set_thumbnail(url=LOGO_URL)
-        embed.set_footer(text=f"{ctx.guild.name} • Verification System")
+        embed = build_branded_embed(
+            guild_id,
+            title=title,
+            description=description,
+            cog_prefix='verify',
+            use_thumbnail=True,
+            use_image=True,
+            use_footer=True,
+        )
 
         view = VerifyView(button_label=button_label)
-        try:
-            with open("intro.gif", "rb") as f:
-                gif_file = discord.File(f, filename="intro.gif")
-            embed.set_image(url="attachment://intro.gif")
-            await channel.send(file=gif_file, embed=embed, view=view)
-        except FileNotFoundError:
-            await channel.send(embed=embed, view=view)
+        msg = await channel.send(embed=embed, view=view)
+        self.bot.add_view(view, message_id=msg.id)
+        print(f'[verify] registered persistent view for new panel msg {msg.id}')
 
 
 async def setup(bot):
