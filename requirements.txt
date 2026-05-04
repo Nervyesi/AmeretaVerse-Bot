@@ -7,3 +7,4 @@ uvicorn[standard]
 pyjwt
 aiohttp
 requests
+boto3>=1.34.0

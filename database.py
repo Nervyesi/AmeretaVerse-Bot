@@ -363,11 +363,58 @@ def init_db():
             "ALTER TABLE users ADD COLUMN x_username_set_at TIMESTAMP",
             "ALTER TABLE users ADD COLUMN engage_points INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN creator_engage_points INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tickets ADD COLUMN display_number INTEGER DEFAULT NULL",
         ]:
             try:
                 conn.execute(migration)
             except sqlite3.OperationalError:
                 pass
+
+        # assets_library table for R2 uploads
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS assets_library (
+                asset_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id      INTEGER NOT NULL,
+                file_id       TEXT NOT NULL,
+                key           TEXT NOT NULL,
+                url           TEXT NOT NULL,
+                original_name TEXT,
+                size          INTEGER NOT NULL,
+                content_type  TEXT,
+                extension     TEXT,
+                uploaded_by   INTEGER,
+                uploaded_at   TEXT DEFAULT (datetime('now')),
+                deleted       INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assets_library_guild "
+            "ON assets_library(guild_id, deleted)"
+        )
+
+        # One-time backfill: assign per-guild display numbers to existing tickets
+        rows_to_fill = conn.execute(
+            "SELECT ticket_id, guild_id FROM tickets "
+            "WHERE display_number IS NULL ORDER BY guild_id, ticket_id"
+        ).fetchall()
+        if rows_to_fill:
+            existing_maxes = {
+                r['guild_id']: r['max_num'] or 0
+                for r in conn.execute(
+                    "SELECT guild_id, MAX(display_number) AS max_num FROM tickets "
+                    "WHERE display_number IS NOT NULL GROUP BY guild_id"
+                ).fetchall()
+            }
+            counters = dict(existing_maxes)
+            updates = []
+            for row in rows_to_fill:
+                gid = row['guild_id'] or 0
+                counters[gid] = counters.get(gid, 0) + 1
+                updates.append((counters[gid], row['ticket_id']))
+            conn.executemany(
+                "UPDATE tickets SET display_number=? WHERE ticket_id=?", updates
+            )
+            print(f'[migration] backfilled display_number for {len(updates)} tickets')
 
     # One-time cleanup: close orphaned tickets (NULL/0 guild_id or stub channel_id=0
     # left behind by interrupted ticket creation before the channel was made).
@@ -552,6 +599,61 @@ def delete_button(button_id: int) -> bool:
             "DELETE FROM roleselect_buttons WHERE button_id=?", (button_id,)
         )
     return c.rowcount > 0
+
+
+# ── Assets library helpers ─────────────────────────────────────────────────────
+
+def list_guild_assets(guild_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM assets_library WHERE guild_id=? AND deleted=0 "
+            "ORDER BY uploaded_at DESC",
+            (guild_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_asset_record(
+    guild_id: int, file_id: str, key: str, url: str,
+    original_name: str, size: int, content_type: str,
+    extension: str, uploaded_by: int,
+) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO assets_library
+               (guild_id, file_id, key, url, original_name, size,
+                content_type, extension, uploaded_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (guild_id, file_id, key, url, original_name, size,
+             content_type, extension, uploaded_by),
+        )
+        return cur.lastrowid
+
+
+def soft_delete_asset(guild_id: int, asset_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM assets_library "
+            "WHERE asset_id=? AND guild_id=? AND deleted=0",
+            (asset_id, guild_id),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE assets_library SET deleted=1 WHERE asset_id=?",
+            (asset_id,),
+        )
+    return dict(row)
+
+
+def get_asset_by_id(guild_id: int, asset_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM assets_library "
+            "WHERE asset_id=? AND guild_id=? AND deleted=0",
+            (asset_id, guild_id),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 if __name__ == '__main__':

@@ -155,7 +155,7 @@ class OpenTicketView(discord.ui.View):
             # Defer so we have time for channel creation
             await interaction.response.defer(ephemeral=True)
 
-            # INSERT stub row to get ticket_id before naming the channel
+            # INSERT stub row, then assign per-guild display_number atomically
             with get_connection() as conn:
                 conn.execute(
                     "INSERT INTO tickets (guild_id, channel_id, user_id, username, status) "
@@ -163,6 +163,16 @@ class OpenTicketView(discord.ui.View):
                     (guild_id, user.id, user.name),
                 )
                 ticket_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(display_number), 0) + 1 AS next_num "
+                    "FROM tickets WHERE guild_id=?",
+                    (guild_id,),
+                ).fetchone()
+                ticket_display = row['next_num']
+                conn.execute(
+                    "UPDATE tickets SET display_number=? WHERE ticket_id=?",
+                    (ticket_display, ticket_id),
+                )
 
             # Permission overwrites
             overwrites = {
@@ -181,7 +191,7 @@ class OpenTicketView(discord.ui.View):
                     read_messages=True, send_messages=True, manage_messages=True,
                 )
 
-            channel_name = f'ticket-{_safe_name(user.name)}-{ticket_id:04d}'
+            channel_name = f'ticket-{_safe_name(user.name)}-{ticket_display:04d}'
 
             try:
                 channel = await category.create_text_channel(
@@ -209,14 +219,14 @@ class OpenTicketView(discord.ui.View):
             )
             embed = build_branded_embed(
                 guild_id,
-                title=f'Ticket #{ticket_id:04d}',
+                title=f'Ticket #{ticket_display:04d}',
                 description=welcome_tmpl.replace('{user}', user.mention),
                 cog_prefix='tickets',
                 use_thumbnail=True,
                 use_image=False,
                 use_footer=False,
             )
-            embed.set_footer(text=f'AmeretaVerse • Support Tickets | ID: {ticket_id}')
+            embed.set_footer(text=f'AmeretaVerse • Support Tickets | #{ticket_display:04d}')
 
             # Ping content
             ping_raw  = (_cfg(guild_id, 'tickets_ping_role') or '').strip()
@@ -293,9 +303,10 @@ class Tickets(commands.Cog):
                     await interaction.response.send_message(msg, ephemeral=True)
             return
 
-        guild_id   = ticket['guild_id']
-        channel_id = ticket['channel_id']
-        user_id    = ticket['user_id']
+        guild_id       = ticket['guild_id']
+        channel_id     = ticket['channel_id']
+        user_id        = ticket['user_id']
+        ticket_display = ticket['display_number'] or ticket_id
 
         # Manual close — permission check
         if close_reason == 'manual' and interaction:
@@ -353,7 +364,7 @@ class Tickets(commands.Cog):
 
                     arch_embed = build_branded_embed(
                         guild_id,
-                        title=f'Ticket #{ticket_id:04d} Closed',
+                        title=f'Ticket #{ticket_display:04d} Closed',
                         description=(
                             f'**User:** <@{user_id}>\n'
                             f'**Reason:** {close_reason}\n'

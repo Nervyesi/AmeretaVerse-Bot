@@ -21,7 +21,7 @@ from typing import Optional
 
 import aiohttp
 import jwt
-from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from dotenv import load_dotenv
@@ -44,9 +44,14 @@ from database import (
     create_button as db_create_button,
     update_button as db_update_button,
     delete_button as db_delete_button,
+    list_guild_assets as db_list_guild_assets,
+    create_asset_record as db_create_asset_record,
+    soft_delete_asset as db_soft_delete_asset,
+    get_asset_by_id as db_get_asset_by_id,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
+from r2_client import upload_file as r2_upload, delete_file as r2_delete, ALLOWED_EXTENSIONS
 
 load_dotenv()
 
@@ -1361,6 +1366,85 @@ async def rs_refresh_panel(
         'message_id': str(panel['message_id']),
         'channel_id': str(panel['channel_id']),
     }
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  ASSETS LIBRARY ENDPOINTS
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+@app.get('/api/servers/{server_id}/assets')
+async def list_assets(server_id: int, user: dict = Depends(get_current_user)):
+    """List all non-deleted assets for this guild."""
+    require_guild_admin(user, server_id)
+    return {'assets': db_list_guild_assets(server_id)}
+
+
+@app.post('/api/servers/{server_id}/assets/upload')
+async def upload_asset(
+    server_id: int,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    """Upload a file to R2 and record it in the assets library."""
+    require_guild_admin(user, server_id)
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail='Empty file')
+
+    try:
+        result = r2_upload(
+            guild_id=server_id,
+            filename=file.filename or 'upload',
+            file_bytes=contents,
+            content_type=file.content_type,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=f'R2 not configured: {e}')
+    except Exception as e:
+        print(f'[upload_asset] r2 error: {type(e).__name__}: {e}')
+        raise HTTPException(status_code=500, detail='Upload to R2 failed')
+
+    user_id = int(user['user_id']) if user.get('user_id') else 0
+    asset_id = db_create_asset_record(
+        guild_id=server_id,
+        file_id=result['file_id'],
+        key=result['key'],
+        url=result['url'] or '',
+        original_name=file.filename or '',
+        size=result['size'],
+        content_type=result['content_type'],
+        extension=result['extension'],
+        uploaded_by=user_id,
+    )
+
+    return {
+        'asset_id':     asset_id,
+        'url':          result['url'],
+        'size':         result['size'],
+        'extension':    result['extension'],
+        'original_name': file.filename,
+    }
+
+
+@app.delete('/api/servers/{server_id}/assets/{asset_id}')
+async def delete_asset(
+    server_id: int,
+    asset_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Soft-delete an asset record and remove it from R2."""
+    require_guild_admin(user, server_id)
+
+    record = db_soft_delete_asset(server_id, asset_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail='Asset not found in this guild')
+
+    r2_delete(record['key'])
+
+    return {'ok': True}
 
 
 # ── Health check ───────────────────────────────────────────────────────────────
