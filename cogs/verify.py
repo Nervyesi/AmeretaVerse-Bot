@@ -92,8 +92,16 @@ class CaptchaModal(discord.ui.Modal, title="Identity Check 🔍"):
                 if _cfg_bool(guild_id, 'verify_dm_on_success_enabled'):
                     dm_msg = _cfg(guild_id, 'verify_dm_on_success_message',
                                   'Welcome! You have been verified in {server}.')
+                    dm_embed = build_branded_embed(
+                        guild_id,
+                        description=dm_msg.replace('{server}', interaction.guild.name),
+                        cog_prefix='verify',
+                        use_thumbnail=True,
+                        use_image=False,
+                        use_footer=True,
+                    )
                     try:
-                        await interaction.user.send(dm_msg.replace('{server}', interaction.guild.name))
+                        await interaction.user.send(embed=dm_embed)
                     except (discord.Forbidden, discord.HTTPException):
                         pass
 
@@ -160,8 +168,16 @@ class CaptchaModal(discord.ui.Modal, title="Identity Check 🔍"):
                     if _cfg_bool(guild_id, 'verify_dm_on_kick_enabled'):
                         dm_msg = _cfg(guild_id, 'verify_dm_on_kick_message',
                                       'You were kicked from {server} for failing CAPTCHA. Feel free to try again.')
+                        dm_embed = build_branded_embed(
+                            guild_id,
+                            description=dm_msg.replace('{server}', interaction.guild.name),
+                            cog_prefix='verify',
+                            use_thumbnail=True,
+                            use_image=False,
+                            use_footer=True,
+                        )
                         try:
-                            await interaction.user.send(dm_msg.replace('{server}', interaction.guild.name))
+                            await interaction.user.send(embed=dm_embed)
                         except (discord.Forbidden, discord.HTTPException):
                             pass
 

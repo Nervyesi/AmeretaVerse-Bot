@@ -1065,6 +1065,10 @@ class _PanelCreate(BaseModel):
     title: str = '🎯 Role Selection'
     description: str = ''
     style: str = 'buttons'
+    thumbnail_url: str = ''
+    image_url: str = ''
+    color: str = ''
+    footer_text: str = ''
 
 
 class _PanelUpdate(BaseModel):
@@ -1072,6 +1076,10 @@ class _PanelUpdate(BaseModel):
     description: Optional[str] = None
     style: Optional[str] = None
     channel_id: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    image_url: Optional[str] = None
+    color: Optional[str] = None
+    footer_text: Optional[str] = None
 
 
 class _ButtonCreate(BaseModel):
@@ -1280,10 +1288,21 @@ async def rs_send_panel(
         title=panel['title'],
         description=panel['description'] or '',
         cog_prefix='roleselect',
-        use_thumbnail=True,
-        use_image=False,
-        use_footer=True,
+        use_thumbnail=not bool(panel.get('thumbnail_url')),
+        use_image=not bool(panel.get('image_url')),
+        use_footer=not bool(panel.get('footer_text')),
     )
+    if panel.get('thumbnail_url'):
+        embed.set_thumbnail(url=panel['thumbnail_url'])
+    if panel.get('image_url'):
+        embed.set_image(url=panel['image_url'])
+    if panel.get('footer_text'):
+        embed.set_footer(text=panel['footer_text'])
+    if panel.get('color'):
+        try:
+            embed.color = discord.Color(int(panel['color'].lstrip('#'), 16))
+        except (ValueError, AttributeError):
+            pass
     view = build_panel_view(panel_id)
 
     # Edit the existing Discord message only if it's in the same channel the user is targeting
@@ -1345,10 +1364,21 @@ async def rs_refresh_panel(
         title=panel['title'],
         description=panel['description'] or '',
         cog_prefix='roleselect',
-        use_thumbnail=True,
-        use_image=False,
-        use_footer=True,
+        use_thumbnail=not bool(panel.get('thumbnail_url')),
+        use_image=not bool(panel.get('image_url')),
+        use_footer=not bool(panel.get('footer_text')),
     )
+    if panel.get('thumbnail_url'):
+        embed.set_thumbnail(url=panel['thumbnail_url'])
+    if panel.get('image_url'):
+        embed.set_image(url=panel['image_url'])
+    if panel.get('footer_text'):
+        embed.set_footer(text=panel['footer_text'])
+    if panel.get('color'):
+        try:
+            embed.color = discord.Color(int(panel['color'].lstrip('#'), 16))
+        except (ValueError, AttributeError):
+            pass
     view = build_panel_view(panel_id)
 
     try:

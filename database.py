@@ -141,6 +141,7 @@ DEFAULT_CONFIG = {
     "tickets_color":            "",
     "tickets_thumbnail_url":    "",
     "tickets_image_url":        "",
+    "tickets_footer_text":      "",
     "roleselect_color":         "",
     "roleselect_thumbnail_url": "",
     "roleselect_image_url":     "",
@@ -364,6 +365,10 @@ def init_db():
             "ALTER TABLE users ADD COLUMN engage_points INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN creator_engage_points INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tickets ADD COLUMN display_number INTEGER DEFAULT NULL",
+            "ALTER TABLE roleselect_panels ADD COLUMN thumbnail_url TEXT DEFAULT ''",
+            "ALTER TABLE roleselect_panels ADD COLUMN image_url TEXT DEFAULT ''",
+            "ALTER TABLE roleselect_panels ADD COLUMN color TEXT DEFAULT ''",
+            "ALTER TABLE roleselect_panels ADD COLUMN footer_text TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(migration)
@@ -505,7 +510,8 @@ def create_panel(guild_id: int, title: str, description: str, style: str) -> int
 
 
 def update_panel(panel_id: int, **fields) -> bool:
-    allowed = {'channel_id', 'message_id', 'title', 'description', 'style'}
+    allowed = {'channel_id', 'message_id', 'title', 'description', 'style',
+               'thumbnail_url', 'image_url', 'color', 'footer_text'}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False

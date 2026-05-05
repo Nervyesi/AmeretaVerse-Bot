@@ -249,8 +249,16 @@ class OpenTicketView(discord.ui.View):
                     guild_id, 'tickets_dm_on_open_message',
                     "Your support ticket has been opened in {server}. We'll be in touch soon.",
                 )
+                dm_embed = build_branded_embed(
+                    guild_id,
+                    description=dm_tmpl.replace('{server}', guild.name),
+                    cog_prefix='tickets',
+                    use_thumbnail=True,
+                    use_image=False,
+                    use_footer=True,
+                )
                 try:
-                    await user.send(dm_tmpl.replace('{server}', guild.name))
+                    await user.send(embed=dm_embed)
                 except (discord.Forbidden, discord.HTTPException):
                     pass
 
@@ -392,8 +400,16 @@ class Tickets(commands.Cog):
             )
             member = guild.get_member(user_id)
             if member:
+                dm_embed = build_branded_embed(
+                    guild_id,
+                    description=dm_tmpl.replace('{server}', guild.name),
+                    cog_prefix='tickets',
+                    use_thumbnail=True,
+                    use_image=False,
+                    use_footer=True,
+                )
                 try:
-                    await member.send(dm_tmpl.replace('{server}', guild.name))
+                    await member.send(embed=dm_embed)
                 except (discord.Forbidden, discord.HTTPException):
                     pass
 

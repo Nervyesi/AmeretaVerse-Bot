@@ -3,8 +3,7 @@ from discord.ext import commands
 
 from database import get_button, get_buttons, get_panel
 from cogs._utils import resolve_role
-
-BRAND = 0x94730D
+from cogs._branding import build_branded_embed
 
 
 # ── Ephemeral confirmation view (not persistent — lives for one interaction) ───
@@ -46,8 +45,16 @@ class ConfirmRoleView(discord.ui.View):
             msg = self.dm_message.replace('{role}', self.role.name).replace(
                 '{server}', interaction.guild.name
             )
+            dm_embed = build_branded_embed(
+                interaction.guild.id,
+                description=msg,
+                cog_prefix='roleselect',
+                use_thumbnail=True,
+                use_image=False,
+                use_footer=True,
+            )
             try:
-                await member.send(msg)
+                await member.send(embed=dm_embed)
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
@@ -141,8 +148,16 @@ async def handle_button_click(
         msg = dm_message.replace('{role}', role.name).replace(
             '{server}', interaction.guild.name
         )
+        dm_embed = build_branded_embed(
+            interaction.guild.id,
+            description=msg,
+            cog_prefix='roleselect',
+            use_thumbnail=True,
+            use_image=False,
+            use_footer=True,
+        )
         try:
-            await member.send(msg)
+            await member.send(embed=dm_embed)
         except (discord.Forbidden, discord.HTTPException):
             pass
 
