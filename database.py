@@ -145,6 +145,7 @@ DEFAULT_CONFIG = {
     "roleselect_color":         "",
     "roleselect_thumbnail_url": "",
     "roleselect_image_url":     "",
+    "roleselect_footer_text":   "",
 }
 
 
