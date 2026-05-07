@@ -398,6 +398,75 @@ def init_db():
             "ON assets_library(guild_id, deleted)"
         )
 
+        # ── Forms tables ──────────────────────────────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS forms (
+                form_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id             INTEGER NOT NULL,
+                name                 TEXT NOT NULL,
+                title                TEXT NOT NULL DEFAULT '',
+                description          TEXT NOT NULL DEFAULT '',
+                button_label         TEXT NOT NULL DEFAULT 'Apply',
+                thumbnail_url        TEXT NOT NULL DEFAULT '',
+                image_url            TEXT NOT NULL DEFAULT '',
+                color                TEXT NOT NULL DEFAULT '',
+                footer_text          TEXT NOT NULL DEFAULT '',
+                channel_id           TEXT NOT NULL DEFAULT '',
+                message_id           TEXT NOT NULL DEFAULT '',
+                ticket_category      TEXT NOT NULL DEFAULT '',
+                staff_roles          TEXT NOT NULL DEFAULT '',
+                ping_role            TEXT NOT NULL DEFAULT '',
+                approve_role         TEXT NOT NULL DEFAULT '',
+                approve_dm_enabled   INTEGER NOT NULL DEFAULT 0,
+                approve_dm_message   TEXT NOT NULL DEFAULT '',
+                reject_dm_enabled    INTEGER NOT NULL DEFAULT 0,
+                reject_dm_message    TEXT NOT NULL DEFAULT '',
+                enabled              INTEGER NOT NULL DEFAULT 1,
+                created_at           TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_forms_guild ON forms(guild_id)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS form_fields (
+                field_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                form_id         INTEGER NOT NULL,
+                position        INTEGER NOT NULL DEFAULT 0,
+                label           TEXT NOT NULL,
+                field_type      TEXT NOT NULL DEFAULT 'short_text',
+                placeholder     TEXT NOT NULL DEFAULT '',
+                required        INTEGER NOT NULL DEFAULT 1,
+                options         TEXT NOT NULL DEFAULT '',
+                max_length      INTEGER DEFAULT NULL,
+                FOREIGN KEY (form_id) REFERENCES forms(form_id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_form_fields_form ON form_fields(form_id)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS form_submissions (
+                submission_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                form_id         INTEGER NOT NULL,
+                guild_id        INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                username        TEXT NOT NULL DEFAULT '',
+                channel_id      TEXT NOT NULL DEFAULT '',
+                answers         TEXT NOT NULL DEFAULT '{}',
+                status          TEXT NOT NULL DEFAULT 'pending',
+                decided_by      INTEGER DEFAULT NULL,
+                decided_at      TEXT DEFAULT NULL,
+                created_at      TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_form_submissions_lookup "
+            "ON form_submissions(form_id, user_id, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_form_submissions_guild "
+            "ON form_submissions(guild_id)"
+        )
+
         # One-time backfill: assign per-guild display numbers to existing tickets
         rows_to_fill = conn.execute(
             "SELECT ticket_id, guild_id FROM tickets "
@@ -661,6 +730,152 @@ def get_asset_by_id(guild_id: int, asset_id: int) -> dict | None:
             (asset_id, guild_id),
         ).fetchone()
     return dict(row) if row else None
+
+
+# ── Forms CRUD helpers ─────────────────────────────────────────────────────────
+
+def list_forms(guild_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM forms WHERE guild_id=? ORDER BY form_id DESC",
+            (guild_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_form(form_id: int, guild_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM forms WHERE form_id=? AND guild_id=?",
+            (form_id, guild_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_form(guild_id: int, name: str) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO forms (guild_id, name, title, description) VALUES (?, ?, ?, '')",
+            (guild_id, name, name),
+        )
+        return cur.lastrowid
+
+
+def update_form(form_id: int, guild_id: int, **fields) -> bool:
+    allowed = {
+        'name', 'title', 'description', 'button_label', 'thumbnail_url', 'image_url',
+        'color', 'footer_text', 'channel_id', 'message_id', 'ticket_category',
+        'staff_roles', 'ping_role', 'approve_role', 'approve_dm_enabled',
+        'approve_dm_message', 'reject_dm_enabled', 'reject_dm_message', 'enabled',
+    }
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return False
+    cols = ', '.join(f'{k}=?' for k in sets)
+    vals = list(sets.values()) + [form_id, guild_id]
+    with get_connection() as conn:
+        c = conn.execute(f"UPDATE forms SET {cols} WHERE form_id=? AND guild_id=?", vals)
+        return c.rowcount > 0
+
+
+def delete_form(form_id: int, guild_id: int) -> bool:
+    with get_connection() as conn:
+        c = conn.execute(
+            "DELETE FROM forms WHERE form_id=? AND guild_id=?",
+            (form_id, guild_id),
+        )
+        return c.rowcount > 0
+
+
+def list_form_fields(form_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM form_fields WHERE form_id=? ORDER BY position ASC, field_id ASC",
+            (form_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_form_field(
+    form_id: int, position: int, label: str, field_type: str,
+    placeholder: str = '', required: int = 1,
+    options: str = '', max_length: int = None,
+) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO form_fields
+               (form_id, position, label, field_type, placeholder, required, options, max_length)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (form_id, position, label, field_type, placeholder, required, options, max_length),
+        )
+        return cur.lastrowid
+
+
+def update_form_field(field_id: int, form_id: int, **fields) -> bool:
+    allowed = {'position', 'label', 'field_type', 'placeholder', 'required', 'options', 'max_length'}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return False
+    cols = ', '.join(f'{k}=?' for k in sets)
+    vals = list(sets.values()) + [field_id, form_id]
+    with get_connection() as conn:
+        c = conn.execute(f"UPDATE form_fields SET {cols} WHERE field_id=? AND form_id=?", vals)
+        return c.rowcount > 0
+
+
+def delete_form_field(field_id: int, form_id: int) -> bool:
+    with get_connection() as conn:
+        c = conn.execute(
+            "DELETE FROM form_fields WHERE field_id=? AND form_id=?",
+            (field_id, form_id),
+        )
+        return c.rowcount > 0
+
+
+def create_form_submission(
+    form_id: int, guild_id: int, user_id: int,
+    username: str, channel_id: str, answers: str,
+) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO form_submissions
+               (form_id, guild_id, user_id, username, channel_id, answers, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+            (form_id, guild_id, user_id, username, channel_id, answers),
+        )
+        return cur.lastrowid
+
+
+def get_submission(submission_id: int, guild_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM form_submissions WHERE submission_id=? AND guild_id=?",
+            (submission_id, guild_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_submission_status(
+    submission_id: int, guild_id: int, status: str, decided_by: int,
+) -> bool:
+    with get_connection() as conn:
+        c = conn.execute(
+            """UPDATE form_submissions
+               SET status=?, decided_by=?, decided_at=datetime('now')
+               WHERE submission_id=? AND guild_id=?""",
+            (status, decided_by, submission_id, guild_id),
+        )
+        return c.rowcount > 0
+
+
+def has_pending_submission(form_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM form_submissions "
+            "WHERE form_id=? AND user_id=? AND status='pending' LIMIT 1",
+            (form_id, user_id),
+        ).fetchone()
+    return row is not None
 
 
 if __name__ == '__main__':

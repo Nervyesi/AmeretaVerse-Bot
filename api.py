@@ -48,6 +48,15 @@ from database import (
     create_asset_record as db_create_asset_record,
     soft_delete_asset as db_soft_delete_asset,
     get_asset_by_id as db_get_asset_by_id,
+    list_forms as db_list_forms,
+    get_form as db_get_form,
+    create_form as db_create_form,
+    update_form as db_update_form,
+    delete_form as db_delete_form,
+    list_form_fields as db_list_form_fields,
+    create_form_field as db_create_form_field,
+    update_form_field as db_update_form_field,
+    delete_form_field as db_delete_form_field,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
@@ -1396,6 +1405,297 @@ async def rs_refresh_panel(
         'message_id': str(panel['message_id']),
         'channel_id': str(panel['channel_id']),
     }
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  FORMS ENDPOINTS
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+_VALID_FIELD_TYPES = {'short_text', 'long_text', 'number', 'dropdown'}
+
+
+class _FormCreate(BaseModel):
+    name: str
+
+
+class _FormUpdate(BaseModel):
+    name: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    button_label: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    image_url: Optional[str] = None
+    color: Optional[str] = None
+    footer_text: Optional[str] = None
+    channel_id: Optional[str] = None
+    ticket_category: Optional[str] = None
+    staff_roles: Optional[str] = None
+    ping_role: Optional[str] = None
+    approve_role: Optional[str] = None
+    approve_dm_enabled: Optional[int] = None
+    approve_dm_message: Optional[str] = None
+    reject_dm_enabled: Optional[int] = None
+    reject_dm_message: Optional[str] = None
+    enabled: Optional[int] = None
+
+
+class _FieldCreate(BaseModel):
+    label: str
+    field_type: str
+    placeholder: str = ''
+    required: int = 1
+    options: str = ''
+    max_length: Optional[int] = None
+    position: int = 0
+
+
+class _FieldUpdate(BaseModel):
+    position: Optional[int] = None
+    label: Optional[str] = None
+    field_type: Optional[str] = None
+    placeholder: Optional[str] = None
+    required: Optional[int] = None
+    options: Optional[str] = None
+    max_length: Optional[int] = None
+
+
+class _FormSendBody(BaseModel):
+    channel_id: str
+
+
+def _validate_field_type(ft: str):
+    if ft not in _VALID_FIELD_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"field_type must be one of: {', '.join(sorted(_VALID_FIELD_TYPES))}"
+        )
+
+
+def _validate_dropdown_options(options_str: str):
+    import json as _json
+    try:
+        opts = _json.loads(options_str)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail='options must be a valid JSON array')
+    if not isinstance(opts, list):
+        raise HTTPException(status_code=400, detail='options must be a JSON array')
+    if len(opts) < 1 or len(opts) > 25:
+        raise HTTPException(status_code=400, detail='dropdown options must have 1–25 items')
+
+
+def _check_form_owner(form_id: int, server_id: int) -> dict:
+    form = db_get_form(form_id, server_id)
+    if form is None:
+        raise HTTPException(status_code=404, detail='Form not found')
+    return form
+
+
+@app.get('/api/servers/{server_id}/forms')
+async def forms_list(server_id: int, user: dict = Depends(get_current_user)):
+    require_guild_admin(user, server_id)
+    forms = db_list_forms(server_id)
+    for f in forms:
+        f['fields'] = db_list_form_fields(f['form_id'])
+    return {'forms': forms}
+
+
+@app.post('/api/servers/{server_id}/forms')
+async def forms_create(
+    server_id: int,
+    body: _FormCreate,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail='name is required')
+    form_id = db_create_form(server_id, body.name.strip())
+    form = db_get_form(form_id, server_id)
+    form['fields'] = []
+    return form
+
+
+@app.get('/api/servers/{server_id}/forms/{form_id}')
+async def forms_get(
+    server_id: int,
+    form_id: int,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    form = _check_form_owner(form_id, server_id)
+    form['fields'] = db_list_form_fields(form_id)
+    return form
+
+
+@app.patch('/api/servers/{server_id}/forms/{form_id}')
+async def forms_update(
+    server_id: int,
+    form_id: int,
+    body: _FormUpdate,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _check_form_owner(form_id, server_id)
+    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if updates:
+        db_update_form(form_id, server_id, **updates)
+    form = db_get_form(form_id, server_id)
+    form['fields'] = db_list_form_fields(form_id)
+    return form
+
+
+@app.delete('/api/servers/{server_id}/forms/{form_id}')
+async def forms_delete(
+    server_id: int,
+    form_id: int,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _check_form_owner(form_id, server_id)
+    db_delete_form(form_id, server_id)
+    return {'ok': True}
+
+
+@app.post('/api/servers/{server_id}/forms/{form_id}/fields')
+async def forms_add_field(
+    server_id: int,
+    form_id: int,
+    body: _FieldCreate,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _check_form_owner(form_id, server_id)
+    _validate_field_type(body.field_type)
+    if not body.label.strip():
+        raise HTTPException(status_code=400, detail='label is required')
+    if len(body.label) > 45:
+        raise HTTPException(status_code=400, detail='label must be ≤ 45 characters')
+    if len(body.placeholder) > 100:
+        raise HTTPException(status_code=400, detail='placeholder must be ≤ 100 characters')
+    if body.field_type == 'dropdown' and body.options:
+        _validate_dropdown_options(body.options)
+    field_id = db_create_form_field(
+        form_id=form_id,
+        position=body.position,
+        label=body.label.strip(),
+        field_type=body.field_type,
+        placeholder=body.placeholder,
+        required=body.required,
+        options=body.options,
+        max_length=body.max_length,
+    )
+    form = db_get_form(form_id, server_id)
+    form['fields'] = db_list_form_fields(form_id)
+    return form
+
+
+@app.patch('/api/servers/{server_id}/forms/{form_id}/fields/{field_id}')
+async def forms_update_field(
+    server_id: int,
+    form_id: int,
+    field_id: int,
+    body: _FieldUpdate,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _check_form_owner(form_id, server_id)
+    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    if 'field_type' in updates:
+        _validate_field_type(updates['field_type'])
+    if 'label' in updates:
+        if not updates['label'].strip():
+            raise HTTPException(status_code=400, detail='label is required')
+        if len(updates['label']) > 45:
+            raise HTTPException(status_code=400, detail='label must be ≤ 45 characters')
+    if 'placeholder' in updates and len(updates.get('placeholder', '')) > 100:
+        raise HTTPException(status_code=400, detail='placeholder must be ≤ 100 characters')
+    if updates.get('field_type') == 'dropdown' and updates.get('options'):
+        _validate_dropdown_options(updates['options'])
+    if updates:
+        db_update_form_field(field_id, form_id, **updates)
+    form = db_get_form(form_id, server_id)
+    form['fields'] = db_list_form_fields(form_id)
+    return form
+
+
+@app.delete('/api/servers/{server_id}/forms/{form_id}/fields/{field_id}')
+async def forms_delete_field(
+    server_id: int,
+    form_id: int,
+    field_id: int,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _check_form_owner(form_id, server_id)
+    db_delete_form_field(field_id, form_id)
+    form = db_get_form(form_id, server_id)
+    form['fields'] = db_list_form_fields(form_id)
+    return form
+
+
+@app.post('/api/servers/{server_id}/forms/{form_id}/send')
+async def forms_send(
+    server_id: int,
+    form_id: int,
+    body: _FormSendBody,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    form = _check_form_owner(form_id, server_id)
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    from cogs._utils import resolve_channel
+    from cogs._branding import build_branded_embed
+    from cogs.forms import FormApplyButton, _build_panel_embed
+
+    channel = resolve_channel(guild, body.channel_id)
+    if channel is None:
+        raise HTTPException(status_code=400, detail=f'Channel not found: {body.channel_id}')
+
+    embed = _build_panel_embed(server_id, form)
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(FormApplyButton(form_id, form.get('button_label') or 'Apply'))
+
+    # Edit existing message if same channel
+    existing_ch_id = form.get('channel_id', '')
+    existing_msg_id = form.get('message_id', '')
+    if existing_msg_id and existing_ch_id:
+        try:
+            ex_ch_int = int(existing_ch_id)
+            ex_msg_int = int(existing_msg_id)
+            if ex_ch_int == channel.id:
+                ex_ch = guild.get_channel(ex_ch_int)
+                if ex_ch:
+                    try:
+                        msg = await ex_ch.fetch_message(ex_msg_int)
+                        await msg.edit(embed=embed, view=view)
+                        db_update_form(form_id, server_id,
+                                       channel_id=str(channel.id),
+                                       message_id=str(msg.id))
+                        return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
+                    except discord.NotFound:
+                        pass
+                    except discord.Forbidden:
+                        raise HTTPException(status_code=400, detail='Bot lacks permission to edit that message')
+        except (ValueError, TypeError):
+            pass
+
+    try:
+        msg = await channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    db_update_form(form_id, server_id,
+                   channel_id=str(channel.id),
+                   message_id=str(msg.id))
+    return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
 
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
