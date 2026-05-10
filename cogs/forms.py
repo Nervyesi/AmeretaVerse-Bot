@@ -3,18 +3,18 @@ forms.py — Generic form builder cog.
 
 Admins define forms via the Dashboard.  Each form has:
   - An embed panel with a single "Apply" button
-  - A list of fields (short_text, long_text, number, dropdown)
+  - A list of fields (short_text, long_text only)
   - Submit behaviour: ticket category, staff roles, ping role
   - Approve action: optional role + optional DM
   - Reject action: optional DM
+  - auto_close_on_decision: close channel on approve/reject (default on)
 
 Flow:
   1. User clicks Apply → FormApplyButton.callback
-  2. Text/number fields are presented in Discord modals (5 per modal, chained)
-  3. Dropdown fields are presented in a follow-up ephemeral SelectMenu view
-  4. On completion → ticket channel created with answers embed + Approve/Reject/Close buttons
-  5. Staff Approves → role granted, DM sent, channel deleted
-     Staff Rejects → DM sent, channel deleted
+  2. Fields are presented in Discord modals (5 per modal, chained for >5 fields)
+  3. On completion → ticket channel created with answers embed + Approve/Reject/Close buttons
+  4. Staff Approves → role granted, DM sent; channel deleted or left open per form config
+     Staff Rejects → DM sent; channel deleted or left open per form config
      Staff Closes  → channel deleted, status = expired
 """
 
@@ -30,7 +30,6 @@ from database import (
     get_form,
     list_form_fields,
     has_pending_submission,
-    create_form_submission,
     get_submission,
     update_submission_status,
     get_connection,
@@ -43,7 +42,7 @@ from cogs._branding import build_branded_embed
 # key: (user_id, form_id)  value: {'answers': {str: str}, 'created_at': datetime}
 _pending_state: dict = {}
 
-VALID_FIELD_TYPES = {'short_text', 'long_text', 'number', 'dropdown'}
+VALID_FIELD_TYPES = {'short_text', 'long_text'}
 
 
 def _cleanup_stale():
@@ -90,12 +89,12 @@ def _build_panel_embed(guild_id: int, form: dict) -> discord.Embed:
     return embed
 
 
-def _safe_channel_name(user_name: str, submission_id: int) -> str:
+def _safe_channel_name(user_name: str, display_num: int) -> str:
     slug = ''.join(
         c for c in user_name.lower().replace(' ', '-')
         if c.isascii() and (c.isalnum() or c == '-')
     )[:16] or 'user'
-    return f'form-{slug}-{submission_id:04d}'
+    return f'form-{slug}-{display_num:04d}'
 
 
 # ── Finalize: create staff ticket channel ────────────────────────────────────
@@ -109,20 +108,6 @@ async def _finalize_submission(
     guild = interaction.guild
     guild_id = guild.id
     user = interaction.user
-
-    # Number validation
-    for f in fields:
-        if f['field_type'] == 'number':
-            val = str(answers.get(str(f['field_id']), '')).strip()
-            if val:
-                try:
-                    int(val)
-                except ValueError:
-                    await _safe_ephemeral(
-                        interaction,
-                        f'❌ **{f["label"]}** must be a whole number. Submission cancelled.'
-                    )
-                    return
 
     # Resolve category
     cat_val = (form.get('ticket_category') or '').strip()
@@ -143,19 +128,29 @@ async def _finalize_submission(
             if role:
                 staff_roles.append(role)
 
-    # Persist stub submission
+    # Persist stub submission with per-guild display_number (atomic in one connection)
     answers_json = json.dumps(answers)
-    submission_id = create_form_submission(
-        form_id=form['form_id'],
-        guild_id=guild_id,
-        user_id=user.id,
-        username=user.name,
-        channel_id='0',
-        answers=answers_json,
-    )
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO form_submissions
+               (form_id, guild_id, user_id, username, channel_id, answers, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+            (form['form_id'], guild_id, user.id, user.name, '0', answers_json),
+        )
+        submission_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        row = conn.execute(
+            "SELECT COALESCE(MAX(display_number), 0) + 1 AS next_num "
+            "FROM form_submissions WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+        submission_display = row['next_num']
+        conn.execute(
+            "UPDATE form_submissions SET display_number=? WHERE submission_id=?",
+            (submission_display, submission_id),
+        )
 
     # Build channel
-    channel_name = _safe_channel_name(user.name, submission_id)
+    channel_name = _safe_channel_name(user.name, submission_display)
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         user: discord.PermissionOverwrite(
@@ -193,7 +188,7 @@ async def _finalize_submission(
         answer = str(answers.get(str(f['field_id']), '')).strip() or '*(not answered)*'
         embed.add_field(name=f['label'][:256], value=answer[:1024], inline=False)
     embed.set_thumbnail(url=user.display_avatar.url)
-    embed.set_footer(text=f'Submission #{submission_id:04d} | User ID: {user.id}')
+    embed.set_footer(text=f'Submission #{submission_display:04d} | User ID: {user.id}')
 
     view = SubmissionTicketView(submission_id, form['form_id'])
 
@@ -214,102 +209,34 @@ async def _finalize_submission(
     )
 
 
-# ── DropdownStepView — ephemeral select menus for dropdown fields ─────────────
-
-class DropdownStepView(discord.ui.View):
-    def __init__(self, form: dict, all_fields: list, dropdown_fields: list, prior_answers: dict):
-        super().__init__(timeout=600)
-        self.form = form
-        self.all_fields = all_fields
-        self.dropdown_fields = dropdown_fields
-        self.prior_answers = dict(prior_answers)
-        self.dropdown_answers: dict = {}
-
-        for f in dropdown_fields:
-            try:
-                opts = json.loads(f.get('options') or '[]')
-            except Exception:
-                opts = []
-            options = [
-                discord.SelectOption(label=str(o)[:100], value=str(o)[:100])
-                for o in opts[:25]
-            ] or [discord.SelectOption(label='(No options configured)', value='__none__')]
-
-            sel = discord.ui.Select(
-                placeholder=f.get('label', 'Select…')[:100],
-                options=options,
-                custom_id=f"dd_{f['field_id']}",
-                min_values=0 if not f.get('required') else 1,
-                max_values=1,
-            )
-            sel.callback = self._make_select_cb(str(f['field_id']))
-            self.add_item(sel)
-
-        submit_btn = discord.ui.Button(
-            label='Submit', style=discord.ButtonStyle.success, emoji='✅',
-        )
-        submit_btn.callback = self._on_submit
-        self.add_item(submit_btn)
-
-    def _make_select_cb(self, field_id: str):
-        async def _cb(interaction: discord.Interaction):
-            selected = interaction.data.get('values', [])
-            if selected and selected[0] != '__none__':
-                self.dropdown_answers[field_id] = selected[0]
-            await interaction.response.defer()
-        return _cb
-
-    async def _on_submit(self, interaction: discord.Interaction):
-        # Required dropdown check
-        for f in self.dropdown_fields:
-            fid = str(f['field_id'])
-            if f.get('required') and fid not in self.dropdown_answers:
-                await interaction.response.send_message(
-                    f'❌ Please select a value for **{f["label"]}**.', ephemeral=True
-                )
-                return
-
-        final_answers = dict(self.prior_answers)
-        final_answers.update(self.dropdown_answers)
-        self.stop()
-        await interaction.response.defer(ephemeral=True)
-        await _finalize_submission(interaction, self.form, final_answers, self.all_fields)
-
-
 # ── FormModal — dynamically built from field definitions ──────────────────────
 
 class FormModal(discord.ui.Modal):
     def __init__(
         self,
         form: dict,
-        all_fields: list,
-        text_fields: list,
-        dropdown_fields: list,
+        fields: list,
         step: int = 0,
         prior_answers: dict = None,
     ):
         self.form = form
-        self.all_fields = all_fields
-        self.text_fields = text_fields
-        self.dropdown_fields = dropdown_fields
+        self.fields = fields
         self.step = step
         self.prior_answers = prior_answers or {}
 
-        step_count = (len(text_fields) + 4) // 5
+        step_count = (len(fields) + 4) // 5
         title = (form.get('name') or 'Application')[:40]
         if step_count > 1:
             title = f'{title} ({step + 1}/{step_count})'
 
         super().__init__(title=title[:45])
 
-        chunk = text_fields[step * 5: step * 5 + 5]
+        chunk = fields[step * 5: step * 5 + 5]
         for f in chunk:
             ftype = f.get('field_type', 'short_text')
             style = (discord.TextStyle.paragraph
                      if ftype == 'long_text' else discord.TextStyle.short)
             label = f['label'][:40]
-            if ftype == 'number':
-                label = f'{label} (number)'[:45]
             max_len = f.get('max_length') or (4000 if ftype == 'long_text' else 1024)
             placeholder = (f.get('placeholder') or '')[:100] or None
             self.add_item(discord.ui.TextInput(
@@ -329,32 +256,19 @@ class FormModal(discord.ui.Modal):
                 fid = child.custom_id.replace('ff_', '')
                 answers[fid] = child.value or ''
 
-        step_count = (len(self.text_fields) + 4) // 5
+        step_count = (len(self.fields) + 4) // 5
         next_step = self.step + 1
 
         if next_step < step_count:
-            # More text modals
             await interaction.response.send_modal(
                 FormModal(
-                    self.form, self.all_fields,
-                    self.text_fields, self.dropdown_fields,
+                    self.form, self.fields,
                     step=next_step, prior_answers=answers,
                 )
             )
-        elif self.dropdown_fields:
-            # Dropdown step
-            view = DropdownStepView(
-                self.form, self.all_fields, self.dropdown_fields, answers
-            )
-            await interaction.response.send_message(
-                'Almost done! Make your selections below, then click **Submit**.',
-                view=view,
-                ephemeral=True,
-            )
         else:
-            # Finalize
             await interaction.response.defer(ephemeral=True)
-            await _finalize_submission(interaction, self.form, answers, self.all_fields)
+            await _finalize_submission(interaction, self.form, answers, self.fields)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         print(f'[forms] FormModal error: {type(error).__name__}: {error}')
@@ -412,24 +326,7 @@ class FormApplyButton(
             )
             return
 
-        text_fields = [f for f in fields if f['field_type'] != 'dropdown']
-        dropdown_fields = [f for f in fields if f['field_type'] == 'dropdown']
-
-        if text_fields:
-            await interaction.response.send_modal(
-                FormModal(form, fields, text_fields, dropdown_fields)
-            )
-        elif dropdown_fields:
-            view = DropdownStepView(form, fields, dropdown_fields, {})
-            await interaction.response.send_message(
-                'Make your selections below, then click **Submit**.',
-                view=view,
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                '❌ This form has no fields configured.', ephemeral=True
-            )
+        await interaction.response.send_modal(FormModal(form, fields))
 
 
 # ── SubmissionTicketView — Approve / Reject / Close on the staff channel ──────
@@ -483,44 +380,73 @@ class FormApproveButton(
             )
             return
 
+        print(f'[forms] approve: form={form["form_id"]} sub={self.submission_id} '
+              f'user={sub["user_id"]} dm_enabled={form.get("approve_dm_enabled")} '
+              f'auto_close={form.get("auto_close_on_decision", 1)}')
+
         await interaction.response.defer()
         update_submission_status(self.submission_id, guild.id, 'approved', interaction.user.id)
 
-        # Give approve role
         member = guild.get_member(sub['user_id'])
+
+        # 1. Grant role
         approve_val = (form.get('approve_role') or '').strip()
-        if member and approve_val:
+        if approve_val and member:
             role = resolve_role(guild, approve_val)
             if role:
                 try:
-                    await member.add_roles(role)
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
+                    await member.add_roles(role, reason='Form approved')
+                    print(f'[forms] approve: granted role {role.name} to {member.id}')
+                except discord.Forbidden:
+                    print(f'[forms] approve: missing perms to grant role {role.name}')
+                except Exception as e:
+                    print(f'[forms] approve: role grant failed {type(e).__name__}: {e}')
 
-        # DM on approve
-        if member and form.get('approve_dm_enabled') and form.get('approve_dm_message'):
+        # 2. Send DM
+        if form.get('approve_dm_enabled') and member:
+            msg_template = form.get('approve_dm_message') or 'Your application has been approved.'
+            msg_text = msg_template.replace('{user}', member.mention).replace('{server}', guild.name)
             dm_embed = build_branded_embed(
                 guild.id,
-                description=form['approve_dm_message'].replace('{server}', guild.name),
+                title='✅ Application Approved',
+                description=msg_text,
                 cog_prefix='forms',
                 use_thumbnail=True, use_image=False, use_footer=True,
             )
             try:
                 await member.send(embed=dm_embed)
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+                print(f'[forms] approve: DM sent to {member.id}')
+            except discord.Forbidden:
+                print(f'[forms] approve: user {member.id} has DMs disabled')
+            except Exception as e:
+                print(f'[forms] approve: DM failed {type(e).__name__}: {e}')
+        elif not form.get('approve_dm_enabled'):
+            print(f'[forms] approve: DM disabled for form {form["form_id"]}')
+        elif not member:
+            print(f'[forms] approve: user {sub["user_id"]} not in guild')
 
+        # 3. Post result and close/leave open
         result_embed = discord.Embed(
             title='✅ Application Approved',
             description=f'Approved by {interaction.user.mention}',
             color=0x3ba55c,
         )
-        await interaction.followup.send(embed=result_embed)
-        await asyncio.sleep(5)
-        try:
-            await interaction.channel.delete()
-        except Exception:
-            pass
+
+        if form.get('auto_close_on_decision', 1):
+            await interaction.followup.send(embed=result_embed)
+            await asyncio.sleep(5)
+            try:
+                await interaction.channel.delete()
+            except Exception:
+                pass
+        else:
+            await interaction.followup.send(embed=result_embed)
+            close_only_view = discord.ui.View(timeout=None)
+            close_only_view.add_item(FormCloseButton(self.submission_id))
+            try:
+                await interaction.message.edit(view=close_only_view)
+            except Exception as e:
+                print(f'[forms] approve: could not update view: {e}')
 
 
 class FormRejectButton(
@@ -571,34 +497,59 @@ class FormRejectButton(
             )
             return
 
+        print(f'[forms] reject: form={form["form_id"]} sub={self.submission_id} '
+              f'user={sub["user_id"]} dm_enabled={form.get("reject_dm_enabled")} '
+              f'auto_close={form.get("auto_close_on_decision", 1)}')
+
         await interaction.response.defer()
         update_submission_status(self.submission_id, guild.id, 'rejected', interaction.user.id)
 
-        # DM on reject
         member = guild.get_member(sub['user_id'])
-        if member and form.get('reject_dm_enabled') and form.get('reject_dm_message'):
+
+        # Send DM
+        if form.get('reject_dm_enabled') and member:
+            msg_template = form.get('reject_dm_message') or 'Your application has not been approved.'
+            msg_text = msg_template.replace('{user}', member.mention).replace('{server}', guild.name)
             dm_embed = build_branded_embed(
                 guild.id,
-                description=form['reject_dm_message'].replace('{server}', guild.name),
+                title='❌ Application Rejected',
+                description=msg_text,
                 cog_prefix='forms',
                 use_thumbnail=True, use_image=False, use_footer=True,
             )
             try:
                 await member.send(embed=dm_embed)
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+                print(f'[forms] reject: DM sent to {member.id}')
+            except discord.Forbidden:
+                print(f'[forms] reject: user {member.id} has DMs disabled')
+            except Exception as e:
+                print(f'[forms] reject: DM failed {type(e).__name__}: {e}')
+        elif not form.get('reject_dm_enabled'):
+            print(f'[forms] reject: DM disabled for form {form["form_id"]}')
+        elif not member:
+            print(f'[forms] reject: user {sub["user_id"]} not in guild')
 
         result_embed = discord.Embed(
             title='❌ Application Rejected',
             description=f'Rejected by {interaction.user.mention}',
             color=0xed4245,
         )
-        await interaction.followup.send(embed=result_embed)
-        await asyncio.sleep(5)
-        try:
-            await interaction.channel.delete()
-        except Exception:
-            pass
+
+        if form.get('auto_close_on_decision', 1):
+            await interaction.followup.send(embed=result_embed)
+            await asyncio.sleep(5)
+            try:
+                await interaction.channel.delete()
+            except Exception:
+                pass
+        else:
+            await interaction.followup.send(embed=result_embed)
+            close_only_view = discord.ui.View(timeout=None)
+            close_only_view.add_item(FormCloseButton(self.submission_id))
+            try:
+                await interaction.message.edit(view=close_only_view)
+            except Exception as e:
+                print(f'[forms] reject: could not update view: {e}')
 
 
 class FormCloseButton(

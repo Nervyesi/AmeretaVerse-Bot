@@ -370,6 +370,8 @@ def init_db():
             "ALTER TABLE roleselect_panels ADD COLUMN image_url TEXT DEFAULT ''",
             "ALTER TABLE roleselect_panels ADD COLUMN color TEXT DEFAULT ''",
             "ALTER TABLE roleselect_panels ADD COLUMN footer_text TEXT DEFAULT ''",
+            "ALTER TABLE form_submissions ADD COLUMN display_number INTEGER DEFAULT NULL",
+            "ALTER TABLE forms ADD COLUMN auto_close_on_decision INTEGER NOT NULL DEFAULT 1",
         ]:
             try:
                 conn.execute(migration)
@@ -490,6 +492,39 @@ def init_db():
                 "UPDATE tickets SET display_number=? WHERE ticket_id=?", updates
             )
             print(f'[migration] backfilled display_number for {len(updates)} tickets')
+
+        # One-time backfill: per-guild display numbers for existing form submissions
+        sub_rows_to_fill = conn.execute(
+            "SELECT submission_id, guild_id FROM form_submissions "
+            "WHERE display_number IS NULL ORDER BY guild_id, submission_id"
+        ).fetchall()
+        if sub_rows_to_fill:
+            existing_sub_maxes = {
+                r['guild_id']: r['max_num'] or 0
+                for r in conn.execute(
+                    "SELECT guild_id, MAX(display_number) AS max_num FROM form_submissions "
+                    "WHERE display_number IS NOT NULL GROUP BY guild_id"
+                ).fetchall()
+            }
+            sub_counters = dict(existing_sub_maxes)
+            sub_updates = []
+            for row in sub_rows_to_fill:
+                gid = row['guild_id'] or 0
+                sub_counters[gid] = sub_counters.get(gid, 0) + 1
+                sub_updates.append((sub_counters[gid], row['submission_id']))
+            conn.executemany(
+                "UPDATE form_submissions SET display_number=? WHERE submission_id=?",
+                sub_updates,
+            )
+            print(f'[migration] backfilled display_number for {len(sub_updates)} form submissions')
+
+        # One-time migration: convert legacy dropdown/number form_fields to short_text
+        result = conn.execute(
+            "UPDATE form_fields SET field_type='short_text', options='' "
+            "WHERE field_type IN ('number', 'dropdown')"
+        )
+        if result.rowcount > 0:
+            print(f'[migration] Converted {result.rowcount} legacy form_fields to short_text')
 
     # One-time cleanup: close orphaned tickets (NULL/0 guild_id or stub channel_id=0
     # left behind by interrupted ticket creation before the channel was made).
@@ -767,6 +802,7 @@ def update_form(form_id: int, guild_id: int, **fields) -> bool:
         'color', 'footer_text', 'channel_id', 'message_id', 'ticket_category',
         'staff_roles', 'ping_role', 'approve_role', 'approve_dm_enabled',
         'approve_dm_message', 'reject_dm_enabled', 'reject_dm_message', 'enabled',
+        'auto_close_on_decision',
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:

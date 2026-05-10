@@ -1411,7 +1411,7 @@ async def rs_refresh_panel(
 #  FORMS ENDPOINTS
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 
-_VALID_FIELD_TYPES = {'short_text', 'long_text', 'number', 'dropdown'}
+_VALID_FIELD_TYPES = {'short_text', 'long_text'}
 
 
 class _FormCreate(BaseModel):
@@ -1437,6 +1437,7 @@ class _FormUpdate(BaseModel):
     reject_dm_enabled: Optional[int] = None
     reject_dm_message: Optional[str] = None
     enabled: Optional[int] = None
+    auto_close_on_decision: Optional[int] = None
 
 
 class _FieldCreate(BaseModel):
@@ -1469,18 +1470,6 @@ def _validate_field_type(ft: str):
             status_code=400,
             detail=f"field_type must be one of: {', '.join(sorted(_VALID_FIELD_TYPES))}"
         )
-
-
-def _validate_dropdown_options(options_str: str):
-    import json as _json
-    try:
-        opts = _json.loads(options_str)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail='options must be a valid JSON array')
-    if not isinstance(opts, list):
-        raise HTTPException(status_code=400, detail='options must be a JSON array')
-    if len(opts) < 1 or len(opts) > 25:
-        raise HTTPException(status_code=400, detail='dropdown options must have 1–25 items')
 
 
 def _check_form_owner(form_id: int, server_id: int) -> dict:
@@ -1571,8 +1560,6 @@ async def forms_add_field(
         raise HTTPException(status_code=400, detail='label must be ≤ 45 characters')
     if len(body.placeholder) > 100:
         raise HTTPException(status_code=400, detail='placeholder must be ≤ 100 characters')
-    if body.field_type == 'dropdown' and body.options:
-        _validate_dropdown_options(body.options)
     field_id = db_create_form_field(
         form_id=form_id,
         position=body.position,
@@ -1608,8 +1595,6 @@ async def forms_update_field(
             raise HTTPException(status_code=400, detail='label must be ≤ 45 characters')
     if 'placeholder' in updates and len(updates.get('placeholder', '')) > 100:
         raise HTTPException(status_code=400, detail='placeholder must be ≤ 100 characters')
-    if updates.get('field_type') == 'dropdown' and updates.get('options'):
-        _validate_dropdown_options(updates['options'])
     if updates:
         db_update_form_field(field_id, form_id, **updates)
     form = db_get_form(form_id, server_id)
