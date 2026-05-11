@@ -9,3 +9,4 @@ aiohttp
 requests
 boto3>=1.34.0
 python-multipart>=0.0.9
+twscrape>=0.18.0

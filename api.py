@@ -57,6 +57,18 @@ from database import (
     create_form_field as db_create_form_field,
     update_form_field as db_update_form_field,
     delete_form_field as db_delete_form_field,
+    get_raid_settings as db_get_raid_settings,
+    upsert_raid_settings as db_upsert_raid_settings,
+    create_guild_raid as db_create_guild_raid,
+    get_guild_raid as db_get_guild_raid,
+    list_guild_raids as db_list_guild_raids,
+    update_guild_raid as db_update_guild_raid,
+    get_raid_leaderboard as db_get_raid_leaderboard,
+    get_raid_verification_log as db_get_raid_verification_log,
+    get_raid_participation as db_get_raid_participation,
+    check_reset_manual_count as db_check_reset_manual_count,
+    upsert_raid_settings,
+    get_user_x_username as db_get_user_x_username,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
@@ -1680,6 +1692,283 @@ async def forms_send(
     db_update_form(form_id, server_id,
                    channel_id=str(channel.id),
                    message_id=str(msg.id))
+    return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  RAID ENDPOINTS
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+import re as _re
+_TWEET_URL_RE = _re.compile(r'^https?://(x|twitter)\.com/.+/status/\d+', _re.IGNORECASE)
+
+
+def _validate_tweet_url(url: str):
+    if not _TWEET_URL_RE.match(url or ''):
+        raise HTTPException(
+            status_code=400,
+            detail='Invalid tweet URL — must be an x.com or twitter.com /status/ URL',
+        )
+
+
+class _RaidSettingsUpdate(BaseModel):
+    enabled: Optional[int] = None
+    point_ratio_like: Optional[int] = None
+    point_ratio_comment: Optional[int] = None
+    point_ratio_retweet: Optional[int] = None
+    adaptive_verification: Optional[int] = None
+    max_manual_checks_per_day: Optional[int] = None
+    guide_channel_id: Optional[str] = None
+    guide_message: Optional[str] = None
+    raid_role_ids: Optional[str] = None
+    ping_role_id: Optional[str] = None
+    embed_thumbnail_url: Optional[str] = None
+    embed_footer_text: Optional[str] = None
+    embed_color: Optional[str] = None
+
+
+class _RaidCreate(BaseModel):
+    tweet_url: str
+    total_points: int
+    mode: str = 'partial'
+    tasks: dict = {'like': True, 'comment': True, 'retweet': True}
+    channel_id: Optional[str] = None
+
+
+class _RaidManualCheck(BaseModel):
+    raid_id: int
+    user_id: str
+
+
+@app.get('/api/servers/{server_id}/raid/settings')
+async def raid_get_settings(server_id: int, user: dict = Depends(get_current_user)):
+    require_guild_admin(user, server_id)
+    return db_get_raid_settings(server_id)
+
+
+@app.patch('/api/servers/{server_id}/raid/settings')
+async def raid_update_settings(
+    server_id: int, body: _RaidSettingsUpdate, user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+
+    ratio_keys = {'point_ratio_like', 'point_ratio_comment', 'point_ratio_retweet'}
+    if any(k in updates for k in ratio_keys):
+        current = db_get_raid_settings(server_id)
+        total = (
+            updates.get('point_ratio_like',    current.get('point_ratio_like', 12)) +
+            updates.get('point_ratio_comment', current.get('point_ratio_comment', 40)) +
+            updates.get('point_ratio_retweet', current.get('point_ratio_retweet', 48))
+        )
+        if total != 100:
+            raise HTTPException(
+                status_code=400,
+                detail=f'Point ratios must sum to 100 (got {total})',
+            )
+
+    if 'max_manual_checks_per_day' in updates:
+        v = updates['max_manual_checks_per_day']
+        if not (1 <= v <= 50):
+            raise HTTPException(status_code=400, detail='max_manual_checks_per_day must be 1–50')
+
+    if updates:
+        db_upsert_raid_settings(server_id, **updates)
+    return db_get_raid_settings(server_id)
+
+
+@app.get('/api/servers/{server_id}/raid/raids')
+async def raid_list(
+    server_id: int,
+    status: str = 'active',
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    raids = db_list_guild_raids(server_id, status=status, limit=min(limit, 200))
+    for r in raids:
+        with get_connection() as conn:
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM raid_participation WHERE raid_id=? AND guild_id=?",
+                (r['raid_id'], server_id),
+            ).fetchone()[0]
+        r['participant_count'] = cnt
+    return {'raids': raids}
+
+
+@app.post('/api/servers/{server_id}/raid/raids')
+async def raid_create(
+    server_id: int, body: _RaidCreate, user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    _validate_tweet_url(body.tweet_url)
+
+    if body.total_points < 1:
+        raise HTTPException(status_code=400, detail='total_points must be ≥ 1')
+    if body.mode not in ('all', 'partial'):
+        raise HTTPException(status_code=400, detail="mode must be 'all' or 'partial'")
+
+    from cogs._twitter import extract_tweet_id
+    tweet_id = extract_tweet_id(body.tweet_url)
+    if not tweet_id:
+        raise HTTPException(status_code=400, detail='Could not parse tweet ID from URL')
+
+    tasks_json = json.dumps({t: bool(v) for t, v in body.tasks.items()
+                              if t in ('like', 'comment', 'retweet')})
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot not in server')
+
+    from cogs.raidbot import _fetch_tweet, _build_raid_embed, RaidPanelButton
+    from cogs._utils import resolve_channel, resolve_role
+
+    settings   = db_get_raid_settings(server_id)
+    tweet_data = _fetch_tweet(body.tweet_url)
+
+    ch_val  = (body.channel_id or '').strip() or (settings.get('guide_channel_id') or '').strip()
+    channel = resolve_channel(guild, ch_val) if ch_val else None
+    if channel is None:
+        raise HTTPException(status_code=400, detail='Channel not found — set guide_channel_id in settings or pass channel_id')
+
+    user_id_int = int(user['user_id'])
+    raid_id = db_create_guild_raid(
+        server_id, body.tweet_url, tweet_id,
+        body.total_points, body.mode, tasks_json, user_id_int,
+    )
+    raid = db_get_guild_raid(raid_id, server_id)
+
+    embed = _build_raid_embed(server_id, raid, tweet_data, settings)
+    view  = discord.ui.View(timeout=None)
+    view.add_item(RaidPanelButton(raid_id))
+
+    ping_raw  = (settings.get('ping_role_id') or '').strip()
+    ping_role = resolve_role(guild, ping_raw) if ping_raw else None
+    content   = f'{ping_role.mention} — new raid just dropped! ⚔️' if ping_role else '⚔️ New raid!'
+
+    try:
+        msg = await channel.send(content=content, embed=embed, view=view,
+                                  allowed_mentions=discord.AllowedMentions(roles=True))
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    db_update_guild_raid(raid_id, server_id,
+                         channel_id=str(channel.id), message_id=str(msg.id))
+
+    return {'ok': True, 'raid_id': raid_id,
+            'message_id': str(msg.id), 'channel_id': str(channel.id)}
+
+
+@app.post('/api/servers/{server_id}/raid/raids/{raid_id}/end')
+async def raid_end(
+    server_id: int, raid_id: int, user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    raid = db_get_guild_raid(raid_id, server_id)
+    if not raid:
+        raise HTTPException(status_code=404, detail='Raid not found')
+    db_update_guild_raid(raid_id, server_id, status='ended')
+    return {'ok': True, 'raid_id': raid_id}
+
+
+@app.get('/api/servers/{server_id}/raid/leaderboard')
+async def raid_leaderboard_api(
+    server_id: int, limit: int = 10, user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    return {'leaderboard': db_get_raid_leaderboard(server_id, min(limit, 100))}
+
+
+@app.get('/api/servers/{server_id}/raid/verification-log')
+async def raid_verification_log(
+    server_id: int,
+    raid_id: Optional[int] = None,
+    user_id_filter: Optional[int] = None,
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    rows = db_get_raid_verification_log(
+        server_id,
+        raid_id=raid_id,
+        user_id=user_id_filter,
+        limit=min(limit, 200),
+    )
+    return {'log': rows}
+
+
+@app.post('/api/servers/{server_id}/raid/manual-check')
+async def raid_manual_check(
+    server_id: int, body: _RaidManualCheck, user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+
+    settings = db_check_reset_manual_count(server_id)
+    max_checks = settings.get('max_manual_checks_per_day', 3)
+    used_today = settings.get('manual_check_count_today', 0)
+    if used_today >= max_checks:
+        raise HTTPException(
+            status_code=429,
+            detail=f'Daily manual check limit reached ({max_checks}/day). Resets at midnight UTC.',
+        )
+
+    try:
+        target_user_id = int(body.user_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail='Invalid user_id — must be a Discord snowflake')
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready')
+
+    cog = bot.get_cog('Raids')
+    if cog is None:
+        raise HTTPException(status_code=503, detail='Raids cog not loaded')
+
+    result = await cog.manual_check(server_id, body.raid_id, target_user_id)
+    if 'error' not in result:
+        db_upsert_raid_settings(server_id, manual_check_count_today=used_today + 1)
+
+    return {
+        'used_today': used_today + (0 if 'error' in result else 1),
+        'limit': max_checks,
+        **result,
+    }
+
+
+@app.post('/api/servers/{server_id}/raid/send-guide')
+async def raid_send_guide(server_id: int, user: dict = Depends(get_current_user)):
+    require_guild_admin(user, server_id)
+    settings = db_get_raid_settings(server_id)
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot not in server')
+
+    from cogs._utils import resolve_channel
+    from cogs.raidbot import DEFAULT_GUIDE_MESSAGE
+
+    ch_val  = (settings.get('guide_channel_id') or '').strip()
+    if not ch_val:
+        raise HTTPException(status_code=400, detail='guide_channel_id not configured')
+
+    channel = resolve_channel(guild, ch_val)
+    if channel is None:
+        raise HTTPException(status_code=400, detail=f'Channel not found: {ch_val}')
+
+    message_text = (settings.get('guide_message') or DEFAULT_GUIDE_MESSAGE).strip()
+    try:
+        msg = await channel.send(message_text)
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
 
 

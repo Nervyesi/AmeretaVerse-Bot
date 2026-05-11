@@ -526,6 +526,105 @@ def init_db():
         if result.rowcount > 0:
             print(f'[migration] Converted {result.rowcount} legacy form_fields to short_text')
 
+        # Idempotent: rename legacy raids/raid_participation (no guild_id) to *_legacy
+        try:
+            raid_cols = [r[1] for r in conn.execute("PRAGMA table_info(raids)").fetchall()]
+            if raid_cols and 'guild_id' not in raid_cols:
+                print('[migration] Renaming legacy raids -> raids_legacy')
+                conn.execute("ALTER TABLE raids RENAME TO raids_legacy")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            rp_cols = [r[1] for r in conn.execute("PRAGMA table_info(raid_participation)").fetchall()]
+            if rp_cols and 'guild_id' not in rp_cols:
+                print('[migration] Renaming legacy raid_participation -> raid_participation_legacy')
+                conn.execute("ALTER TABLE raid_participation RENAME TO raid_participation_legacy")
+        except sqlite3.OperationalError:
+            pass
+
+        # New per-guild raid tables
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS raids (
+                raid_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id        INTEGER NOT NULL,
+                display_number  INTEGER DEFAULT NULL,
+                tweet_url       TEXT NOT NULL,
+                tweet_id        TEXT NOT NULL DEFAULT '',
+                total_points    INTEGER NOT NULL DEFAULT 100,
+                mode            TEXT NOT NULL DEFAULT 'partial',
+                tasks_json      TEXT NOT NULL DEFAULT '{"like":true,"comment":true,"retweet":true}',
+                channel_id      TEXT NOT NULL DEFAULT '',
+                message_id      TEXT NOT NULL DEFAULT '',
+                posted_at       TEXT DEFAULT (datetime('now')),
+                ends_at         TEXT DEFAULT NULL,
+                status          TEXT NOT NULL DEFAULT 'active',
+                created_by      INTEGER DEFAULT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_raids_guild ON raids(guild_id, status);
+
+            CREATE TABLE IF NOT EXISTS raid_participation (
+                participation_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id            INTEGER NOT NULL,
+                raid_id             INTEGER NOT NULL,
+                user_id             INTEGER NOT NULL,
+                tasks_claimed       TEXT NOT NULL DEFAULT '[]',
+                points_earned       INTEGER NOT NULL DEFAULT 0,
+                verified_at         TEXT DEFAULT NULL,
+                verification_status TEXT NOT NULL DEFAULT 'pending',
+                flag_reason         TEXT DEFAULT NULL,
+                created_at          TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_raidpart_guild_user
+                ON raid_participation(guild_id, user_id, raid_id);
+            CREATE INDEX IF NOT EXISTS idx_raidpart_pending
+                ON raid_participation(verification_status, created_at);
+
+            CREATE TABLE IF NOT EXISTS raid_user_points (
+                guild_id        INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                total_points    INTEGER NOT NULL DEFAULT 0,
+                raids_completed INTEGER NOT NULL DEFAULT 0,
+                last_active     TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_raidpts_lb
+                ON raid_user_points(guild_id, total_points DESC);
+
+            CREATE TABLE IF NOT EXISTS raid_settings (
+                guild_id                    INTEGER PRIMARY KEY,
+                enabled                     INTEGER NOT NULL DEFAULT 0,
+                point_ratio_like            INTEGER NOT NULL DEFAULT 12,
+                point_ratio_comment         INTEGER NOT NULL DEFAULT 40,
+                point_ratio_retweet         INTEGER NOT NULL DEFAULT 48,
+                adaptive_verification       INTEGER NOT NULL DEFAULT 1,
+                max_manual_checks_per_day   INTEGER NOT NULL DEFAULT 3,
+                manual_check_count_today    INTEGER NOT NULL DEFAULT 0,
+                manual_check_date           TEXT DEFAULT NULL,
+                guide_channel_id            TEXT DEFAULT '',
+                guide_message               TEXT DEFAULT '',
+                raid_role_ids               TEXT DEFAULT '',
+                ping_role_id                TEXT DEFAULT '',
+                embed_thumbnail_url         TEXT DEFAULT '',
+                embed_footer_text           TEXT DEFAULT '',
+                embed_color                 TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS raid_verification_log (
+                log_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    INTEGER NOT NULL,
+                raid_id     INTEGER,
+                user_id     INTEGER NOT NULL,
+                task        TEXT NOT NULL,
+                claimed     INTEGER NOT NULL,
+                verified    INTEGER NOT NULL,
+                source      TEXT NOT NULL,
+                checked_at  TEXT DEFAULT (datetime('now')),
+                error_text  TEXT DEFAULT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_raidlog_guild
+                ON raid_verification_log(guild_id, checked_at DESC);
+        """)
+
     # One-time cleanup: close orphaned tickets (NULL/0 guild_id or stub channel_id=0
     # left behind by interrupted ticket creation before the channel was made).
     with get_connection() as conn:
@@ -904,6 +1003,14 @@ def update_submission_status(
         return c.rowcount > 0
 
 
+def get_user_x_username(user_id: int) -> str | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT x_username FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return row['x_username'] if row else None
+
+
 def has_pending_submission(form_id: int, user_id: int) -> bool:
     with get_connection() as conn:
         row = conn.execute(
@@ -912,6 +1019,277 @@ def has_pending_submission(form_id: int, user_id: int) -> bool:
             (form_id, user_id),
         ).fetchone()
     return row is not None
+
+
+# ── Raid CRUD helpers ──────────────────────────────────────────────────────────
+
+_RAID_SETTINGS_DEFAULTS = {
+    'guild_id': 0, 'enabled': 0,
+    'point_ratio_like': 12, 'point_ratio_comment': 40, 'point_ratio_retweet': 48,
+    'adaptive_verification': 1, 'max_manual_checks_per_day': 3,
+    'manual_check_count_today': 0, 'manual_check_date': None,
+    'guide_channel_id': '', 'guide_message': '', 'raid_role_ids': '',
+    'ping_role_id': '', 'embed_thumbnail_url': '', 'embed_footer_text': '', 'embed_color': '',
+}
+
+
+def get_raid_settings(guild_id: int) -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM raid_settings WHERE guild_id=?", (guild_id,)
+        ).fetchone()
+    if row:
+        return dict(row)
+    d = dict(_RAID_SETTINGS_DEFAULTS)
+    d['guild_id'] = guild_id
+    return d
+
+
+def upsert_raid_settings(guild_id: int, **fields) -> bool:
+    allowed = {
+        'enabled', 'point_ratio_like', 'point_ratio_comment', 'point_ratio_retweet',
+        'adaptive_verification', 'max_manual_checks_per_day', 'manual_check_count_today',
+        'manual_check_date', 'guide_channel_id', 'guide_message', 'raid_role_ids',
+        'ping_role_id', 'embed_thumbnail_url', 'embed_footer_text', 'embed_color',
+    }
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return False
+    cols = ['guild_id'] + list(sets.keys())
+    vals = [guild_id] + list(sets.values())
+    placeholders = ', '.join('?' for _ in vals)
+    update_clause = ', '.join(f'{k}=excluded.{k}' for k in sets.keys())
+    with get_connection() as conn:
+        conn.execute(
+            f"INSERT INTO raid_settings ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(guild_id) DO UPDATE SET {update_clause}",
+            vals,
+        )
+    return True
+
+
+def create_guild_raid(
+    guild_id: int, tweet_url: str, tweet_id: str, total_points: int,
+    mode: str, tasks_json: str, created_by: int,
+) -> int:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO raids (guild_id, tweet_url, tweet_id, total_points, mode, tasks_json, created_by, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'active')",
+            (guild_id, tweet_url, tweet_id, total_points, mode, tasks_json, created_by),
+        )
+        raid_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        row = conn.execute(
+            "SELECT COALESCE(MAX(display_number), 0) + 1 AS next_num FROM raids WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE raids SET display_number=? WHERE raid_id=?",
+            (row['next_num'], raid_id),
+        )
+    return raid_id
+
+
+def get_guild_raid(raid_id: int, guild_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM raids WHERE raid_id=? AND guild_id=?",
+            (raid_id, guild_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_guild_raids(guild_id: int, status: str = 'active', limit: int = 50) -> list:
+    with get_connection() as conn:
+        if status == 'all':
+            rows = conn.execute(
+                "SELECT * FROM raids WHERE guild_id=? ORDER BY posted_at DESC LIMIT ?",
+                (guild_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM raids WHERE guild_id=? AND status=? ORDER BY posted_at DESC LIMIT ?",
+                (guild_id, status, limit),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_guild_raid(raid_id: int, guild_id: int, **fields) -> bool:
+    allowed = {'tweet_url', 'tweet_id', 'total_points', 'mode', 'tasks_json',
+               'channel_id', 'message_id', 'ends_at', 'status'}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return False
+    cols = ', '.join(f'{k}=?' for k in sets)
+    with get_connection() as conn:
+        c = conn.execute(
+            f"UPDATE raids SET {cols} WHERE raid_id=? AND guild_id=?",
+            list(sets.values()) + [raid_id, guild_id],
+        )
+    return c.rowcount > 0
+
+
+def get_raid_participation(guild_id: int, raid_id: int, user_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM raid_participation WHERE guild_id=? AND raid_id=? AND user_id=?",
+            (guild_id, raid_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_participation_by_id(participation_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM raid_participation WHERE participation_id=?",
+            (participation_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_raid_participation(
+    guild_id: int, raid_id: int, user_id: int,
+    tasks_claimed: str, points_earned: int,
+) -> int:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO raid_participation (guild_id, raid_id, user_id, tasks_claimed, points_earned) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (guild_id, raid_id, user_id, tasks_claimed, points_earned),
+        )
+        return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+
+
+def update_raid_participation(participation_id: int, **fields) -> bool:
+    allowed = {'tasks_claimed', 'points_earned', 'verified_at', 'verification_status', 'flag_reason'}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return False
+    cols = ', '.join(f'{k}=?' for k in sets)
+    with get_connection() as conn:
+        c = conn.execute(
+            f"UPDATE raid_participation SET {cols} WHERE participation_id=?",
+            list(sets.values()) + [participation_id],
+        )
+    return c.rowcount > 0
+
+
+def list_raid_participations(
+    guild_id: int, raid_id: int = None, user_id: int = None,
+    v_status: str = None, limit: int = 50,
+) -> list:
+    conditions = ["guild_id=?"]
+    params: list = [guild_id]
+    if raid_id is not None:
+        conditions.append("raid_id=?"); params.append(raid_id)
+    if user_id is not None:
+        conditions.append("user_id=?"); params.append(user_id)
+    if v_status is not None:
+        conditions.append("verification_status=?"); params.append(v_status)
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM raid_participation WHERE {' AND '.join(conditions)} "
+            "ORDER BY created_at DESC LIMIT ?", params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_raid_user_points(guild_id: int, user_id: int, delta_points: int, delta_raids: int = 0):
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO raid_user_points (guild_id, user_id, total_points, raids_completed, last_active)
+               VALUES (?, ?, MAX(0,?), MAX(0,?), datetime('now'))
+               ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                   total_points=MAX(0, total_points + ?),
+                   raids_completed=raids_completed + ?,
+                   last_active=datetime('now')""",
+            (guild_id, user_id, max(0, delta_points), max(0, delta_raids),
+             delta_points, delta_raids),
+        )
+
+
+def get_raid_user_points(guild_id: int, user_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM raid_user_points WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_raid_leaderboard(guild_id: int, limit: int = 10) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT rup.user_id, u.username, rup.total_points, rup.raids_completed "
+            "FROM raid_user_points rup LEFT JOIN users u ON u.user_id=rup.user_id "
+            "WHERE rup.guild_id=? ORDER BY rup.total_points DESC LIMIT ?",
+            (guild_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_raid_verification_log(
+    guild_id: int, raid_id: int, user_id: int,
+    task: str, claimed: bool, verified: bool,
+    source: str, error_text: str = None,
+):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO raid_verification_log "
+            "(guild_id, raid_id, user_id, task, claimed, verified, source, error_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, raid_id, user_id, task,
+             1 if claimed else 0, 1 if verified else 0, source, error_text),
+        )
+
+
+def get_raid_verification_log(
+    guild_id: int, raid_id: int = None, user_id: int = None, limit: int = 50,
+) -> list:
+    conditions = ["guild_id=?"]
+    params: list = [guild_id]
+    if raid_id is not None:
+        conditions.append("raid_id=?"); params.append(raid_id)
+    if user_id is not None:
+        conditions.append("user_id=?"); params.append(user_id)
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM raid_verification_log WHERE {' AND '.join(conditions)} "
+            "ORDER BY checked_at DESC LIMIT ?", params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_pending_participations_24h() -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM raid_participation WHERE verification_status='pending' "
+            "AND created_at > datetime('now', '-24 hours')"
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def sample_pending_participations(limit: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM raid_participation WHERE verification_status='pending' "
+            "AND created_at > datetime('now', '-24 hours') ORDER BY RANDOM() LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def check_reset_manual_count(guild_id: int) -> dict:
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    settings = get_raid_settings(guild_id)
+    if settings.get('manual_check_date') != today:
+        upsert_raid_settings(guild_id, manual_check_count_today=0, manual_check_date=today)
+        settings['manual_check_count_today'] = 0
+        settings['manual_check_date'] = today
+    return settings
 
 
 if __name__ == '__main__':
