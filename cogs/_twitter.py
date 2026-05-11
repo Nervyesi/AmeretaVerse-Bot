@@ -1,20 +1,58 @@
 """
-Twitter scraping via twscrape.
-Uses credentials from env vars; session persists in /data/twscrape.db.
+Twitter scraping via twscrape — multi-account pool with active/backup slots.
+
+Env vars (slots 1–5):
+  TWITTER_ACCOUNT_1_USERNAME, TWITTER_ACCOUNT_1_EMAIL, TWITTER_ACCOUNT_1_PASSWORD
+  TWITTER_ACCOUNT_2_USERNAME, TWITTER_ACCOUNT_2_EMAIL, TWITTER_ACCOUNT_2_PASSWORD
+  ... up to TWITTER_ACCOUNT_5_*
+
+Active status is stored in the twitter_accounts DB table (admin-managed).
+Only slots with active=1 in DB are added to the twscrape pool.
+
+Backward compat: if no numbered accounts are set but old TWITTER_USERNAME/EMAIL/PASSWORD
+env vars exist, they are treated as slot 1 and auto-activated on first run.
 """
 import os
 import asyncio
 import re
 
 API_INSTANCE = None
-INITIALIZED = False
-_init_lock = asyncio.Lock()
+INITIALIZED  = False
+_init_lock   = asyncio.Lock()
 
-TWITTER_USERNAME     = os.getenv('TWITTER_USERNAME', '')
-TWITTER_EMAIL        = os.getenv('TWITTER_EMAIL', '')
-TWITTER_PASSWORD     = os.getenv('TWITTER_PASSWORD', '')
-TWITTER_EMAIL_PASSWD = os.getenv('TWITTER_EMAIL_PASSWORD', TWITTER_PASSWORD)
-TWSCRAPE_DB_PATH     = os.getenv('TWSCRAPE_DB_PATH', '/data/twscrape.db')
+TWSCRAPE_DB_PATH = os.getenv('TWSCRAPE_DB_PATH', '/data/twscrape.db')
+
+
+def _get_slot_credentials(slot: int) -> dict | None:
+    prefix   = f'TWITTER_ACCOUNT_{slot}_'
+    username = (os.getenv(f'{prefix}USERNAME') or '').strip()
+    email    = (os.getenv(f'{prefix}EMAIL')    or '').strip()
+    password = (os.getenv(f'{prefix}PASSWORD') or '').strip()
+    if not (username and email and password):
+        return None
+    return {'slot': slot, 'username': username, 'email': email, 'password': password}
+
+
+def _get_legacy_credentials() -> dict | None:
+    username = (os.getenv('TWITTER_USERNAME') or '').strip()
+    email    = (os.getenv('TWITTER_EMAIL')    or '').strip()
+    password = (os.getenv('TWITTER_PASSWORD') or '').strip()
+    if not (username and email and password):
+        return None
+    return {'slot': 1, 'username': username, 'email': email, 'password': password}
+
+
+def _discover_configured_accounts() -> list:
+    accounts = []
+    for slot in range(1, 6):
+        creds = _get_slot_credentials(slot)
+        if creds:
+            accounts.append(creds)
+    if not accounts:
+        legacy = _get_legacy_credentials()
+        if legacy:
+            accounts.append(legacy)
+    return accounts
 
 
 async def get_api():
@@ -22,30 +60,86 @@ async def get_api():
     async with _init_lock:
         if INITIALIZED and API_INSTANCE is not None:
             return API_INSTANCE
+
         try:
             from twscrape import API
-            api = API(TWSCRAPE_DB_PATH)
-            if not (TWITTER_USERNAME and TWITTER_EMAIL and TWITTER_PASSWORD):
-                print('[twitter] No credentials configured — verification disabled')
-                INITIALIZED = True
-                API_INSTANCE = api
-                return api
-            try:
-                await api.pool.add_account(
-                    TWITTER_USERNAME, TWITTER_PASSWORD,
-                    TWITTER_EMAIL, TWITTER_EMAIL_PASSWD,
-                )
-                print(f'[twitter] Added account {TWITTER_USERNAME}, logging in...')
-                await api.pool.login_all()
-            except Exception as e:
-                print(f'[twitter] Account setup note: {e}')
-            INITIALIZED = True
-            API_INSTANCE = api
-            return api
         except ImportError:
             print('[twitter] twscrape not installed — verification disabled')
             INITIALIZED = True
             return None
+
+        api         = API(TWSCRAPE_DB_PATH)
+        configured  = _discover_configured_accounts()
+
+        if not configured:
+            print('[twitter] No credentials configured — verification disabled')
+            INITIALIZED = True
+            API_INSTANCE = api
+            return api
+
+        from database import (
+            list_twitter_accounts,
+            upsert_twitter_account_slot,
+            set_twitter_account_active,
+        )
+
+        # Sync DB rows for every configured slot so the admin panel shows them
+        for acc in configured:
+            upsert_twitter_account_slot(acc['slot'], acc['username'])
+
+        # Auto-activate slot 1 on first run if nothing is active yet
+        db_rows    = list_twitter_accounts()
+        any_active = any(r['active'] for r in db_rows)
+        if not any_active and configured:
+            set_twitter_account_active(configured[0]['slot'], 1)
+            print(f"[twitter] Auto-activated slot {configured[0]['slot']} ({configured[0]['username']}) — first run")
+            db_rows = list_twitter_accounts()
+
+        active_slots = {r['slot'] for r in db_rows if r['active']}
+
+        # Find which usernames are already registered with twscrape
+        try:
+            pool_accounts      = await api.pool.accounts_info()
+            existing_usernames = {a.username.lower() for a in pool_accounts}
+        except Exception:
+            existing_usernames = set()
+
+        added = 0
+        for acc in configured:
+            if acc['slot'] not in active_slots:
+                continue
+            if acc['username'].lower() in existing_usernames:
+                print(f"[twitter] Slot {acc['slot']} ({acc['username']}) already in pool")
+                continue
+            try:
+                await api.pool.add_account(
+                    acc['username'], acc['password'],
+                    acc['email'],    acc['password'],
+                )
+                added += 1
+                print(f"[twitter] Added slot {acc['slot']} ({acc['username']}) to pool")
+            except Exception as e:
+                print(f"[twitter] Slot {acc['slot']} add error: {type(e).__name__}: {e}")
+
+        if added > 0:
+            print('[twitter] Logging in newly added accounts...')
+            try:
+                await api.pool.login_all()
+            except Exception as e:
+                print(f'[twitter] login_all warning: {type(e).__name__}: {e}')
+
+        INITIALIZED  = True
+        API_INSTANCE = api
+        return api
+
+
+async def reload_api():
+    """Force re-initialization of the twscrape pool (call after admin changes active slots)."""
+    global API_INSTANCE, INITIALIZED
+    async with _init_lock:
+        API_INSTANCE = None
+        INITIALIZED  = False
+    return await get_api()
 
 
 def normalize_username(u: str) -> str:

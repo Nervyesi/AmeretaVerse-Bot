@@ -2051,6 +2051,55 @@ async def delete_asset(
     return {'ok': True}
 
 
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  GLOBAL ADMIN — TWITTER ACCOUNT POOL MANAGEMENT
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+# Discord user ID(s) allowed to manage the global Twitter account pool.
+# Only the bot owner should be here — this is a global (cross-guild) resource.
+_GLOBAL_ADMIN_IDS = {461460143343927306}
+
+
+def require_global_admin(user: dict):
+    uid = int(user.get('user_id', 0))
+    if uid not in _GLOBAL_ADMIN_IDS:
+        raise HTTPException(status_code=403, detail='Global admin only')
+
+
+class _TwAccountActivate(BaseModel):
+    active: int  # 0 or 1
+
+
+@app.get('/api/admin/twitter-accounts')
+async def tw_list_accounts(user: dict = Depends(get_current_user)):
+    """Return all configured Twitter account slots and their active status.
+    Credentials are NEVER included in the response."""
+    require_global_admin(user)
+    from database import list_twitter_accounts
+    rows = list_twitter_accounts()
+    # Strip any field that could reveal credentials — only expose slot/username/active/last_used/notes
+    safe = [
+        {'slot': r['slot'], 'username': r['username'],
+         'active': r['active'], 'last_used': r['last_used'], 'notes': r['notes']}
+        for r in rows
+    ]
+    return {'accounts': safe}
+
+
+@app.patch('/api/admin/twitter-accounts/{slot}')
+async def tw_set_account_active(
+    slot: int, body: _TwAccountActivate, user: dict = Depends(get_current_user),
+):
+    """Activate or deactivate a Twitter account slot, then reload the twscrape pool."""
+    require_global_admin(user)
+    from database import set_twitter_account_active
+    if not set_twitter_account_active(slot, 1 if body.active else 0):
+        raise HTTPException(status_code=404, detail=f'Slot {slot} not found in DB')
+    from cogs._twitter import reload_api
+    await reload_api()
+    return {'ok': True, 'slot': slot, 'active': body.active}
+
+
 # ── Health check ───────────────────────────────────────────────────────────────
 
 @app.get('/health')

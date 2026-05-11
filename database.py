@@ -625,6 +625,16 @@ def init_db():
                 ON raid_verification_log(guild_id, checked_at DESC);
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS twitter_accounts (
+                slot      INTEGER PRIMARY KEY,
+                username  TEXT NOT NULL DEFAULT '',
+                active    INTEGER NOT NULL DEFAULT 0,
+                last_used TEXT DEFAULT NULL,
+                notes     TEXT DEFAULT ''
+            )
+        """)
+
     # One-time cleanup: close orphaned tickets (NULL/0 guild_id or stub channel_id=0
     # left behind by interrupted ticket creation before the channel was made).
     with get_connection() as conn:
@@ -1001,6 +1011,33 @@ def update_submission_status(
             (status, decided_by, submission_id, guild_id),
         )
         return c.rowcount > 0
+
+
+# ── Twitter account helpers ────────────────────────────────────────────────────
+
+def list_twitter_accounts() -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM twitter_accounts ORDER BY slot"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_twitter_account_active(slot: int, active: int) -> bool:
+    with get_connection() as conn:
+        c = conn.execute(
+            "UPDATE twitter_accounts SET active=? WHERE slot=?", (active, slot)
+        )
+    return c.rowcount > 0
+
+
+def upsert_twitter_account_slot(slot: int, username: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO twitter_accounts (slot, username, active) VALUES (?, ?, 0) "
+            "ON CONFLICT(slot) DO UPDATE SET username=excluded.username",
+            (slot, username),
+        )
 
 
 def get_user_x_username(user_id: int) -> str | None:
