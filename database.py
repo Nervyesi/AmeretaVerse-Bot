@@ -374,6 +374,13 @@ def init_db():
             "ALTER TABLE forms ADD COLUMN auto_close_on_decision INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE raid_settings ADD COLUMN raid_channel_id TEXT DEFAULT ''",
             "ALTER TABLE raid_settings ADD COLUMN raid_ping_role_id TEXT DEFAULT ''",
+            "ALTER TABLE raid_settings ADD COLUMN raid_guide_channel_id TEXT DEFAULT ''",
+            "ALTER TABLE raid_settings ADD COLUMN raid_guide_title TEXT DEFAULT ''",
+            "ALTER TABLE raid_settings ADD COLUMN raid_guide_description TEXT DEFAULT ''",
+            "ALTER TABLE raid_settings ADD COLUMN raid_guide_thumbnail_url TEXT DEFAULT ''",
+            "ALTER TABLE raid_settings ADD COLUMN raid_guide_image_url TEXT DEFAULT ''",
+            "ALTER TABLE raid_settings ADD COLUMN raid_guide_color TEXT DEFAULT ''",
+            "ALTER TABLE raid_settings ADD COLUMN raid_guide_footer_text TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(migration)
@@ -631,6 +638,56 @@ def init_db():
         conn.execute(
             "UPDATE raid_settings SET raid_ping_role_id=ping_role_id "
             "WHERE raid_ping_role_id='' AND ping_role_id IS NOT NULL AND ping_role_id != ''"
+        )
+
+        # One-time: backfill default guide title and description for existing rows
+        _DEFAULT_GUIDE_TITLE = "Raid System - How It Works"
+        _DEFAULT_GUIDE_DESC = (
+            "Welcome! This is your community's raid system. Here's everything you need to know to participate.\n\n"
+            "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
+            "**1️⃣ Link your X (Twitter) account**\n\n"
+            "Use the `/setx` command followed by your X username (without the @).\n\n"
+            "Example: `/setx myusername`\n\n"
+            "You only need to do this once. If you ever need to change it, you can update it again after a 7-day cooldown.\n\n"
+            "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
+            "**2️⃣ Wait for a raid to drop**\n\n"
+            "When a new raid is posted, you'll see an embed in the raid channel containing:\n"
+            "- The tweet to raid\n"
+            "- Which tasks count (Like, Comment, Retweet)\n"
+            "- Four action buttons below the embed\n\n"
+            "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
+            "**3️⃣ Complete the tasks on X**\n\n"
+            "Open the tweet on X and do the tasks you want to claim. Be genuine — write thoughtful comments, don't just spam.\n\n"
+            "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
+            "**4️⃣ Claim your tasks**\n\n"
+            "Back on Discord, under the raid embed:\n\n"
+            "❤️ **Like** — click to toggle if you liked the tweet\n"
+            "💬 **Comment** — click to toggle if you commented\n"
+            "🔁 **Retweet** — click to toggle if you retweeted\n\n"
+            "Each click shows you your current selection privately. Take your time — nothing is recorded until you confirm.\n\n"
+            "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
+            "**5️⃣ Confirm your submission**\n\n"
+            "When you're ready, click ✅ **Confirm**. The bot records what you claimed and shows the points you earned. "
+            "Your submission is final — you can only confirm once per raid.\n\n"
+            "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
+            "**🔍 How we verify**\n\n"
+            "A random sample of submissions is automatically checked against X every day. "
+            "Admins can also manually verify any submission. "
+            "If a task was claimed but not done, it gets flagged and points are deducted. "
+            "Repeat offenders can be banned from raiding.\n\n"
+            "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
+            "**📊 Track your progress**\n\n"
+            "- `/raid leaderboard` — see the top raiders in this server\n"
+            "- `/raid profile` — see your own stats\n\n"
+            "Happy raiding! 🚀"
+        )
+        conn.execute(
+            "UPDATE raid_settings SET raid_guide_title=? WHERE raid_guide_title=''",
+            (_DEFAULT_GUIDE_TITLE,),
+        )
+        conn.execute(
+            "UPDATE raid_settings SET raid_guide_description=? WHERE raid_guide_description=''",
+            (_DEFAULT_GUIDE_DESC,),
         )
 
         conn.execute("""
@@ -1088,6 +1145,9 @@ _RAID_SETTINGS_DEFAULTS = {
     'guide_channel_id': '', 'guide_message': '', 'raid_role_ids': '',
     'ping_role_id': '', 'embed_thumbnail_url': '', 'embed_footer_text': '', 'embed_color': '',
     'raid_channel_id': '', 'raid_ping_role_id': '',
+    'raid_guide_channel_id': '', 'raid_guide_title': '', 'raid_guide_description': '',
+    'raid_guide_thumbnail_url': '', 'raid_guide_image_url': '',
+    'raid_guide_color': '', 'raid_guide_footer_text': '',
 }
 
 
@@ -1110,6 +1170,9 @@ def upsert_raid_settings(guild_id: int, **fields) -> bool:
         'manual_check_date', 'guide_channel_id', 'guide_message', 'raid_role_ids',
         'ping_role_id', 'embed_thumbnail_url', 'embed_footer_text', 'embed_color',
         'raid_channel_id', 'raid_ping_role_id',
+        'raid_guide_channel_id', 'raid_guide_title', 'raid_guide_description',
+        'raid_guide_thumbnail_url', 'raid_guide_image_url',
+        'raid_guide_color', 'raid_guide_footer_text',
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:

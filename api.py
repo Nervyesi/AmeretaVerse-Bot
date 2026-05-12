@@ -1718,14 +1718,20 @@ class _RaidSettingsUpdate(BaseModel):
     point_ratio_like: Optional[int] = None
     point_ratio_comment: Optional[int] = None
     point_ratio_retweet: Optional[int] = None
-    guide_channel_id: Optional[str] = None
-    guide_message: Optional[str] = None
     raid_channel_id: Optional[str] = None
     raid_role_ids: Optional[str] = None
     raid_ping_role_id: Optional[str] = None
     embed_thumbnail_url: Optional[str] = None
     embed_footer_text: Optional[str] = None
     embed_color: Optional[str] = None
+    # Guide section
+    raid_guide_channel_id: Optional[str] = None
+    raid_guide_title: Optional[str] = None
+    raid_guide_description: Optional[str] = None
+    raid_guide_thumbnail_url: Optional[str] = None
+    raid_guide_image_url: Optional[str] = None
+    raid_guide_color: Optional[str] = None
+    raid_guide_footer_text: Optional[str] = None
 
 
 class _RaidCreate(BaseModel):
@@ -1817,7 +1823,7 @@ async def raid_create(
     if guild is None:
         raise HTTPException(status_code=404, detail='Bot not in server')
 
-    from cogs.raidbot import _fetch_tweet, _build_raid_embed, RaidPanelButton
+    from cogs.raidbot import _fetch_tweet, _build_raid_embed, build_raid_panel_view
     from cogs._utils import resolve_channel, resolve_role
 
     settings   = db_get_raid_settings(server_id)
@@ -1841,8 +1847,7 @@ async def raid_create(
     raid = db_get_guild_raid(raid_id, server_id)
 
     embed = _build_raid_embed(server_id, raid, tweet_data, settings)
-    view  = discord.ui.View(timeout=None)
-    view.add_item(RaidPanelButton(raid_id))
+    view  = build_raid_panel_view(raid_id)
 
     ping_raw  = (settings.get('raid_ping_role_id') or settings.get('ping_role_id') or '').strip()
     ping_role = resolve_role(guild, ping_raw) if ping_raw else None
@@ -1851,6 +1856,7 @@ async def raid_create(
     try:
         msg = await channel.send(content=content, embed=embed, view=view,
                                   allowed_mentions=discord.AllowedMentions(roles=True))
+        bot.add_view(view, message_id=msg.id)
     except discord.Forbidden:
         raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
     except Exception as e:
@@ -1977,21 +1983,40 @@ async def raid_send_guide(server_id: int, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=404, detail='Bot not in server')
 
     from cogs._utils import resolve_channel
-    from cogs.raidbot import DEFAULT_GUIDE_MESSAGE
+    from cogs.raidbot import DEFAULT_GUIDE_TITLE, DEFAULT_GUIDE_DESCRIPTION
 
-    ch_val  = (settings.get('guide_channel_id') or '').strip()
+    ch_val = (settings.get('raid_guide_channel_id') or '').strip()
     if not ch_val:
-        raise HTTPException(status_code=400, detail='guide_channel_id not configured')
+        raise HTTPException(status_code=400, detail='Guide channel not configured (raid_guide_channel_id)')
 
     channel = resolve_channel(guild, ch_val)
     if channel is None:
-        raise HTTPException(status_code=400, detail=f'Channel not found: {ch_val}')
+        raise HTTPException(status_code=400, detail=f'Guide channel not found: {ch_val}')
 
-    message_text = (settings.get('guide_message') or DEFAULT_GUIDE_MESSAGE).strip()
+    title       = (settings.get('raid_guide_title') or DEFAULT_GUIDE_TITLE).strip()
+    description = (settings.get('raid_guide_description') or DEFAULT_GUIDE_DESCRIPTION).strip()
+    color_str   = (settings.get('raid_guide_color') or '').strip()
     try:
-        msg = await channel.send(message_text)
+        color = int(color_str.lstrip('#'), 16) if color_str else 0x94730D
+    except ValueError:
+        color = 0x94730D
+
+    embed = discord.Embed(title=title, description=description, color=color)
+
+    thumb = (settings.get('raid_guide_thumbnail_url') or '').strip()
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    image = (settings.get('raid_guide_image_url') or '').strip()
+    if image:
+        embed.set_image(url=image)
+    footer = (settings.get('raid_guide_footer_text') or '').strip()
+    if footer:
+        embed.set_footer(text=footer)
+
+    try:
+        msg = await channel.send(embed=embed)
     except discord.Forbidden:
-        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+        raise HTTPException(status_code=400, detail='Bot lacks permission to post in guide channel')
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
