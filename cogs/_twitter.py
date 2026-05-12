@@ -190,6 +190,44 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
         return {'verified': None, 'reason': f'scrape_error:{type(e).__name__}'}
 
 
+async def lookup_twitter_user_by_login(username: str) -> dict | None:
+    """Get a Twitter user's basic info by username. Returns None if not found or error."""
+    try:
+        api = await get_api()
+        if api is None:
+            return None
+        user = await api.user_by_login(normalize_username(username))
+        if user:
+            return {
+                'id': str(user.id),
+                'username': user.username,
+                'display_name': getattr(user, 'displayname', ''),
+            }
+        return None
+    except Exception as e:
+        print(f'[twitter] lookup_by_login error: {type(e).__name__}: {e}')
+        return None
+
+
+async def lookup_twitter_user_by_id(user_id: str) -> dict | None:
+    """Get a Twitter user's basic info by numeric user ID. Returns None if not found or error."""
+    try:
+        api = await get_api()
+        if api is None:
+            return None
+        user = await api.user_by_id(int(user_id))
+        if user:
+            return {
+                'id': str(user.id),
+                'username': user.username,
+                'display_name': getattr(user, 'displayname', ''),
+            }
+        return None
+    except Exception as e:
+        print(f'[twitter] lookup_by_id error: {type(e).__name__}: {e}')
+        return None
+
+
 def extract_tweet_id(url: str) -> str | None:
     m = re.search(r'/status/(\d+)', url or '')
     return m.group(1) if m else None

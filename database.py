@@ -372,6 +372,8 @@ def init_db():
             "ALTER TABLE roleselect_panels ADD COLUMN footer_text TEXT DEFAULT ''",
             "ALTER TABLE form_submissions ADD COLUMN display_number INTEGER DEFAULT NULL",
             "ALTER TABLE forms ADD COLUMN auto_close_on_decision INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE raid_settings ADD COLUMN raid_channel_id TEXT DEFAULT ''",
+            "ALTER TABLE raid_settings ADD COLUMN raid_ping_role_id TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(migration)
@@ -624,6 +626,12 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_raidlog_guild
                 ON raid_verification_log(guild_id, checked_at DESC);
         """)
+
+        # One-time: copy ping_role_id -> raid_ping_role_id for existing rows
+        conn.execute(
+            "UPDATE raid_settings SET raid_ping_role_id=ping_role_id "
+            "WHERE raid_ping_role_id='' AND ping_role_id IS NOT NULL AND ping_role_id != ''"
+        )
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS twitter_accounts (
@@ -1040,6 +1048,18 @@ def upsert_twitter_account_slot(slot: int, username: str) -> None:
         )
 
 
+def find_user_by_x_username(x_username: str) -> dict | None:
+    """Find a users row by X/Twitter username (case-insensitive, strips leading @)."""
+    cleaned = (x_username or '').lstrip('@').strip().lower()
+    if not cleaned:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE LOWER(x_username) = ?", (cleaned,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def get_user_x_username(user_id: int) -> str | None:
     with get_connection() as conn:
         row = conn.execute(
@@ -1067,6 +1087,7 @@ _RAID_SETTINGS_DEFAULTS = {
     'manual_check_count_today': 0, 'manual_check_date': None,
     'guide_channel_id': '', 'guide_message': '', 'raid_role_ids': '',
     'ping_role_id': '', 'embed_thumbnail_url': '', 'embed_footer_text': '', 'embed_color': '',
+    'raid_channel_id': '', 'raid_ping_role_id': '',
 }
 
 
@@ -1088,6 +1109,7 @@ def upsert_raid_settings(guild_id: int, **fields) -> bool:
         'adaptive_verification', 'max_manual_checks_per_day', 'manual_check_count_today',
         'manual_check_date', 'guide_channel_id', 'guide_message', 'raid_role_ids',
         'ping_role_id', 'embed_thumbnail_url', 'embed_footer_text', 'embed_color',
+        'raid_channel_id', 'raid_ping_role_id',
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:

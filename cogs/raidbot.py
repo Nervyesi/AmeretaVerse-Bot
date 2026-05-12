@@ -3,6 +3,7 @@ raidbot.py — Per-guild Raid module.
 
 Flow:
   1. Admin posts a raid via /raid post (modal) or Dashboard API.
+     The raid always posts to raid_channel_id from settings.
   2. Bot sends raid embed with 'My Panel' button to the configured channel.
   3. User clicks My Panel → ephemeral toggle panel → Confirm → participation recorded.
   4. Daily midnight UTC: adaptive sample of pending participations verified via twscrape.
@@ -35,11 +36,15 @@ from database import (
     count_pending_participations_24h,
     sample_pending_participations,
     get_user_x_username,
+    find_user_by_x_username,
     list_guild_raids,
 )
 from cogs._utils import resolve_channel, resolve_role
 from cogs._branding import build_branded_embed
 from cogs._twitter import extract_tweet_id
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+MANUAL_CHECK_DAILY_LIMIT = 10
 
 DEFAULT_GUIDE_MESSAGE = (
     "🎯 **AmeretaVerse Raid System Guide**\n\n"
@@ -61,6 +66,16 @@ DEFAULT_GUIDE_MESSAGE = (
 
 # In-memory panel state: (raid_id, user_id) -> set[str]
 _panel_states: dict = {}
+
+
+# ── Adaptive check percentage ─────────────────────────────────────────────────
+
+def _adaptive_check_pct(total_pending: int) -> int:
+    if total_pending < 100:   return 50
+    if total_pending < 500:   return 30
+    if total_pending < 2000:  return 15
+    if total_pending < 5000:  return 8
+    return 5
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -151,7 +166,6 @@ def _build_raid_embed(guild_id: int, raid: dict, tweet: dict, settings: dict) ->
 
     if settings.get('embed_thumbnail_url'):
         embed.set_thumbnail(url=settings['embed_thumbnail_url'])
-
     if tweet.get('image'):
         embed.set_image(url=tweet['image'])
 
@@ -238,14 +252,11 @@ class RaidPersonalPanel(discord.ui.View):
             return
 
         guild_id = interaction.guild_id or self.guild_id
-
-        # Re-check raid active
         raid = get_guild_raid(self.raid_id, guild_id)
         if not raid or raid['status'] != 'active':
             await interaction.response.edit_message(content='❌ This raid is no longer active.', embed=None, view=None)
             return
 
-        # Re-check no existing participation
         if get_raid_participation(guild_id, self.raid_id, self.user_id):
             await interaction.response.edit_message(content='⚠️ You already submitted for this raid.', embed=None, view=None)
             return
@@ -268,7 +279,6 @@ class RaidPersonalPanel(discord.ui.View):
         settings = get_raid_settings(guild_id)
         points = _calc_points(settings, raid['total_points'], self.tasks_enabled, valid_state, raid['mode'])
 
-        # Upsert global user record
         with get_connection() as conn:
             conn.execute(
                 "INSERT INTO users (user_id, username) VALUES (?,?) "
@@ -280,7 +290,6 @@ class RaidPersonalPanel(discord.ui.View):
         create_raid_participation(guild_id, self.raid_id, self.user_id, tasks_json, points)
         upsert_raid_user_points(guild_id, self.user_id, points, delta_raids=1)
 
-        # Keep global users.total_points for backwards compat
         with get_connection() as conn:
             conn.execute(
                 "UPDATE users SET total_points=total_points+? WHERE user_id=?",
@@ -369,7 +378,6 @@ class RaidPostModal(discord.ui.Modal, title='Post New Raid'):
         guild_id = interaction.guild_id or 0
         settings = get_raid_settings(guild_id)
 
-        # Validate
         tweet_url_val = self.tweet_url.value.strip()
         tweet_id_val  = extract_tweet_id(tweet_url_val)
         if not tweet_id_val:
@@ -386,51 +394,49 @@ class RaidPostModal(discord.ui.Modal, title='Post New Raid'):
             await interaction.response.send_message('❌ Total points must be a positive integer.', ephemeral=True)
             return
 
+        ch_id = (settings.get('raid_channel_id') or '').strip()
+        if not ch_id:
+            await interaction.response.send_message(
+                '❌ No raid channel configured. Set it in Dashboard → Raid → Settings first.', ephemeral=True
+            )
+            return
+        channel = resolve_channel(interaction.guild, ch_id)
+        if not channel:
+            await interaction.response.send_message(
+                f'❌ Raid channel not found: `{ch_id}`. Update it in Dashboard → Raid → Settings.', ephemeral=True
+            )
+            return
+
         mode_val = self.mode.value.strip().lower()
         if mode_val not in ('all', 'partial'):
             mode_val = 'partial'
-
-        raw_tasks = [t.strip().lower() for t in self.tasks.value.split(',') if t.strip()]
+        raw_tasks  = [t.strip().lower() for t in self.tasks.value.split(',') if t.strip()]
         valid_tasks = {'like', 'comment', 'retweet'}
-        task_list = [t for t in raw_tasks if t in valid_tasks] or ['like', 'comment', 'retweet']
-        tasks_obj = {t: (t in task_list) for t in ['like', 'comment', 'retweet']}
+        task_list  = [t for t in raw_tasks if t in valid_tasks] or ['like', 'comment', 'retweet']
+        tasks_obj  = {t: (t in task_list) for t in ['like', 'comment', 'retweet']}
         tasks_json = json.dumps(tasks_obj)
 
         await interaction.response.defer(ephemeral=True)
 
         tweet_data = _fetch_tweet(tweet_url_val)
-
-        raid_id = create_guild_raid(
+        raid_id    = create_guild_raid(
             guild_id, tweet_url_val, tweet_id_val, pts, mode_val, tasks_json,
             interaction.user.id,
         )
         raid = get_guild_raid(raid_id, guild_id)
 
-        # Determine channel
-        channel = None
-        ch_id = (settings.get('guide_channel_id') or '').strip()
-        # Actually post to configured raid channel (ping_role_id field is for ping, not channel)
-        # Use guide_channel_id as fallback — in practice admin sets a channel via Dashboard
-        # For /raid post, we post to current channel if not configured
-        guild = interaction.guild
-        if not channel:
-            channel = interaction.channel
-
         embed = _build_raid_embed(guild_id, raid, tweet_data, settings)
         view  = discord.ui.View(timeout=None)
         view.add_item(RaidPanelButton(raid_id))
 
-        # Ping role
-        ping_raw  = (settings.get('ping_role_id') or '').strip()
-        ping_role = resolve_role(guild, ping_raw) if ping_raw else None
+        ping_raw  = (settings.get('raid_ping_role_id') or settings.get('ping_role_id') or '').strip()
+        ping_role = resolve_role(interaction.guild, ping_raw) if ping_raw else None
         content   = f'{ping_role.mention} — new raid just dropped! ⚔️' if ping_role else '⚔️ New raid just dropped!'
 
         msg = await channel.send(content=content, embed=embed, view=view,
                                   allowed_mentions=discord.AllowedMentions(roles=True))
         self._bot.add_dynamic_items(RaidPanelButton)
-
-        update_guild_raid(raid_id, guild_id,
-                          channel_id=str(channel.id), message_id=str(msg.id))
+        update_guild_raid(raid_id, guild_id, channel_id=str(channel.id), message_id=str(msg.id))
 
         display_num = raid.get('display_number') or raid_id
         await interaction.followup.send(
@@ -457,7 +463,6 @@ class RaidsCog(commands.Cog, name='Raids'):
         guild_id = interaction.guild_id or 0
         settings = get_raid_settings(guild_id)
 
-        # Permission check
         is_authorized = interaction.user.guild_permissions.administrator
         if not is_authorized:
             raid_role_ids = (settings.get('raid_role_ids') or '').strip()
@@ -565,38 +570,117 @@ class RaidsCog(commands.Cog, name='Raids'):
             f'✅ X username set to **@{username}**.', ephemeral=True
         )
 
+    # ── Target resolution for manual check ───────────────────────────────────
+
+    async def _resolve_manual_check_target(self, guild_id: int, identifier: str) -> dict | None:
+        """Resolve a free-text identifier to {discord_user_id, discord_username, twitter_username}.
+
+        Accepts: Discord ID (digits), Discord username, @twitter_handle, plain twitter handle,
+        or numeric Twitter user ID.
+        """
+        from cogs._twitter import lookup_twitter_user_by_login, lookup_twitter_user_by_id
+
+        raw = (identifier or '').strip()
+        if not raw:
+            return None
+
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return None
+
+        def _make(discord_user_id, discord_username, twitter_username):
+            return {
+                'discord_user_id': discord_user_id,
+                'discord_username': discord_username,
+                'twitter_username': twitter_username,
+            }
+
+        def _enrich_twitter(tw_uname: str) -> dict:
+            db_row = find_user_by_x_username(tw_uname)
+            if db_row:
+                m = guild.get_member(db_row['user_id'])
+                uname = m.name if m else db_row.get('username', '(unknown)')
+                return _make(db_row['user_id'], uname, tw_uname)
+            return _make(None, '(not linked to Discord)', tw_uname)
+
+        # All-numeric: try Discord member ID first, then Twitter numeric ID
+        if raw.isdigit():
+            member = guild.get_member(int(raw))
+            if member:
+                return _make(member.id, member.name, get_user_x_username(member.id))
+            tw_user = await lookup_twitter_user_by_id(raw)
+            if tw_user:
+                return _enrich_twitter(tw_user['username'])
+            return None
+
+        cleaned = raw.lstrip('@')
+
+        # Try as Twitter username (works whether or not prefixed with @)
+        tw_user = await lookup_twitter_user_by_login(cleaned)
+        if tw_user:
+            return _enrich_twitter(tw_user['username'])
+
+        # Last resort: try as Discord username or display name in this guild
+        lc = cleaned.lower()
+        for member in guild.members:
+            if member.name.lower() == lc or member.display_name.lower() == lc:
+                return _make(member.id, member.name, get_user_x_username(member.id))
+
+        return None
+
     # ── Manual check (called by API endpoint) ─────────────────────────────────
 
-    async def manual_check(self, guild_id: int, raid_id: int, user_id: int) -> dict:
-        """Verify a single participation. Returns per-task results dict."""
-        from cogs._twitter import check_comment as tw_check_comment
-        from cogs._twitter import check_retweet as tw_check_retweet
+    async def manual_check(self, guild_id: int, raid_id: int, identifier: str) -> dict:
+        """Verify a participation by flexible identifier. Returns per-task results dict."""
+        from cogs._twitter import check_comment as tw_cc, check_retweet as tw_cr
+
+        resolved = await self._resolve_manual_check_target(guild_id, identifier)
+        if not resolved:
+            return {
+                'error': (
+                    f'Could not resolve "{identifier}" — '
+                    'try Discord username, Discord ID, @twitter_handle, or Twitter user ID'
+                )
+            }
+
+        discord_user_id  = resolved.get('discord_user_id')
+        twitter_username = resolved.get('twitter_username')
+        discord_username = resolved.get('discord_username', '(unknown)')
+
+        if not discord_user_id:
+            return {
+                'error': (
+                    f'Found Twitter user @{twitter_username} but they are not '
+                    'linked to a Discord account in this server\'s database'
+                )
+            }
 
         raid = get_guild_raid(raid_id, guild_id)
         if not raid:
             return {'error': 'Raid not found'}
 
-        part = get_raid_participation(guild_id, raid_id, user_id)
+        part = get_raid_participation(guild_id, raid_id, discord_user_id)
         if not part:
-            return {'error': 'No participation found for this user'}
+            return {'error': f'No participation found for {discord_username} in Raid #{raid_id}'}
 
-        x_username = get_user_x_username(user_id)
-        if not x_username:
-            return {'error': 'User has no X username set'}
+        if not twitter_username:
+            twitter_username = get_user_x_username(discord_user_id)
+        if not twitter_username:
+            return {'error': f'{discord_username} has no X/Twitter username linked'}
 
-        tweet_id     = raid['tweet_id']
+        tweet_id      = raid['tweet_id']
         tasks_claimed = set(json.loads(part.get('tasks_claimed') or '[]'))
 
-        results = {}
-        comment_result  = None
-        retweet_result  = None
+        results        = {}
+        comment_result = None
+        retweet_result = None
 
         if 'comment' in tasks_claimed:
-            comment_result = await tw_check_comment(tweet_id, x_username)
+            comment_result = await tw_cc(tweet_id, twitter_username)
             results['comment'] = {'claimed': True, **comment_result}
 
         if 'retweet' in tasks_claimed:
-            retweet_result = await tw_check_retweet(tweet_id, x_username)
+            retweet_result = await tw_cr(tweet_id, twitter_username)
             results['retweet'] = {'claimed': True, **retweet_result}
 
         if 'like' in tasks_claimed:
@@ -616,16 +700,14 @@ class RaidsCog(commands.Cog, name='Raids'):
                     'reason': 'companions_passed' if companions_ok else 'companions_failed',
                 }
 
-        # Log and apply deductions
-        settings = get_raid_settings(guild_id)
+        settings      = get_raid_settings(guild_id)
         flagged_tasks = {t for t, r in results.items() if r.get('verified') is False}
 
         if flagged_tasks:
-            deduct = 0
-            for task in flagged_tasks:
-                pct = settings.get(f'point_ratio_{task}', 0) / 100
-                deduct += round(raid['total_points'] * pct)
-
+            deduct = sum(
+                round(raid['total_points'] * settings.get(f'point_ratio_{task}', 0) / 100)
+                for task in flagged_tasks
+            )
             with get_connection() as conn:
                 conn.execute(
                     "UPDATE raid_participation SET verification_status='flagged', "
@@ -636,16 +718,15 @@ class RaidsCog(commands.Cog, name='Raids'):
                 if deduct > 0:
                     conn.execute(
                         "UPDATE raid_user_points SET total_points=MAX(0,total_points-?) "
-                        "WHERE guild_id=? AND user_id=?", (deduct, guild_id, user_id),
+                        "WHERE guild_id=? AND user_id=?", (deduct, guild_id, discord_user_id),
                     )
                     conn.execute(
                         "UPDATE users SET total_points=MAX(0,total_points-?) WHERE user_id=?",
-                        (deduct, user_id),
+                        (deduct, discord_user_id),
                     )
-
             for task in flagged_tasks:
                 add_raid_verification_log(
-                    guild_id, raid_id, user_id, task, True, False, 'manual',
+                    guild_id, raid_id, discord_user_id, task, True, False, 'manual',
                     error_text='manual_check',
                 )
         else:
@@ -657,12 +738,21 @@ class RaidsCog(commands.Cog, name='Raids'):
                 )
             for task in tasks_claimed:
                 add_raid_verification_log(
-                    guild_id, raid_id, user_id, task, True, True, 'manual',
+                    guild_id, raid_id, discord_user_id, task, True, True, 'manual',
                 )
 
-        return {'x_username': x_username, 'tasks': results,
-                'flagged': sorted(flagged_tasks), 'deducted': 0 if not flagged_tasks else
-                sum(round(raid['total_points'] * settings.get(f'point_ratio_{t}', 0) / 100) for t in flagged_tasks)}
+        deducted = sum(
+            round(raid['total_points'] * settings.get(f'point_ratio_{t}', 0) / 100)
+            for t in flagged_tasks
+        ) if flagged_tasks else 0
+
+        return {
+            'discord_username': discord_username,
+            'twitter_username': twitter_username,
+            'tasks': results,
+            'flagged': sorted(flagged_tasks),
+            'deducted': deducted,
+        }
 
     # ── Daily verification ─────────────────────────────────────────────────────
 
@@ -673,13 +763,9 @@ class RaidsCog(commands.Cog, name='Raids'):
             print('[raid] daily check: no pending participations')
             return
 
-        if total < 500:      pct = 25
-        elif total < 2000:   pct = 15
-        elif total < 5000:   pct = 8
-        else:                pct = 5
-
+        pct         = _adaptive_check_pct(total)
         sample_size = max(1, total * pct // 100)
-        rows = sample_pending_participations(sample_size)
+        rows        = sample_pending_participations(sample_size)
         print(f'[raid] daily check: total={total} sampling={sample_size} ({pct}%)')
 
         for row in rows:
@@ -694,8 +780,7 @@ class RaidsCog(commands.Cog, name='Raids'):
         await self.bot.wait_until_ready()
 
     async def _verify_participation(self, row: dict):
-        from cogs._twitter import check_comment as tw_cc
-        from cogs._twitter import check_retweet as tw_cr
+        from cogs._twitter import check_comment as tw_cc, check_retweet as tw_cr
 
         guild_id = row['guild_id']
         raid     = get_guild_raid(row['raid_id'], guild_id)
@@ -730,8 +815,8 @@ class RaidsCog(commands.Cog, name='Raids'):
                     flagged_tasks.add('like')
 
         if flagged_tasks:
-            settings = get_raid_settings(guild_id)
-            deduct   = sum(
+            settings    = get_raid_settings(guild_id)
+            deduct      = sum(
                 round(raid['total_points'] * settings.get(f'point_ratio_{t}', 0) / 100)
                 for t in flagged_tasks
             )

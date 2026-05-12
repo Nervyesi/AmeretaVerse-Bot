@@ -1702,6 +1702,8 @@ async def forms_send(
 import re as _re
 _TWEET_URL_RE = _re.compile(r'^https?://(x|twitter)\.com/.+/status/\d+', _re.IGNORECASE)
 
+_MANUAL_CHECK_DAILY_LIMIT = 10
+
 
 def _validate_tweet_url(url: str):
     if not _TWEET_URL_RE.match(url or ''):
@@ -1716,12 +1718,11 @@ class _RaidSettingsUpdate(BaseModel):
     point_ratio_like: Optional[int] = None
     point_ratio_comment: Optional[int] = None
     point_ratio_retweet: Optional[int] = None
-    adaptive_verification: Optional[int] = None
-    max_manual_checks_per_day: Optional[int] = None
     guide_channel_id: Optional[str] = None
     guide_message: Optional[str] = None
+    raid_channel_id: Optional[str] = None
     raid_role_ids: Optional[str] = None
-    ping_role_id: Optional[str] = None
+    raid_ping_role_id: Optional[str] = None
     embed_thumbnail_url: Optional[str] = None
     embed_footer_text: Optional[str] = None
     embed_color: Optional[str] = None
@@ -1732,12 +1733,11 @@ class _RaidCreate(BaseModel):
     total_points: int
     mode: str = 'partial'
     tasks: dict = {'like': True, 'comment': True, 'retweet': True}
-    channel_id: Optional[str] = None
 
 
 class _RaidManualCheck(BaseModel):
     raid_id: int
-    user_id: str
+    identifier: str
 
 
 @app.get('/api/servers/{server_id}/raid/settings')
@@ -1766,11 +1766,6 @@ async def raid_update_settings(
                 status_code=400,
                 detail=f'Point ratios must sum to 100 (got {total})',
             )
-
-    if 'max_manual_checks_per_day' in updates:
-        v = updates['max_manual_checks_per_day']
-        if not (1 <= v <= 50):
-            raise HTTPException(status_code=400, detail='max_manual_checks_per_day must be 1–50')
 
     if updates:
         db_upsert_raid_settings(server_id, **updates)
@@ -1828,10 +1823,15 @@ async def raid_create(
     settings   = db_get_raid_settings(server_id)
     tweet_data = _fetch_tweet(body.tweet_url)
 
-    ch_val  = (body.channel_id or '').strip() or (settings.get('guide_channel_id') or '').strip()
-    channel = resolve_channel(guild, ch_val) if ch_val else None
+    ch_val = (settings.get('raid_channel_id') or '').strip()
+    if not ch_val:
+        raise HTTPException(
+            status_code=400,
+            detail='Raid channel not configured. Set raid_channel_id in Raid Settings first.',
+        )
+    channel = resolve_channel(guild, ch_val)
     if channel is None:
-        raise HTTPException(status_code=400, detail='Channel not found — set guide_channel_id in settings or pass channel_id')
+        raise HTTPException(status_code=400, detail=f'Raid channel not found: {ch_val}')
 
     user_id_int = int(user['user_id'])
     raid_id = db_create_guild_raid(
@@ -1844,7 +1844,7 @@ async def raid_create(
     view  = discord.ui.View(timeout=None)
     view.add_item(RaidPanelButton(raid_id))
 
-    ping_raw  = (settings.get('ping_role_id') or '').strip()
+    ping_raw  = (settings.get('raid_ping_role_id') or settings.get('ping_role_id') or '').strip()
     ping_role = resolve_role(guild, ping_raw) if ping_raw else None
     content   = f'{ping_role.mention} — new raid just dropped! ⚔️' if ping_role else '⚔️ New raid!'
 
@@ -1886,19 +1886,51 @@ async def raid_leaderboard_api(
 @app.get('/api/servers/{server_id}/raid/verification-log')
 async def raid_verification_log(
     server_id: int,
-    raid_id: Optional[int] = None,
-    user_id_filter: Optional[int] = None,
+    status: str = 'flagged',
     limit: int = 50,
     user: dict = Depends(get_current_user),
 ):
+    """Return aggregated verification flags — one row per (user, raid) with task details."""
     require_guild_admin(user, server_id)
-    rows = db_get_raid_verification_log(
-        server_id,
-        raid_id=raid_id,
-        user_id=user_id_filter,
-        limit=min(limit, 200),
+    guild = bot.get_guild(server_id) if bot.is_ready() else None
+
+    having_clause = (
+        '' if status == 'all'
+        else 'HAVING SUM(CASE WHEN verified=0 THEN 1 ELSE 0 END) > 0'
     )
-    return {'log': rows}
+    with get_connection() as conn:
+        agg_rows = conn.execute(f"""
+            SELECT
+                user_id, raid_id,
+                COUNT(*) AS task_count,
+                SUM(CASE WHEN verified=0 THEN 1 ELSE 0 END) AS failed_count,
+                MAX(checked_at) AS last_checked,
+                MAX(source) AS source
+            FROM raid_verification_log
+            WHERE guild_id=?
+            GROUP BY user_id, raid_id
+            {having_clause}
+            ORDER BY last_checked DESC
+            LIMIT ?
+        """, (server_id, min(limit, 200))).fetchall()
+
+        flags = []
+        for row in agg_rows:
+            d = dict(row)
+            member = guild.get_member(d['user_id']) if guild else None
+            d['discord_username'] = member.name if member else f'user_{d["user_id"]}'
+            d['twitter_username'] = db_get_user_x_username(d['user_id']) or '(not linked)'
+            raid = db_get_guild_raid(d['raid_id'], server_id)
+            d['tweet_url'] = (raid or {}).get('tweet_url', '')
+            task_rows = conn.execute(
+                "SELECT task, claimed, verified, error_text FROM raid_verification_log "
+                "WHERE guild_id=? AND user_id=? AND raid_id=? ORDER BY task",
+                (server_id, d['user_id'], d['raid_id']),
+            ).fetchall()
+            d['tasks'] = [dict(t) for t in task_rows]
+            flags.append(d)
+
+    return {'flags': flags}
 
 
 @app.post('/api/servers/{server_id}/raid/manual-check')
@@ -1907,19 +1939,13 @@ async def raid_manual_check(
 ):
     require_guild_admin(user, server_id)
 
-    settings = db_check_reset_manual_count(server_id)
-    max_checks = settings.get('max_manual_checks_per_day', 3)
+    settings   = db_check_reset_manual_count(server_id)
     used_today = settings.get('manual_check_count_today', 0)
-    if used_today >= max_checks:
+    if used_today >= _MANUAL_CHECK_DAILY_LIMIT:
         raise HTTPException(
             status_code=429,
-            detail=f'Daily manual check limit reached ({max_checks}/day). Resets at midnight UTC.',
+            detail=f'Daily manual check limit ({_MANUAL_CHECK_DAILY_LIMIT}) reached. Resets at midnight UTC.',
         )
-
-    try:
-        target_user_id = int(body.user_id)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail='Invalid user_id — must be a Discord snowflake')
 
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready')
@@ -1928,13 +1954,13 @@ async def raid_manual_check(
     if cog is None:
         raise HTTPException(status_code=503, detail='Raids cog not loaded')
 
-    result = await cog.manual_check(server_id, body.raid_id, target_user_id)
+    result = await cog.manual_check(server_id, body.raid_id, body.identifier)
     if 'error' not in result:
         db_upsert_raid_settings(server_id, manual_check_count_today=used_today + 1)
 
     return {
         'used_today': used_today + (0 if 'error' in result else 1),
-        'limit': max_checks,
+        'limit': _MANUAL_CHECK_DAILY_LIMIT,
         **result,
     }
 
