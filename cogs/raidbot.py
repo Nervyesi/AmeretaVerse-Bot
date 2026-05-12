@@ -315,9 +315,10 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
             enabled_tasks = {t for t, v in allowed.items() if v}
             claimed_tasks = {t for t, v in claimed.items() if v}
             if claimed_tasks < enabled_tasks:
-                missing = enabled_tasks - claimed_tasks
+                _friendly = {'like': 'Like', 'comment': 'Comment', 'retweet': 'Retweet'}
+                missing_str = ', '.join(_friendly.get(t, t.capitalize()) for t in sorted(enabled_tasks - claimed_tasks))
                 await interaction.response.edit_message(
-                    content=f'❌ All tasks required. Also select: {", ".join(sorted(missing))}',
+                    content=f"❌ This raid requires ALL tasks to be completed. You haven't selected: **{missing_str}**.",
                     embed=None, view=None,
                 )
                 return
@@ -695,49 +696,72 @@ class RaidsCog(commands.Cog, name='Raids'):
     # ── Target resolution for manual check ───────────────────────────────────
 
     async def _resolve_manual_check_target(self, guild_id: int, identifier: str) -> dict | None:
-        # FIX 6: numeric → Discord ID only (no Twitter ID lookup)
         from cogs._twitter import lookup_twitter_user_by_login
 
         raw = (identifier or '').strip()
+        print(f'[raid] resolve_manual_check: guild={guild_id} identifier="{raw}"')
         if not raw:
+            print('[raid] resolve_manual_check: empty identifier')
             return None
 
         guild = self.bot.get_guild(guild_id)
         if not guild:
+            print(f'[raid] resolve_manual_check: guild {guild_id} not found in bot cache')
             return None
 
-        def _make(discord_user_id, discord_username, twitter_username):
-            return {
-                'discord_user_id': discord_user_id,
-                'discord_username': discord_username,
-                'twitter_username': twitter_username,
-            }
-
-        def _enrich_twitter(tw_uname: str) -> dict:
-            db_row = find_user_by_x_username(tw_uname)
-            if db_row:
-                m = guild.get_member(db_row['user_id'])
-                uname = m.name if m else db_row.get('username', '(unknown)')
-                return _make(db_row['user_id'], uname, tw_uname)
-            return _make(None, '(not linked to Discord)', tw_uname)
-
-        # Numeric → Discord ID only
+        # 1. All-numeric → Discord ID only (no Twitter ID lookup per FIX 6)
         if raw.isdigit():
+            print(f'[raid] resolve_manual_check: numeric input — trying Discord member ID')
             member = guild.get_member(int(raw))
             if member:
-                return _make(member.id, member.name, get_user_x_username(member.id))
-            return None  # not a guild member — don't attempt Twitter ID lookup
+                tw = get_user_x_username(member.id)
+                print(f'[raid] resolve_manual_check: found Discord member {member.name} (bot={member.bot}), x_username={tw!r}')
+                return {
+                    'discord_user_id':  member.id,
+                    'discord_username': member.name,
+                    'twitter_username': tw,
+                }
+            print(f'[raid] resolve_manual_check: {raw} is not a member ID in this guild')
+            return None
 
-        cleaned = raw.lstrip('@')
+        cleaned = raw.lstrip('@').strip()
+        print(f'[raid] resolve_manual_check: cleaned="{cleaned}" — trying Twitter lookup first')
+
+        # 2. Try as Twitter username
         tw_user = await lookup_twitter_user_by_login(cleaned)
         if tw_user:
-            return _enrich_twitter(tw_user['username'])
+            tw_uname = tw_user['username']
+            print(f'[raid] resolve_manual_check: Twitter user found @{tw_uname} — looking up Discord linkage')
+            db_row = find_user_by_x_username(tw_uname)
+            if db_row:
+                member = guild.get_member(int(db_row['user_id']))
+                uname  = member.name if member else db_row.get('username', '(not in guild)')
+                print(f'[raid] resolve_manual_check: linked to Discord user {uname}')
+                return {
+                    'discord_user_id':  int(db_row['user_id']),
+                    'discord_username': uname,
+                    'twitter_username': tw_uname,
+                }
+            # Twitter user exists but no /setx linkage — do NOT fall through
+            print(f'[raid] resolve_manual_check: @{tw_uname} found on Twitter but not linked via /setx')
+            return None
 
-        lc = cleaned.lower()
+        # 3. Fall back: exact Discord username/display_name — skip bots
+        print(f'[raid] resolve_manual_check: Twitter lookup returned None — trying Discord username "{cleaned}"')
+        target_lower = cleaned.lower()
         for member in guild.members:
-            if member.name.lower() == lc or member.display_name.lower() == lc:
-                return _make(member.id, member.name, get_user_x_username(member.id))
+            if member.bot:
+                continue  # never match bots
+            if member.name.lower() == target_lower or (member.display_name or '').lower() == target_lower:
+                tw = get_user_x_username(member.id)
+                print(f'[raid] resolve_manual_check: found Discord member by username: {member.name}, x_username={tw!r}')
+                return {
+                    'discord_user_id':  member.id,
+                    'discord_username': member.name,
+                    'twitter_username': tw,
+                }
 
+        print(f'[raid] resolve_manual_check: no match found for "{cleaned}"')
         return None
 
     # ── Manual check (called by API endpoint) ─────────────────────────────────

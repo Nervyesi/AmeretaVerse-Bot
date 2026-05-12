@@ -15,6 +15,7 @@ env vars exist, they are treated as slot 1 and auto-activated on first run.
 import os
 import asyncio
 import re
+import traceback as _tb
 
 API_INSTANCE = None
 INITIALIZED  = False
@@ -57,8 +58,10 @@ def _discover_configured_accounts() -> list:
 
 async def get_api():
     global API_INSTANCE, INITIALIZED
+    print(f'[twitter] get_api called (INITIALIZED={INITIALIZED})')
     async with _init_lock:
         if INITIALIZED and API_INSTANCE is not None:
+            print('[twitter] get_api: returning cached API_INSTANCE')
             return API_INSTANCE
 
         try:
@@ -68,14 +71,18 @@ async def get_api():
             INITIALIZED = True
             return None
 
-        api         = API(TWSCRAPE_DB_PATH)
-        configured  = _discover_configured_accounts()
+        api        = API(TWSCRAPE_DB_PATH)
+        configured = _discover_configured_accounts()
+        print(f'[twitter] get_api: discovered {len(configured)} configured account(s)')
 
         if not configured:
             print('[twitter] No credentials configured — verification disabled')
-            INITIALIZED = True
+            INITIALIZED  = True
             API_INSTANCE = api
             return api
+
+        for acc in configured:
+            print(f'[twitter] get_api: slot {acc["slot"]} username={acc["username"]}')
 
         from database import (
             list_twitter_accounts,
@@ -83,11 +90,9 @@ async def get_api():
             set_twitter_account_active,
         )
 
-        # Sync DB rows for every configured slot so the admin panel shows them
         for acc in configured:
             upsert_twitter_account_slot(acc['slot'], acc['username'])
 
-        # Auto-activate slot 1 on first run if nothing is active yet
         db_rows    = list_twitter_accounts()
         any_active = any(r['active'] for r in db_rows)
         if not any_active and configured:
@@ -96,20 +101,23 @@ async def get_api():
             db_rows = list_twitter_accounts()
 
         active_slots = {r['slot'] for r in db_rows if r['active']}
+        print(f'[twitter] get_api: active slots = {active_slots}')
 
-        # Find which usernames are already registered with twscrape
         try:
             pool_accounts      = await api.pool.accounts_info()
             existing_usernames = {a.username.lower() for a in pool_accounts}
-        except Exception:
+            print(f'[twitter] get_api: already in pool = {existing_usernames}')
+        except Exception as e:
+            print(f'[twitter] get_api: pool.accounts_info() failed: {type(e).__name__}: {e}')
             existing_usernames = set()
 
         added = 0
         for acc in configured:
             if acc['slot'] not in active_slots:
+                print(f'[twitter] slot {acc["slot"]} ({acc["username"]}) not active — skipping')
                 continue
             if acc['username'].lower() in existing_usernames:
-                print(f"[twitter] Slot {acc['slot']} ({acc['username']}) already in pool")
+                print(f'[twitter] slot {acc["slot"]} ({acc["username"]}) already in pool')
                 continue
             try:
                 await api.pool.add_account(
@@ -117,25 +125,31 @@ async def get_api():
                     acc['email'],    acc['password'],
                 )
                 added += 1
-                print(f"[twitter] Added slot {acc['slot']} ({acc['username']}) to pool")
+                print(f'[twitter] add_account OK: slot {acc["slot"]} ({acc["username"]})')
             except Exception as e:
-                print(f"[twitter] Slot {acc['slot']} add error: {type(e).__name__}: {e}")
+                print(f'[twitter] add_account FAILED: slot {acc["slot"]} ({acc["username"]}): {type(e).__name__}: {e}')
 
         if added > 0:
-            print('[twitter] Logging in newly added accounts...')
+            print('[twitter] calling login_all()...')
             try:
                 await api.pool.login_all()
+                print('[twitter] login_all completed successfully')
             except Exception as e:
-                print(f'[twitter] login_all warning: {type(e).__name__}: {e}')
+                print(f'[twitter] login_all FAILED: {type(e).__name__}: {e}')
+                _tb.print_exc()
+        else:
+            print('[twitter] get_api: no new accounts added — skipping login_all')
 
         INITIALIZED  = True
         API_INSTANCE = api
+        print('[twitter] get_api: initialization complete, API_INSTANCE set')
         return api
 
 
 async def reload_api():
     """Force re-initialization of the twscrape pool (call after admin changes active slots)."""
     global API_INSTANCE, INITIALIZED
+    print('[twitter] reload_api: resetting state')
     async with _init_lock:
         API_INSTANCE = None
         INITIALIZED  = False
@@ -148,83 +162,114 @@ def normalize_username(u: str) -> str:
 
 async def check_comment(tweet_id: str, target_username: str) -> dict:
     """Check if target_username commented on tweet_id."""
+    print(f'[twitter] check_comment called: tweet_id={tweet_id} target={target_username}')
     target = normalize_username(target_username)
     if not target:
+        print('[twitter] check_comment: empty target — returning False')
         return {'verified': False, 'reason': 'no_username'}
     try:
         api = await get_api()
         if api is None:
+            print('[twitter] check_comment: api is None — verification disabled')
             return {'verified': None, 'reason': 'verification_disabled'}
+        print(f'[twitter] check_comment: fetching replies for tweet {tweet_id}...')
         from twscrape import gather
         replies = await gather(api.tweet_replies(int(tweet_id), limit=200))
+        print(f'[twitter] check_comment: got {len(replies)} replies')
         for reply in replies:
-            if normalize_username(getattr(reply.user, 'username', '')) == target:
+            reply_user = normalize_username(getattr(reply.user, 'username', ''))
+            if reply_user == target:
+                print(f'[twitter] check_comment: MATCH found for {target}')
                 return {'verified': True, 'reason': 'found_comment'}
+        print(f'[twitter] check_comment: no match for {target} in {len(replies)} replies')
         return {'verified': False, 'reason': 'no_comment_found'}
     except Exception as e:
-        print(f'[twitter] check_comment error: {type(e).__name__}: {e}')
+        print(f'[twitter] check_comment EXCEPTION: {type(e).__name__}: {e}')
+        _tb.print_exc()
         return {'verified': None, 'reason': f'scrape_error:{type(e).__name__}'}
 
 
 async def check_retweet(tweet_id: str, target_username: str) -> dict:
     """Check if target_username retweeted tweet_id."""
+    print(f'[twitter] check_retweet called: tweet_id={tweet_id} target={target_username}')
     target = normalize_username(target_username)
     if not target:
+        print('[twitter] check_retweet: empty target — returning False')
         return {'verified': False, 'reason': 'no_username'}
     try:
         api = await get_api()
         if api is None:
+            print('[twitter] check_retweet: api is None — verification disabled')
             return {'verified': None, 'reason': 'verification_disabled'}
-        from twscrape import gather
+        print(f'[twitter] check_retweet: looking up user {target}...')
         user = await api.user_by_login(target)
         if not user:
+            print(f'[twitter] check_retweet: user {target} not found on Twitter')
             return {'verified': False, 'reason': 'user_not_found'}
+        print(f'[twitter] check_retweet: user found id={user.id}, fetching timeline...')
+        from twscrape import gather
         tweets = await gather(api.user_tweets(user.id, limit=200))
+        print(f'[twitter] check_retweet: got {len(tweets)} tweets in timeline')
         for tw in tweets:
             rt = getattr(tw, 'retweetedTweet', None)
             if rt and str(rt.id) == str(tweet_id):
+                print(f'[twitter] check_retweet: MATCH found — tweet {tweet_id} in timeline')
                 return {'verified': True, 'reason': 'found_retweet'}
+        print(f'[twitter] check_retweet: tweet {tweet_id} not found in {len(tweets)}-tweet timeline')
         return {'verified': False, 'reason': 'no_retweet_found'}
     except Exception as e:
-        print(f'[twitter] check_retweet error: {type(e).__name__}: {e}')
+        print(f'[twitter] check_retweet EXCEPTION: {type(e).__name__}: {e}')
+        _tb.print_exc()
         return {'verified': None, 'reason': f'scrape_error:{type(e).__name__}'}
 
 
 async def lookup_twitter_user_by_login(username: str) -> dict | None:
     """Get a Twitter user's basic info by username. Returns None if not found or error."""
+    print(f'[twitter] lookup_by_login: username={username}')
     try:
         api = await get_api()
         if api is None:
+            print('[twitter] lookup_by_login: api is None')
             return None
-        user = await api.user_by_login(normalize_username(username))
+        cleaned = normalize_username(username)
+        print(f'[twitter] lookup_by_login: calling api.user_by_login({cleaned!r})...')
+        user = await api.user_by_login(cleaned)
         if user:
+            print(f'[twitter] lookup_by_login: found id={user.id} username={user.username}')
             return {
-                'id': str(user.id),
-                'username': user.username,
+                'id':           str(user.id),
+                'username':     user.username,
                 'display_name': getattr(user, 'displayname', ''),
             }
+        print(f'[twitter] lookup_by_login: no user returned for {cleaned!r}')
         return None
     except Exception as e:
-        print(f'[twitter] lookup_by_login error: {type(e).__name__}: {e}')
+        print(f'[twitter] lookup_by_login EXCEPTION: {type(e).__name__}: {e}')
+        _tb.print_exc()
         return None
 
 
 async def lookup_twitter_user_by_id(user_id: str) -> dict | None:
     """Get a Twitter user's basic info by numeric user ID. Returns None if not found or error."""
+    print(f'[twitter] lookup_by_id: user_id={user_id}')
     try:
         api = await get_api()
         if api is None:
+            print('[twitter] lookup_by_id: api is None')
             return None
         user = await api.user_by_id(int(user_id))
         if user:
+            print(f'[twitter] lookup_by_id: found username={user.username}')
             return {
-                'id': str(user.id),
-                'username': user.username,
+                'id':           str(user.id),
+                'username':     user.username,
                 'display_name': getattr(user, 'displayname', ''),
             }
+        print(f'[twitter] lookup_by_id: no user returned for id={user_id}')
         return None
     except Exception as e:
-        print(f'[twitter] lookup_by_id error: {type(e).__name__}: {e}')
+        print(f'[twitter] lookup_by_id EXCEPTION: {type(e).__name__}: {e}')
+        _tb.print_exc()
         return None
 
 

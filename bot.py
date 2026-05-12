@@ -23,5 +23,15 @@ async def on_ready():
         ensure_guild_defaults(guild.id)
     print(f'Bot is online: {bot.user}')
 
+    print('[startup] Initializing Twitter API pool...')
+    try:
+        from cogs._twitter import get_api
+        await get_api()
+        print('[startup] Twitter API pool initialization complete')
+    except Exception as e:
+        import traceback
+        print(f'[startup] Twitter API init FAILED: {type(e).__name__}: {e}')
+        traceback.print_exc()
+
 if __name__ == '__main__':
     bot.run(os.getenv('DISCORD_TOKEN'))

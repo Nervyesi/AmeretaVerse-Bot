@@ -426,10 +426,11 @@ async def server_analytics(
 
         raid_stats = conn.execute("""
             SELECT COUNT(*) as total_raids,
-                   SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) as active_raids,
+                   SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) as active_raids,
                    SUM(total_points) as total_points_offered
             FROM raids
-        """).fetchone()
+            WHERE guild_id=?
+        """, (server_id,)).fetchone()
 
         e4e_stats = conn.execute("""
             SELECT COUNT(*) as total_links,
