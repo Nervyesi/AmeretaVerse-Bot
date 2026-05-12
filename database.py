@@ -374,6 +374,7 @@ def init_db():
             "ALTER TABLE forms ADD COLUMN auto_close_on_decision INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE raid_settings ADD COLUMN raid_channel_id TEXT DEFAULT ''",
             "ALTER TABLE raid_settings ADD COLUMN raid_ping_role_id TEXT DEFAULT ''",
+            "ALTER TABLE raids ADD COLUMN ended_reason TEXT DEFAULT NULL",
             "ALTER TABLE raid_settings ADD COLUMN raid_guide_channel_id TEXT DEFAULT ''",
             "ALTER TABLE raid_settings ADD COLUMN raid_guide_title TEXT DEFAULT ''",
             "ALTER TABLE raid_settings ADD COLUMN raid_guide_description TEXT DEFAULT ''",
@@ -640,9 +641,12 @@ def init_db():
             "WHERE raid_ping_role_id='' AND ping_role_id IS NOT NULL AND ping_role_id != ''"
         )
 
-        # One-time: backfill default guide title and description for existing rows
+        # One-time: backfill default guide title and description for existing rows.
+        # OLD default (from previous phase) is replaced with NEW default (added FIX4 line +
+        # updated button references). Rows with custom text are left untouched.
         _DEFAULT_GUIDE_TITLE = "Raid System - How It Works"
-        _DEFAULT_GUIDE_DESC = (
+        _OLD_GUIDE_DESC_SENTINEL = "Repeat offenders can be banned from raiding."
+        _NEW_DEFAULT_GUIDE_DESC = (
             "Welcome! This is your community's raid system. Here's everything you need to know to participate.\n\n"
             "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
             "**1️⃣ Link your X (Twitter) account**\n\n"
@@ -654,17 +658,18 @@ def init_db():
             "When a new raid is posted, you'll see an embed in the raid channel containing:\n"
             "- The tweet to raid\n"
             "- Which tasks count (Like, Comment, Retweet)\n"
-            "- Four action buttons below the embed\n\n"
+            "- A 🎯 **Join Raid** button below the embed\n\n"
             "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
             "**3️⃣ Complete the tasks on X**\n\n"
             "Open the tweet on X and do the tasks you want to claim. Be genuine — write thoughtful comments, don't just spam.\n\n"
             "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
             "**4️⃣ Claim your tasks**\n\n"
-            "Back on Discord, under the raid embed:\n\n"
+            "Back on Discord, click 🎯 **Join Raid** under the raid embed. "
+            "This opens a private panel just for you:\n\n"
             "❤️ **Like** — click to toggle if you liked the tweet\n"
             "💬 **Comment** — click to toggle if you commented\n"
             "🔁 **Retweet** — click to toggle if you retweeted\n\n"
-            "Each click shows you your current selection privately. Take your time — nothing is recorded until you confirm.\n\n"
+            "Each click silently updates your selection — nothing is recorded until you confirm.\n\n"
             "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
             "**5️⃣ Confirm your submission**\n\n"
             "When you're ready, click ✅ **Confirm**. The bot records what you claimed and shows the points you earned. "
@@ -674,7 +679,7 @@ def init_db():
             "A random sample of submissions is automatically checked against X every day. "
             "Admins can also manually verify any submission. "
             "If a task was claimed but not done, it gets flagged and points are deducted. "
-            "Repeat offenders can be banned from raiding.\n\n"
+            "Admins can also take extra actions (ban, mute, etc.) at their discretion.\n\n"
             "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
             "**📊 Track your progress**\n\n"
             "- `/raid leaderboard` — see the top raiders in this server\n"
@@ -685,9 +690,11 @@ def init_db():
             "UPDATE raid_settings SET raid_guide_title=? WHERE raid_guide_title=''",
             (_DEFAULT_GUIDE_TITLE,),
         )
+        # Update empty rows AND rows that still have the old default (identified by sentinel phrase)
         conn.execute(
-            "UPDATE raid_settings SET raid_guide_description=? WHERE raid_guide_description=''",
-            (_DEFAULT_GUIDE_DESC,),
+            "UPDATE raid_settings SET raid_guide_description=? "
+            "WHERE raid_guide_description='' OR raid_guide_description LIKE ?",
+            (_NEW_DEFAULT_GUIDE_DESC, f'%{_OLD_GUIDE_DESC_SENTINEL}%'),
         )
 
         conn.execute("""
@@ -1210,6 +1217,16 @@ def create_guild_raid(
             (row['next_num'], raid_id),
         )
     return raid_id
+
+
+def end_raid(raid_id: int, guild_id: int, ended_reason: str = 'admin') -> bool:
+    with get_connection() as conn:
+        c = conn.execute(
+            "UPDATE raids SET status='ended', ended_reason=? "
+            "WHERE raid_id=? AND guild_id=? AND status='active'",
+            (ended_reason, raid_id, guild_id),
+        )
+    return c.rowcount > 0
 
 
 def get_guild_raid(raid_id: int, guild_id: int) -> dict | None:

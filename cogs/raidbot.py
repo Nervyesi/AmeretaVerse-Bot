@@ -2,11 +2,10 @@
 raidbot.py — Per-guild Raid module.
 
 Flow:
-  1. Admin posts a raid via /raid post (modal) or Dashboard API.
-     The raid always posts to raid_channel_id from settings.
-  2. Bot sends raid embed with 4 inline buttons: Like / Comment / Retweet / Confirm.
-  3. User toggles tasks (each click shows ephemeral status), then confirms.
-     Confirm records participation and awards points.
+  1. Admin posts a raid via /raid post or Dashboard. Embed has one "Join Raid" button.
+  2. User clicks Join Raid → bot sends ephemeral personal panel with task toggles.
+  3. User toggles tasks silently (edit_message, no new messages), then confirms.
+     Confirm records participation and shows result in the same ephemeral.
   4. Daily midnight UTC: adaptive sample of pending participations verified via twscrape.
   5. Flagged users have points deducted; verification log updated.
 """
@@ -15,7 +14,7 @@ import json
 import asyncio
 import traceback
 import requests
-from datetime import datetime, timezone, time as dtime
+from datetime import datetime, timezone, timedelta, time as dtime
 
 import discord
 from discord import app_commands
@@ -28,6 +27,7 @@ from database import (
     create_guild_raid,
     get_guild_raid,
     update_guild_raid,
+    end_raid,
     get_raid_participation,
     create_raid_participation,
     update_raid_participation,
@@ -62,17 +62,18 @@ DEFAULT_GUIDE_DESCRIPTION = (
     "When a new raid is posted, you'll see an embed in the raid channel containing:\n"
     "- The tweet to raid\n"
     "- Which tasks count (Like, Comment, Retweet)\n"
-    "- Four action buttons below the embed\n\n"
+    "- A 🎯 **Join Raid** button below the embed\n\n"
     "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
     "**3️⃣ Complete the tasks on X**\n\n"
     "Open the tweet on X and do the tasks you want to claim. Be genuine — write thoughtful comments, don't just spam.\n\n"
     "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
     "**4️⃣ Claim your tasks**\n\n"
-    "Back on Discord, under the raid embed:\n\n"
+    "Back on Discord, click 🎯 **Join Raid** under the raid embed. "
+    "This opens a private panel just for you:\n\n"
     "❤️ **Like** — click to toggle if you liked the tweet\n"
     "💬 **Comment** — click to toggle if you commented\n"
     "🔁 **Retweet** — click to toggle if you retweeted\n\n"
-    "Each click shows your current selection privately. Nothing is recorded until you confirm.\n\n"
+    "Each click silently updates your selection — nothing is recorded until you confirm.\n\n"
     "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
     "**5️⃣ Confirm your submission**\n\n"
     "When you're ready, click ✅ **Confirm**. The bot records what you claimed and shows the points you earned. "
@@ -81,7 +82,8 @@ DEFAULT_GUIDE_DESCRIPTION = (
     "**🔍 How we verify**\n\n"
     "A random sample of submissions is automatically checked against X every day. "
     "Admins can also manually verify any submission. "
-    "If a task was claimed but not done, it gets flagged and points are deducted.\n\n"
+    "If a task was claimed but not done, it gets flagged and points are deducted. "
+    "Admins can also take extra actions (ban, mute, etc.) at their discretion.\n\n"
     "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
     "**📊 Track your progress**\n\n"
     "- `/raid leaderboard` — see the top raiders in this server\n"
@@ -146,21 +148,6 @@ def _fetch_tweet(url: str) -> dict:
     return result
 
 
-def _calc_points(settings: dict, total_points: int, tasks_enabled: set,
-                  tasks_claimed: set, mode: str) -> int:
-    done = tasks_claimed & tasks_enabled
-    if mode == 'all':
-        return total_points if done >= tasks_enabled else 0
-    like_pct    = settings.get('point_ratio_like', 12) / 100
-    comment_pct = settings.get('point_ratio_comment', 40) / 100
-    retweet_pct = settings.get('point_ratio_retweet', 48) / 100
-    points = 0
-    if 'like'    in done: points += round(total_points * like_pct)
-    if 'comment' in done: points += round(total_points * comment_pct)
-    if 'retweet' in done: points += round(total_points * retweet_pct)
-    return points
-
-
 def _build_raid_embed(guild_id: int, raid: dict, tweet: dict, settings: dict) -> discord.Embed:
     color_str = (settings.get('embed_color') or '').strip()
     try:
@@ -200,7 +187,7 @@ def _build_raid_embed(guild_id: int, raid: dict, tweet: dict, settings: dict) ->
         '\n'.join(tweet_lines) + '\n\n'
         f'**Tasks:** {task_str}\n'
         f'**Points:** {raid["total_points"]} pts  •  **Mode:** {raid.get("mode", "partial")}\n\n'
-        f'Toggle tasks below then click ✅ Confirm.{mode_note}'
+        f'Click 🎯 **Join Raid** to participate.{mode_note}'
     )
     embed = discord.Embed(description=description, color=color)
 
@@ -214,95 +201,197 @@ def _build_raid_embed(guild_id: int, raid: dict, tweet: dict, settings: dict) ->
     return embed
 
 
-# ── Inline DynamicItem buttons ────────────────────────────────────────────────
+def _check_auto_end(raid: dict) -> tuple[dict, bool]:
+    """Return (updated_raid_dict, was_ended). Mutates raid dict if ended."""
+    if raid.get('status') != 'active':
+        return raid, False
+    posted_str = raid.get('posted_at') or ''
+    if not posted_str:
+        return raid, False
+    try:
+        posted = datetime.fromisoformat(posted_str)
+        if posted.tzinfo is None:
+            posted = posted.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - posted) > timedelta(hours=48):
+            end_raid(int(raid['raid_id']), int(raid['guild_id']), ended_reason='auto_48h')
+            raid = dict(raid)
+            raid['status'] = 'ended'
+            raid['ended_reason'] = 'auto_48h'
+            return raid, True
+    except Exception:
+        pass
+    return raid, False
 
-class RaidTaskButton(
-    discord.ui.DynamicItem[discord.ui.Button],
-    template=r'raid:btn:(?P<task>like|comment|retweet):(?P<rid>\d+)',
-):
-    _EMOJI  = {'like': '❤️', 'comment': '💬', 'retweet': '🔁'}
-    _LABEL  = {'like': 'Like', 'comment': 'Comment', 'retweet': 'Retweet'}
 
-    def __init__(self, task: str, raid_id: int):
-        super().__init__(
-            discord.ui.Button(
-                style=discord.ButtonStyle.secondary,
-                label=self._LABEL[task],
-                emoji=self._EMOJI[task],
-                custom_id=f'raid:btn:{task}:{raid_id}',
-            )
+# ── Personal ephemeral panel (non-persistent, 10-min timeout) ─────────────────
+
+def _build_personal_panel_view(raid_id: int, state: dict, user_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=600)
+
+    for task, emoji, label in [
+        ('like',    '❤️', 'Like'),
+        ('comment', '💬', 'Comment'),
+        ('retweet', '🔁', 'Retweet'),
+    ]:
+        is_on = state.get(task, False)
+        btn = discord.ui.Button(
+            style=discord.ButtonStyle.success if is_on else discord.ButtonStyle.secondary,
+            label=label,
+            emoji=emoji,
+            custom_id=f'rp:{task}:{raid_id}:{user_id}',
         )
-        self.task    = task
-        self.raid_id = raid_id
 
-    @classmethod
-    async def from_custom_id(cls, interaction, item, match, /):
-        return cls(match['task'], int(match['rid']))
+        def _make_toggle_cb(t):
+            async def cb(interaction: discord.Interaction):
+                if interaction.user.id != user_id:
+                    await interaction.response.send_message('❌ This panel is not yours.', ephemeral=True)
+                    return
+                s = _get_panel_state(user_id, raid_id)
+                s[t] = not s[t]
+                s['updated_at'] = datetime.utcnow()
+                new_view = _build_personal_panel_view(raid_id, s, user_id)
+                await interaction.response.edit_message(view=new_view)
+            return cb
 
-    async def callback(self, interaction: discord.Interaction):
+        btn.callback = _make_toggle_cb(task)
+        view.add_item(btn)
+
+    confirm_btn = discord.ui.Button(
+        style=discord.ButtonStyle.primary,
+        label='Confirm',
+        emoji='✅',
+        custom_id=f'rp:confirm:{raid_id}:{user_id}',
+    )
+
+    async def confirm_cb(interaction: discord.Interaction):
+        if interaction.user.id != user_id:
+            await interaction.response.send_message('❌ This panel is not yours.', ephemeral=True)
+            return
+        await _handle_personal_confirm(interaction, raid_id, user_id)
+
+    confirm_btn.callback = confirm_cb
+    view.add_item(confirm_btn)
+    return view
+
+
+async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: int, user_id: int):
+    try:
+        guild_id = interaction.guild_id or 0
+
+        raid = get_guild_raid(raid_id, guild_id)
+        if not raid:
+            await interaction.response.edit_message(content='❌ Raid not found.', embed=None, view=None)
+            return
+
+        raid, _ = _check_auto_end(dict(raid))
+
+        if raid['status'] != 'active':
+            reason = raid.get('ended_reason') or ''
+            msg = '❌ This raid has been ended by admin.' if reason == 'admin' else '❌ This raid has ended.'
+            await interaction.response.edit_message(content=msg, embed=None, view=None)
+            return
+
+        if get_raid_participation(guild_id, raid_id, user_id):
+            await interaction.response.edit_message(content='✅ You already submitted this raid.', embed=None, view=None)
+            return
+
+        state = _get_panel_state(user_id, raid_id)
+        if not any([state.get('like'), state.get('comment'), state.get('retweet')]):
+            await interaction.response.edit_message(content='⚠️ Select at least one task first.', embed=None, view=None)
+            return
+
+        allowed = {}
         try:
-            guild_id = interaction.guild_id or 0
-            user_id  = interaction.user.id
+            allowed = json.loads(raid.get('tasks_json') or '{}')
+        except Exception:
+            pass
+        claimed = {
+            'like':    state.get('like', False)    and bool(allowed.get('like', True)),
+            'comment': state.get('comment', False) and bool(allowed.get('comment', True)),
+            'retweet': state.get('retweet', False) and bool(allowed.get('retweet', True)),
+        }
 
-            raid = get_guild_raid(self.raid_id, guild_id)
-            if not raid or raid['status'] != 'active':
-                await interaction.response.send_message('❌ This raid is no longer active.', ephemeral=True)
-                return
-
-            x_username = get_user_x_username(user_id)
-            if not x_username:
-                await interaction.response.send_message(
-                    '⚠️ Link your X account first with `/setx <username>` before joining a raid.',
-                    ephemeral=True,
+        if raid.get('mode') == 'all':
+            enabled_tasks = {t for t, v in allowed.items() if v}
+            claimed_tasks = {t for t, v in claimed.items() if v}
+            if claimed_tasks < enabled_tasks:
+                missing = enabled_tasks - claimed_tasks
+                await interaction.response.edit_message(
+                    content=f'❌ All tasks required. Also select: {", ".join(sorted(missing))}',
+                    embed=None, view=None,
                 )
                 return
 
-            if get_raid_participation(guild_id, self.raid_id, user_id):
-                await interaction.response.send_message(
-                    '✅ You already submitted this raid. Each raid can only be confirmed once.',
-                    ephemeral=True,
-                )
-                return
+        settings  = get_raid_settings(guild_id)
+        r_like    = settings.get('point_ratio_like',    12)
+        r_comment = settings.get('point_ratio_comment', 40)
+        r_retweet = settings.get('point_ratio_retweet', 48)
+        total     = int(raid['total_points'])
 
-            state = _get_panel_state(user_id, self.raid_id)
-            state[self.task] = not state[self.task]
-            state['updated_at'] = datetime.utcnow()
+        earned, lines = 0, []
+        if claimed['like']:
+            pts = total * r_like // 100; earned += pts
+            lines.append(f'❤️ Like — {pts} pts')
+        if claimed['comment']:
+            pts = total * r_comment // 100; earned += pts
+            lines.append(f'💬 Comment — {pts} pts')
+        if claimed['retweet']:
+            pts = total * r_retweet // 100; earned += pts
+            lines.append(f'🔁 Retweet — {pts} pts')
 
-            status_lines = [
-                f"{'✅' if state['like'] else '⬜'} ❤️ Like",
-                f"{'✅' if state['comment'] else '⬜'} 💬 Comment",
-                f"{'✅' if state['retweet'] else '⬜'} 🔁 Retweet",
-            ]
-            embed = build_branded_embed(
-                guild_id,
-                title='Your task selection',
-                description='\n'.join(status_lines) + '\n\nClick ✅ **Confirm** when ready to submit.',
-                cog_prefix='raid',
-                use_thumbnail=True, use_image=False, use_footer=True,
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO users (user_id, username) VALUES (?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
+                (user_id, str(interaction.user)),
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+        create_raid_participation(guild_id, raid_id, user_id, json.dumps(claimed), earned)
+        upsert_raid_user_points(guild_id, user_id, earned, delta_raids=1)
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE users SET total_points=total_points+? WHERE user_id=?",
+                (earned, user_id),
+            )
 
-        except Exception as e:
-            print(f'[raid] task button error: {type(e).__name__}: {e}')
-            traceback.print_exc()
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message('An error occurred.', ephemeral=True)
-            except Exception:
-                pass
+        _clear_panel_state(user_id, raid_id)
+
+        display_num = raid.get('display_number') or raid_id
+        result_embed = build_branded_embed(
+            guild_id,
+            title=f'✅ Submitted — {earned} pts earned',
+            description=(
+                '**Tasks claimed:**\n' + '\n'.join(lines) +
+                f'\n\nRaid #{display_num:04d} — '
+                '_A random sample of submissions is auto-verified daily._'
+            ),
+            cog_prefix='raid',
+            use_thumbnail=True, use_image=False, use_footer=True,
+        )
+        await interaction.response.edit_message(content=None, embed=result_embed, view=None)
+
+    except Exception as e:
+        print(f'[raid] confirm error: {type(e).__name__}: {e}')
+        traceback.print_exc()
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(content='An error occurred.', embed=None, view=None)
+        except Exception:
+            pass
 
 
-class RaidConfirmButton(
+# ── RaidJoinButton — single persistent entry-point button ─────────────────────
+
+class RaidJoinButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r'raid:btn:confirm:(?P<rid>\d+)',
+    template=r'raid:join:(?P<rid>\d+)',
 ):
     def __init__(self, raid_id: int):
         super().__init__(
             discord.ui.Button(
                 style=discord.ButtonStyle.success,
-                label='Confirm',
-                emoji='✅',
-                custom_id=f'raid:btn:confirm:{raid_id}',
+                label='Join Raid',
+                emoji='🎯',
+                custom_id=f'raid:join:{raid_id}',
             )
         )
         self.raid_id = raid_id
@@ -316,110 +405,52 @@ class RaidConfirmButton(
             guild_id = interaction.guild_id or 0
             user_id  = interaction.user.id
 
+            # FIX 7: check enabled first
+            settings = get_raid_settings(guild_id)
+            if not settings or not settings.get('enabled'):
+                await interaction.response.send_message(
+                    '❌ The Raid System is currently disabled.', ephemeral=True
+                )
+                return
+
             raid = get_guild_raid(self.raid_id, guild_id)
-            if not raid or raid['status'] != 'active':
-                await interaction.response.send_message('❌ This raid is no longer active.', ephemeral=True)
+            if not raid:
+                await interaction.response.send_message('❌ Raid not found.', ephemeral=True)
+                return
+
+            # FIX 5: 48h auto-end
+            raid = dict(raid)
+            raid, _ = _check_auto_end(raid)
+
+            if raid['status'] != 'active':
+                reason = raid.get('ended_reason') or ''
+                msg = '❌ This raid has been ended by admin.' if reason == 'admin' else '❌ This raid has ended.'
+                await interaction.response.send_message(msg, ephemeral=True)
                 return
 
             x_username = get_user_x_username(user_id)
             if not x_username:
                 await interaction.response.send_message(
-                    '⚠️ Link your X account first with `/setx <username>` before joining a raid.',
-                    ephemeral=True,
+                    '⚠️ Link your X account first: `/setx your_username`', ephemeral=True
                 )
                 return
 
             if get_raid_participation(guild_id, self.raid_id, user_id):
                 await interaction.response.send_message(
-                    '✅ You already submitted this raid.', ephemeral=True,
+                    '✅ You already submitted this raid.', ephemeral=True
                 )
                 return
 
             state = _get_panel_state(user_id, self.raid_id)
-            if not any([state['like'], state['comment'], state['retweet']]):
-                await interaction.response.send_message(
-                    '⚠️ Select at least one task before confirming.', ephemeral=True,
-                )
-                return
-
-            # Intersect with tasks enabled for this raid
-            allowed = {}
-            try:
-                allowed = json.loads(raid.get('tasks_json') or '{}')
-            except Exception:
-                pass
-            claimed = {
-                'like':    state['like']    and bool(allowed.get('like', True)),
-                'comment': state['comment'] and bool(allowed.get('comment', True)),
-                'retweet': state['retweet'] and bool(allowed.get('retweet', True)),
-            }
-
-            if raid.get('mode') == 'all':
-                enabled_tasks = {t for t, v in allowed.items() if v}
-                claimed_tasks = {t for t, v in claimed.items() if v}
-                if claimed_tasks < enabled_tasks:
-                    missing = enabled_tasks - claimed_tasks
-                    await interaction.response.send_message(
-                        f'❌ All tasks required. Also select: {", ".join(sorted(missing))}',
-                        ephemeral=True,
-                    )
-                    return
-
-            settings    = get_raid_settings(guild_id)
-            r_like      = settings.get('point_ratio_like',    12)
-            r_comment   = settings.get('point_ratio_comment', 40)
-            r_retweet   = settings.get('point_ratio_retweet', 48)
-            total       = int(raid['total_points'])
-
-            earned  = 0
-            lines   = []
-            if claimed['like']:
-                pts = total * r_like // 100
-                earned += pts
-                lines.append(f'❤️ Like — {pts} pts')
-            if claimed['comment']:
-                pts = total * r_comment // 100
-                earned += pts
-                lines.append(f'💬 Comment — {pts} pts')
-            if claimed['retweet']:
-                pts = total * r_retweet // 100
-                earned += pts
-                lines.append(f'🔁 Retweet — {pts} pts')
-
-            # Persist
-            with get_connection() as conn:
-                conn.execute(
-                    "INSERT INTO users (user_id, username) VALUES (?,?) "
-                    "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
-                    (user_id, str(interaction.user)),
-                )
-            tasks_json = json.dumps(claimed)
-            create_raid_participation(guild_id, self.raid_id, user_id, tasks_json, earned)
-            upsert_raid_user_points(guild_id, user_id, earned, delta_raids=1)
-            with get_connection() as conn:
-                conn.execute(
-                    "UPDATE users SET total_points=total_points+? WHERE user_id=?",
-                    (earned, user_id),
-                )
-
-            _clear_panel_state(user_id, self.raid_id)
-
-            display_num = raid.get('display_number') or self.raid_id
-            result_embed = build_branded_embed(
-                guild_id,
-                title=f'✅ Submitted — {earned} pts earned',
-                description=(
-                    '**Tasks claimed:**\n' + '\n'.join(lines) +
-                    f'\n\nRaid #{display_num:04d} — '
-                    '_A random sample of submissions is auto-verified daily._'
-                ),
-                cog_prefix='raid',
-                use_thumbnail=True, use_image=False, use_footer=True,
+            view  = _build_personal_panel_view(self.raid_id, state, user_id)
+            await interaction.response.send_message(
+                content='**Select the tasks you completed, then click ✅ Confirm.**',
+                view=view,
+                ephemeral=True,
             )
-            await interaction.response.send_message(embed=result_embed, ephemeral=True)
 
         except Exception as e:
-            print(f'[raid] confirm error: {type(e).__name__}: {e}')
+            print(f'[raid] join button error: {type(e).__name__}: {e}')
             traceback.print_exc()
             try:
                 if not interaction.response.is_done():
@@ -430,10 +461,7 @@ class RaidConfirmButton(
 
 def build_raid_panel_view(raid_id: int) -> discord.ui.View:
     v = discord.ui.View(timeout=None)
-    v.add_item(RaidTaskButton('like',    raid_id))
-    v.add_item(RaidTaskButton('comment', raid_id))
-    v.add_item(RaidTaskButton('retweet', raid_id))
-    v.add_item(RaidConfirmButton(raid_id))
+    v.add_item(RaidJoinButton(raid_id))
     return v
 
 
@@ -452,6 +480,12 @@ class RaidPostModal(discord.ui.Modal, title='Post New Raid'):
     async def on_submit(self, interaction: discord.Interaction):
         guild_id = interaction.guild_id or 0
         settings = get_raid_settings(guild_id)
+
+        if not settings or not settings.get('enabled'):
+            await interaction.response.send_message(
+                '❌ The Raid System is disabled on this server.', ephemeral=True
+            )
+            return
 
         tweet_url_val = self.tweet_url.value.strip()
         tweet_id_val  = extract_tweet_id(tweet_url_val)
@@ -537,6 +571,12 @@ class RaidsCog(commands.Cog, name='Raids'):
         guild_id = interaction.guild_id or 0
         settings = get_raid_settings(guild_id)
 
+        if not settings or not settings.get('enabled'):
+            await interaction.response.send_message(
+                '❌ The Raid System is disabled on this server.', ephemeral=True
+            )
+            return
+
         is_authorized = interaction.user.guild_permissions.administrator
         if not is_authorized:
             raid_role_ids = (settings.get('raid_role_ids') or '').strip()
@@ -557,8 +597,12 @@ class RaidsCog(commands.Cog, name='Raids'):
     @raid_group.command(name='leaderboard', description='Top raiders in this server')
     async def raid_leaderboard(self, interaction: discord.Interaction):
         guild_id = interaction.guild_id or 0
-        rows     = get_raid_leaderboard(guild_id, limit=10)
+        settings = get_raid_settings(guild_id)
+        if not settings or not settings.get('enabled'):
+            await interaction.response.send_message('❌ The Raid System is disabled on this server.', ephemeral=True)
+            return
 
+        rows = get_raid_leaderboard(guild_id, limit=10)
         if not rows:
             await interaction.response.send_message('No raid participants yet. Be the first. ⚔️')
             return
@@ -580,8 +624,12 @@ class RaidsCog(commands.Cog, name='Raids'):
     @app_commands.describe(member='Member to look up (defaults to yourself)')
     async def raid_profile(self, interaction: discord.Interaction, member: discord.Member = None):
         guild_id = interaction.guild_id or 0
-        target   = member or interaction.user
+        settings = get_raid_settings(guild_id)
+        if not settings or not settings.get('enabled'):
+            await interaction.response.send_message('❌ The Raid System is disabled on this server.', ephemeral=True)
+            return
 
+        target   = member or interaction.user
         pts_row  = get_raid_user_points(guild_id, target.id)
         x_uname  = get_user_x_username(target.id)
         points   = pts_row['total_points']    if pts_row else 0
@@ -647,7 +695,8 @@ class RaidsCog(commands.Cog, name='Raids'):
     # ── Target resolution for manual check ───────────────────────────────────
 
     async def _resolve_manual_check_target(self, guild_id: int, identifier: str) -> dict | None:
-        from cogs._twitter import lookup_twitter_user_by_login, lookup_twitter_user_by_id
+        # FIX 6: numeric → Discord ID only (no Twitter ID lookup)
+        from cogs._twitter import lookup_twitter_user_by_login
 
         raw = (identifier or '').strip()
         if not raw:
@@ -672,14 +721,12 @@ class RaidsCog(commands.Cog, name='Raids'):
                 return _make(db_row['user_id'], uname, tw_uname)
             return _make(None, '(not linked to Discord)', tw_uname)
 
+        # Numeric → Discord ID only
         if raw.isdigit():
             member = guild.get_member(int(raw))
             if member:
                 return _make(member.id, member.name, get_user_x_username(member.id))
-            tw_user = await lookup_twitter_user_by_id(raw)
-            if tw_user:
-                return _enrich_twitter(tw_user['username'])
-            return None
+            return None  # not a guild member — don't attempt Twitter ID lookup
 
         cleaned = raw.lstrip('@')
         tw_user = await lookup_twitter_user_by_login(cleaned)
@@ -703,7 +750,7 @@ class RaidsCog(commands.Cog, name='Raids'):
             return {
                 'error': (
                     f'Could not resolve "{identifier}" — '
-                    'try Discord username, Discord ID, @twitter_handle, or Twitter user ID'
+                    'try Discord username, Discord ID, or @twitter_handle'
                 )
             }
 
@@ -847,7 +894,13 @@ class RaidsCog(commands.Cog, name='Raids'):
         from cogs._twitter import check_comment as tw_cc, check_retweet as tw_cr
 
         guild_id = row['guild_id']
-        raid     = get_guild_raid(row['raid_id'], guild_id)
+
+        # FIX 7: skip disabled guilds
+        settings = get_raid_settings(guild_id)
+        if not settings or not settings.get('enabled'):
+            return
+
+        raid = get_guild_raid(row['raid_id'], guild_id)
         if not raid:
             return
 
@@ -879,7 +932,6 @@ class RaidsCog(commands.Cog, name='Raids'):
                     flagged_tasks.add('like')
 
         if flagged_tasks:
-            settings    = get_raid_settings(guild_id)
             deduct      = sum(
                 round(raid['total_points'] * settings.get(f'point_ratio_{t}', 0) / 100)
                 for t in flagged_tasks
@@ -925,4 +977,4 @@ class RaidsCog(commands.Cog, name='Raids'):
 
 async def setup(bot):
     await bot.add_cog(RaidsCog(bot))
-    bot.add_dynamic_items(RaidTaskButton, RaidConfirmButton)
+    bot.add_dynamic_items(RaidJoinButton)

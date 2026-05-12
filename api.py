@@ -63,6 +63,7 @@ from database import (
     get_guild_raid as db_get_guild_raid,
     list_guild_raids as db_list_guild_raids,
     update_guild_raid as db_update_guild_raid,
+    end_raid as db_end_raid,
     get_raid_leaderboard as db_get_raid_leaderboard,
     get_raid_verification_log as db_get_raid_verification_log,
     get_raid_participation as db_get_raid_participation,
@@ -1877,7 +1878,7 @@ async def raid_end(
     raid = db_get_guild_raid(raid_id, server_id)
     if not raid:
         raise HTTPException(status_code=404, detail='Raid not found')
-    db_update_guild_raid(raid_id, server_id, status='ended')
+    db_end_raid(raid_id, server_id, ended_reason='admin')
     return {'ok': True, 'raid_id': raid_id}
 
 
@@ -2021,6 +2022,13 @@ async def raid_send_guide(server_id: int, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=500, detail=str(e))
 
     return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
+
+
+@app.get('/api/raid/guide-defaults')
+async def raid_guide_defaults():
+    """Return the default guide title and description (no auth — public constants)."""
+    from cogs.raidbot import DEFAULT_GUIDE_TITLE, DEFAULT_GUIDE_DESCRIPTION
+    return {'title': DEFAULT_GUIDE_TITLE, 'description': DEFAULT_GUIDE_DESCRIPTION}
 
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
