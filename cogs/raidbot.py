@@ -705,8 +705,6 @@ class RaidsCog(commands.Cog, name='Raids'):
     # ── Target resolution for manual check ───────────────────────────────────
 
     async def _resolve_manual_check_target(self, guild_id: int, identifier: str) -> dict | None:
-        from cogs._twitter import lookup_twitter_user_by_login
-
         raw = (identifier or '').strip()
         print(f'[raid] resolve_manual_check: guild={guild_id} identifier="{raw}"')
         if not raw:
@@ -718,13 +716,13 @@ class RaidsCog(commands.Cog, name='Raids'):
             print(f'[raid] resolve_manual_check: guild {guild_id} not found in bot cache')
             return None
 
-        # 1. All-numeric → Discord ID only (no Twitter ID lookup per FIX 6)
+        # 1. All-numeric → Discord ID only
         if raw.isdigit():
             print(f'[raid] resolve_manual_check: numeric input — trying Discord member ID')
             member = guild.get_member(int(raw))
             if member:
                 tw = get_user_x_username(member.id)
-                print(f'[raid] resolve_manual_check: found Discord member {member.name} (bot={member.bot}), x_username={tw!r}')
+                print(f'[raid] resolve_manual_check: found member {member.name}, x_username={tw!r}')
                 return {
                     'discord_user_id':  member.id,
                     'discord_username': member.name,
@@ -734,36 +732,38 @@ class RaidsCog(commands.Cog, name='Raids'):
             return None
 
         cleaned = raw.lstrip('@').strip()
-        print(f'[raid] resolve_manual_check: cleaned="{cleaned}" — trying Twitter lookup first')
 
-        # 2. Try as Twitter username
+        # 2. DB lookup by x_username FIRST — works even when Twitter scraping is offline
+        print(f'[raid] resolve_manual_check: trying DB x_username lookup for "{cleaned}"')
+        db_row = find_user_by_x_username(cleaned)
+        if db_row:
+            member = guild.get_member(int(db_row['user_id']))
+            uname  = member.name if member else db_row.get('username', '(not in guild)')
+            print(f'[raid] resolve_manual_check: DB found — discord={uname} twitter={cleaned}')
+            return {
+                'discord_user_id':  int(db_row['user_id']),
+                'discord_username': uname,
+                'twitter_username': cleaned,
+            }
+
+        # 3. Twitter API lookup (only if DB had no match — confirms handle exists)
+        print(f'[raid] resolve_manual_check: no DB linkage, trying Twitter API for "{cleaned}"')
+        from cogs._twitter import lookup_twitter_user_by_login
         tw_user = await lookup_twitter_user_by_login(cleaned)
         if tw_user:
-            tw_uname = tw_user['username']
-            print(f'[raid] resolve_manual_check: Twitter user found @{tw_uname} — looking up Discord linkage')
-            db_row = find_user_by_x_username(tw_uname)
-            if db_row:
-                member = guild.get_member(int(db_row['user_id']))
-                uname  = member.name if member else db_row.get('username', '(not in guild)')
-                print(f'[raid] resolve_manual_check: linked to Discord user {uname}')
-                return {
-                    'discord_user_id':  int(db_row['user_id']),
-                    'discord_username': uname,
-                    'twitter_username': tw_uname,
-                }
-            # Twitter user exists but no /setx linkage — do NOT fall through
-            print(f'[raid] resolve_manual_check: @{tw_uname} found on Twitter but not linked via /setx')
+            # Twitter user exists but no /setx linkage — do NOT fall through to Discord search
+            print(f'[raid] resolve_manual_check: @{tw_user["username"]} on Twitter but not linked via /setx')
             return None
 
-        # 3. Fall back: exact Discord username/display_name — skip bots
-        print(f'[raid] resolve_manual_check: Twitter lookup returned None — trying Discord username "{cleaned}"')
+        # 4. Discord username / display_name search — skip bots
+        print(f'[raid] resolve_manual_check: trying Discord username search for "{cleaned}"')
         target_lower = cleaned.lower()
         for member in guild.members:
             if member.bot:
-                continue  # never match bots
+                continue
             if member.name.lower() == target_lower or (member.display_name or '').lower() == target_lower:
                 tw = get_user_x_username(member.id)
-                print(f'[raid] resolve_manual_check: found Discord member by username: {member.name}, x_username={tw!r}')
+                print(f'[raid] resolve_manual_check: found by Discord name: {member.name}, x_username={tw!r}')
                 return {
                     'discord_user_id':  member.id,
                     'discord_username': member.name,
@@ -822,32 +822,51 @@ class RaidsCog(commands.Cog, name='Raids'):
             print(f'[raid] manual_check: raid {raid_id} not found. Guild display_numbers: {all_ids}')
             return {'error': f'Raid #{raid_id} not found in this guild'}
 
-        part = get_raid_participation(guild_id, raid_id, discord_user_id)
+        actual_raid_id = raid['raid_id']  # may differ from param if display_number fallback was used
+
+        part = get_raid_participation(guild_id, actual_raid_id, discord_user_id)
         if not part:
-            return {'error': f'No participation found for {discord_username} in Raid #{raid_id}'}
+            display = raid.get('display_number', actual_raid_id)
+            return {'error': f'No participation found for {discord_username} in Raid #{display}'}
 
         if not twitter_username:
             twitter_username = get_user_x_username(discord_user_id)
         if not twitter_username:
             return {'error': f'{discord_username} has no X/Twitter username linked'}
 
-        tweet_id      = raid['tweet_id']
-        tasks_claimed = set(json.loads(part.get('tasks_claimed') or '[]'))
+        tweet_id = raid['tweet_id']
+
+        # Parse which tasks this raid allows
+        try:
+            allowed_tasks = json.loads(raid.get('tasks_json') or '{}')
+        except Exception:
+            allowed_tasks = {'like': True, 'comment': True, 'retweet': True}
+
+        # Parse what the user actually claimed — stored as {"like": true, "comment": false, ...}
+        try:
+            tc_raw = json.loads(part.get('tasks_claimed') or '{}')
+            if isinstance(tc_raw, dict):
+                tasks_claimed = {t for t, v in tc_raw.items() if v}
+            else:
+                tasks_claimed = set(tc_raw)
+        except Exception:
+            tasks_claimed = set()
 
         results        = {}
         comment_result = None
         retweet_result = None
 
-        if 'comment' in tasks_claimed:
+        if 'comment' in tasks_claimed and allowed_tasks.get('comment'):
             comment_result = await tw_cc(tweet_id, twitter_username)
             results['comment'] = {'claimed': True, **comment_result}
 
-        if 'retweet' in tasks_claimed:
+        if 'retweet' in tasks_claimed and allowed_tasks.get('retweet'):
             retweet_result = await tw_cr(tweet_id, twitter_username)
             results['retweet'] = {'claimed': True, **retweet_result}
 
-        if 'like' in tasks_claimed:
-            companions = tasks_claimed - {'like'}
+        if 'like' in tasks_claimed and allowed_tasks.get('like'):
+            # companions = other enabled tasks that user also claimed
+            companions = (tasks_claimed & {t for t, v in allowed_tasks.items() if v}) - {'like'}
             if not companions:
                 results['like'] = {'claimed': True, 'verified': True, 'reason': 'like_always_pass'}
             else:
@@ -947,7 +966,6 @@ class RaidsCog(commands.Cog, name='Raids'):
 
         guild_id = row['guild_id']
 
-        # FIX 7: skip disabled guilds
         settings = get_raid_settings(guild_id)
         if not settings or not settings.get('enabled'):
             return
@@ -960,21 +978,40 @@ class RaidsCog(commands.Cog, name='Raids'):
         if not x_username:
             return
 
-        tweet_id      = raid['tweet_id']
-        tasks_claimed = set(json.loads(row.get('tasks_claimed') or '[]'))
+        tweet_id = raid['tweet_id']
 
-        comment_result = await tw_cc(tweet_id, x_username) if 'comment' in tasks_claimed else None
-        retweet_result = await tw_cr(tweet_id, x_username) if 'retweet' in tasks_claimed else None
+        # Parse which tasks this raid allows
+        try:
+            allowed_tasks = json.loads(raid.get('tasks_json') or '{}')
+        except Exception:
+            allowed_tasks = {'like': True, 'comment': True, 'retweet': True}
+
+        # Parse what the user actually claimed — stored as {"like": true, "comment": false, ...}
+        try:
+            tc_raw = json.loads(row.get('tasks_claimed') or '{}')
+            if isinstance(tc_raw, dict):
+                tasks_claimed = {t for t, v in tc_raw.items() if v}
+            else:
+                tasks_claimed = set(tc_raw)
+        except Exception:
+            tasks_claimed = set()
+
+        # Only check tasks that the raid allows AND user claimed
+        effective_tasks = tasks_claimed & {t for t, v in allowed_tasks.items() if v}
+
+        comment_result = await tw_cc(tweet_id, x_username) if 'comment' in effective_tasks else None
+        retweet_result = await tw_cr(tweet_id, x_username) if 'retweet' in effective_tasks else None
 
         flagged_tasks = set()
 
+        # verified is False = confirmed failure; None = scraper error (inconclusive — never flag)
         if comment_result and comment_result['verified'] is False:
             flagged_tasks.add('comment')
         if retweet_result and retweet_result['verified'] is False:
             flagged_tasks.add('retweet')
 
-        if 'like' in tasks_claimed:
-            companions = tasks_claimed - {'like'}
+        if 'like' in effective_tasks:
+            companions = effective_tasks - {'like'}
             if companions:
                 any_companion_failed = (
                     ('comment' in companions and comment_result and comment_result['verified'] is False) or
@@ -982,6 +1019,7 @@ class RaidsCog(commands.Cog, name='Raids'):
                 )
                 if any_companion_failed:
                     flagged_tasks.add('like')
+            # If like is the only effective task, never flag it
 
         if flagged_tasks:
             deduct      = sum(
@@ -1021,7 +1059,7 @@ class RaidsCog(commands.Cog, name='Raids'):
                     "verified_at=datetime('now') WHERE participation_id=?",
                     (row['participation_id'],),
                 )
-            for task in tasks_claimed:
+            for task in effective_tasks:
                 add_raid_verification_log(
                     guild_id, row['raid_id'], row['user_id'], task, True, True, 'auto',
                 )

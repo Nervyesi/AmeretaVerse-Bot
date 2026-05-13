@@ -2,15 +2,16 @@
 Twitter scraping via twscrape — multi-account pool with active/backup slots.
 
 Env vars (slots 1–5):
-  TWITTER_ACCOUNT_1_USERNAME, TWITTER_ACCOUNT_1_EMAIL, TWITTER_ACCOUNT_1_PASSWORD
-  TWITTER_ACCOUNT_2_USERNAME, TWITTER_ACCOUNT_2_EMAIL, TWITTER_ACCOUNT_2_PASSWORD
-  ... up to TWITTER_ACCOUNT_5_*
+  Cookie auth (preferred):
+    TWITTER_ACCOUNT_1_USERNAME, TWITTER_ACCOUNT_1_CT0, TWITTER_ACCOUNT_1_AUTH_TOKEN
+  Password auth (fallback):
+    TWITTER_ACCOUNT_1_USERNAME, TWITTER_ACCOUNT_1_EMAIL, TWITTER_ACCOUNT_1_PASSWORD
 
 Active status is stored in the twitter_accounts DB table (admin-managed).
 Only slots with active=1 in DB are added to the twscrape pool.
 
-Backward compat: if no numbered accounts are set but old TWITTER_USERNAME/EMAIL/PASSWORD
-env vars exist, they are treated as slot 1 and auto-activated on first run.
+Backward compat: legacy TWITTER_USERNAME/CT0/AUTH_TOKEN or TWITTER_EMAIL/PASSWORD
+env vars are treated as slot 1 on first run.
 """
 import os
 import asyncio
@@ -25,22 +26,52 @@ TWSCRAPE_DB_PATH = os.getenv('TWSCRAPE_DB_PATH', '/data/twscrape.db')
 
 
 def _get_slot_credentials(slot: int) -> dict | None:
+    """Read credentials for a numbered slot.
+
+    Cookie auth (preferred): USERNAME + CT0 + AUTH_TOKEN
+    Password auth (fallback): USERNAME + EMAIL + PASSWORD
+    Returns None if slot is not configured.
+    """
     prefix   = f'TWITTER_ACCOUNT_{slot}_'
     username = (os.getenv(f'{prefix}USERNAME') or '').strip()
-    email    = (os.getenv(f'{prefix}EMAIL')    or '').strip()
-    password = (os.getenv(f'{prefix}PASSWORD') or '').strip()
-    if not (username and email and password):
+    if not username:
         return None
-    return {'slot': slot, 'username': username, 'email': email, 'password': password}
+
+    ct0        = (os.getenv(f'{prefix}CT0')        or '').strip()
+    auth_token = (os.getenv(f'{prefix}AUTH_TOKEN') or '').strip()
+    email      = (os.getenv(f'{prefix}EMAIL')      or '').strip()
+    password   = (os.getenv(f'{prefix}PASSWORD')   or '').strip()
+
+    if ct0 and auth_token:
+        creds = {'slot': slot, 'username': username, 'auth_mode': 'cookies',
+                 'ct0': ct0, 'auth_token': auth_token}
+        if email:    creds['email']    = email
+        if password: creds['password'] = password
+        return creds
+
+    if email and password:
+        return {'slot': slot, 'username': username, 'auth_mode': 'password',
+                'email': email, 'password': password}
+
+    return None
 
 
 def _get_legacy_credentials() -> dict | None:
+    """Backward compat: old TWITTER_* env vars without slot numbering."""
     username = (os.getenv('TWITTER_USERNAME') or '').strip()
+    if not username:
+        return None
+    ct0        = (os.getenv('TWITTER_CT0')        or '').strip()
+    auth_token = (os.getenv('TWITTER_AUTH_TOKEN') or '').strip()
+    if ct0 and auth_token:
+        return {'slot': 1, 'username': username, 'auth_mode': 'cookies',
+                'ct0': ct0, 'auth_token': auth_token}
     email    = (os.getenv('TWITTER_EMAIL')    or '').strip()
     password = (os.getenv('TWITTER_PASSWORD') or '').strip()
-    if not (username and email and password):
-        return None
-    return {'slot': 1, 'username': username, 'email': email, 'password': password}
+    if email and password:
+        return {'slot': 1, 'username': username, 'auth_mode': 'password',
+                'email': email, 'password': password}
+    return None
 
 
 def _discover_configured_accounts() -> list:
@@ -81,9 +112,6 @@ async def get_api():
             API_INSTANCE = api
             return api
 
-        for acc in configured:
-            print(f'[twitter] get_api: slot {acc["slot"]} username={acc["username"]}')
-
         from database import (
             list_twitter_accounts,
             upsert_twitter_account_slot,
@@ -91,6 +119,7 @@ async def get_api():
         )
 
         for acc in configured:
+            print(f'[twitter] get_api: slot {acc["slot"]} username={acc["username"]} mode={acc["auth_mode"]}')
             upsert_twitter_account_slot(acc['slot'], acc['username'])
 
         db_rows    = list_twitter_accounts()
@@ -103,42 +132,53 @@ async def get_api():
         active_slots = {r['slot'] for r in db_rows if r['active']}
         print(f'[twitter] get_api: active slots = {active_slots}')
 
-        try:
-            pool_accounts      = await api.pool.accounts_info()
-            existing_usernames = {a.username.lower() for a in pool_accounts}
-            print(f'[twitter] get_api: already in pool = {existing_usernames}')
-        except Exception as e:
-            print(f'[twitter] get_api: pool.accounts_info() failed: {type(e).__name__}: {e}')
-            existing_usernames = set()
-
-        added = 0
         for acc in configured:
             if acc['slot'] not in active_slots:
                 print(f'[twitter] slot {acc["slot"]} ({acc["username"]}) not active — skipping')
                 continue
-            if acc['username'].lower() in existing_usernames:
-                print(f'[twitter] slot {acc["slot"]} ({acc["username"]}) already in pool')
-                continue
+
+            auth_mode = acc.get('auth_mode', 'password')
+
+            # Add account to pool — catch "already exists" silently
             try:
+                placeholder_email = acc.get('email') or f"{acc['username']}@placeholder.local"
+                placeholder_pw    = acc.get('password') or 'placeholder_pw_unused'
                 await api.pool.add_account(
-                    acc['username'], acc['password'],
-                    acc['email'],    acc['password'],
+                    acc['username'], placeholder_pw,
+                    placeholder_email, placeholder_pw,
                 )
-                added += 1
                 print(f'[twitter] add_account OK: slot {acc["slot"]} ({acc["username"]})')
             except Exception as e:
-                print(f'[twitter] add_account FAILED: slot {acc["slot"]} ({acc["username"]}): {type(e).__name__}: {e}')
+                print(f'[twitter] add_account note (slot {acc["slot"]}): {type(e).__name__}: {e}')
 
-        if added > 0:
-            print('[twitter] calling login_all()...')
-            try:
-                await api.pool.login_all()
-                print('[twitter] login_all completed successfully')
-            except Exception as e:
-                print(f'[twitter] login_all FAILED: {type(e).__name__}: {e}')
-                _tb.print_exc()
-        else:
-            print('[twitter] get_api: no new accounts added — skipping login_all')
+            if auth_mode == 'cookies':
+                cookie_str = f"ct0={acc['ct0']}; auth_token={acc['auth_token']}"
+                try:
+                    await api.pool.set_cookies(acc['username'], cookie_str)
+                    print(f'[twitter] set_cookies OK: slot {acc["slot"]} ({acc["username"]})')
+                except Exception as e:
+                    print(f'[twitter] set_cookies FAILED slot {acc["slot"]}: {type(e).__name__}: {e}')
+                    _tb.print_exc()
+            else:
+                print(f'[twitter] password-mode slot {acc["slot"]} ({acc["username"]}) — calling login_all()...')
+                try:
+                    await api.pool.login_all()
+                    print(f'[twitter] login_all returned for slot {acc["slot"]}')
+                except Exception as e:
+                    print(f'[twitter] login_all FAILED slot {acc["slot"]}: {type(e).__name__}: {e}')
+                    _tb.print_exc()
+
+        # Verify auth actually works with a known public account
+        try:
+            print('[twitter] testing API — looking up @twitter...')
+            test_user = await api.user_by_login('twitter')
+            if test_user:
+                print(f'[twitter] API TEST OK: got @{test_user.username} (id={test_user.id})')
+            else:
+                print('[twitter] API TEST: returned None — auth may not be working')
+        except Exception as e:
+            print(f'[twitter] API TEST FAILED: {type(e).__name__}: {e}')
+            _tb.print_exc()
 
         INITIALIZED  = True
         API_INSTANCE = api
