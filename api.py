@@ -1946,6 +1946,7 @@ async def raid_manual_check(
     server_id: int, body: _RaidManualCheck, user: dict = Depends(get_current_user),
 ):
     require_guild_admin(user, server_id)
+    print(f'[raid] manual-check endpoint: server={server_id} raid_id={body.raid_id} identifier={body.identifier!r}')
 
     settings   = db_check_reset_manual_count(server_id)
     used_today = settings.get('manual_check_count_today', 0)

@@ -225,7 +225,7 @@ def _check_auto_end(raid: dict) -> tuple[dict, bool]:
 
 # ── Personal ephemeral panel (non-persistent, 10-min timeout) ─────────────────
 
-def _build_personal_panel_view(raid_id: int, state: dict, user_id: int) -> discord.ui.View:
+def _build_personal_panel_view(raid_id: int, state: dict, user_id: int, allowed_tasks: dict) -> discord.ui.View:
     view = discord.ui.View(timeout=600)
 
     for task, emoji, label in [
@@ -233,6 +233,8 @@ def _build_personal_panel_view(raid_id: int, state: dict, user_id: int) -> disco
         ('comment', '💬', 'Comment'),
         ('retweet', '🔁', 'Retweet'),
     ]:
+        if not allowed_tasks.get(task, False):
+            continue
         is_on = state.get(task, False)
         btn = discord.ui.Button(
             style=discord.ButtonStyle.success if is_on else discord.ButtonStyle.secondary,
@@ -249,7 +251,7 @@ def _build_personal_panel_view(raid_id: int, state: dict, user_id: int) -> disco
                 s = _get_panel_state(user_id, raid_id)
                 s[t] = not s[t]
                 s['updated_at'] = datetime.utcnow()
-                new_view = _build_personal_panel_view(raid_id, s, user_id)
+                new_view = _build_personal_panel_view(raid_id, s, user_id, allowed_tasks)
                 await interaction.response.edit_message(view=new_view)
             return cb
 
@@ -442,8 +444,15 @@ class RaidJoinButton(
                 )
                 return
 
+            allowed_tasks = {'like': True, 'comment': True, 'retweet': True}
+            try:
+                parsed = json.loads(raid.get('tasks_json') or '{}')
+                if any(parsed.values()):
+                    allowed_tasks = parsed
+            except Exception:
+                pass
             state = _get_panel_state(user_id, self.raid_id)
-            view  = _build_personal_panel_view(self.raid_id, state, user_id)
+            view  = _build_personal_panel_view(self.raid_id, state, user_id, allowed_tasks)
             await interaction.response.send_message(
                 content='**Select the tasks you completed, then click ✅ Confirm.**',
                 view=view,
@@ -769,12 +778,15 @@ class RaidsCog(commands.Cog, name='Raids'):
     async def manual_check(self, guild_id: int, raid_id: int, identifier: str) -> dict:
         from cogs._twitter import check_comment as tw_cc, check_retweet as tw_cr
 
+        print(f'[raid] manual_check: guild={guild_id} raid_id={raid_id} identifier="{identifier}"')
+
         resolved = await self._resolve_manual_check_target(guild_id, identifier)
         if not resolved:
             return {
                 'error': (
-                    f'Could not resolve "{identifier}" — '
-                    'try Discord username, Discord ID, or @twitter_handle'
+                    f'Could not resolve "{identifier}". Tried Discord username, Discord ID, '
+                    'and Twitter handle. If using a Twitter handle, the user must have '
+                    'linked their Discord account with /setx <twitter_handle> first.'
                 )
             }
 
@@ -792,7 +804,23 @@ class RaidsCog(commands.Cog, name='Raids'):
 
         raid = get_guild_raid(raid_id, guild_id)
         if not raid:
-            return {'error': 'Raid not found'}
+            print(f'[raid] manual_check: raid_id={raid_id} not found by PK — trying display_number fallback')
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT * FROM raids WHERE guild_id=? AND display_number=? LIMIT 1",
+                    (guild_id, raid_id),
+                ).fetchone()
+                if row:
+                    raid = dict(row)
+                    print(f'[raid] manual_check: resolved via display_number={raid_id}, real raid_id={raid["raid_id"]}')
+        if not raid:
+            with get_connection() as conn:
+                all_ids = [r[0] for r in conn.execute(
+                    "SELECT display_number FROM raids WHERE guild_id=? ORDER BY posted_at DESC LIMIT 10",
+                    (guild_id,),
+                ).fetchall()]
+            print(f'[raid] manual_check: raid {raid_id} not found. Guild display_numbers: {all_ids}')
+            return {'error': f'Raid #{raid_id} not found in this guild'}
 
         part = get_raid_participation(guild_id, raid_id, discord_user_id)
         if not part:
