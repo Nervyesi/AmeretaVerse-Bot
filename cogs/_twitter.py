@@ -139,27 +139,41 @@ async def get_api():
 
             auth_mode = acc.get('auth_mode', 'password')
 
-            # Add account to pool — catch "already exists" silently
-            try:
-                placeholder_email = acc.get('email') or f"{acc['username']}@placeholder.local"
-                placeholder_pw    = acc.get('password') or 'placeholder_pw_unused'
-                await api.pool.add_account(
-                    acc['username'], placeholder_pw,
-                    placeholder_email, placeholder_pw,
-                )
-                print(f'[twitter] add_account OK: slot {acc["slot"]} ({acc["username"]})')
-            except Exception as e:
-                print(f'[twitter] add_account note (slot {acc["slot"]}): {type(e).__name__}: {e}')
-
             if auth_mode == 'cookies':
                 cookie_str = f"ct0={acc['ct0']}; auth_token={acc['auth_token']}"
+
+                # Remove any stale pool row so re-add with fresh cookies is accepted
                 try:
-                    await api.pool.set_cookies(acc['username'], cookie_str)
-                    print(f'[twitter] set_cookies OK: slot {acc["slot"]} ({acc["username"]})')
+                    await api.pool.delete_accounts(acc['username'])
+                    print(f'[twitter] deleted stale pool row for {acc["username"]}')
                 except Exception as e:
-                    print(f'[twitter] set_cookies FAILED slot {acc["slot"]}: {type(e).__name__}: {e}')
+                    print(f'[twitter] delete_accounts note (slot {acc["slot"]}): {type(e).__name__}: {e}')
+
+                # add_account with cookies kwarg — the correct twscrape 0.17 API
+                try:
+                    placeholder_email = acc.get('email') or f"{acc['username']}@placeholder.local"
+                    placeholder_pw    = acc.get('password') or 'placeholder_pw_unused'
+                    await api.pool.add_account(
+                        acc['username'], placeholder_pw,
+                        placeholder_email, placeholder_pw,
+                        cookies=cookie_str,
+                    )
+                    print(f'[twitter] add_account(cookies=...) OK: slot {acc["slot"]} ({acc["username"]})')
+                except Exception as e:
+                    print(f'[twitter] add_account(cookies=...) FAILED slot {acc["slot"]}: {type(e).__name__}: {e}')
                     _tb.print_exc()
+
             else:
+                # Password mode — add account then login
+                try:
+                    await api.pool.add_account(
+                        acc['username'], acc['password'],
+                        acc['email'],    acc['password'],
+                    )
+                    print(f'[twitter] add_account OK: slot {acc["slot"]} ({acc["username"]})')
+                except Exception as e:
+                    print(f'[twitter] add_account note (slot {acc["slot"]}): {type(e).__name__}: {e}')
+
                 print(f'[twitter] password-mode slot {acc["slot"]} ({acc["username"]}) — calling login_all()...')
                 try:
                     await api.pool.login_all()
