@@ -2178,9 +2178,9 @@ async def tw_set_account_active(
     return {'ok': True, 'slot': slot, 'active': body.active}
 
 
-@app.post('/api/admin/test-apify')
-async def admin_test_apify(user: dict = Depends(get_current_user)):
-    """Run a live Apify test lookup and return the result with health status."""
+@app.post('/api/admin/test-twitter')
+async def admin_test_twitter(user: dict = Depends(get_current_user)):
+    """Run a live TwitterAPI.io test lookup and return the result with health status."""
     require_global_admin(user)
     from cogs._twitter import lookup_twitter_user_by_login, get_scraping_health
     try:
@@ -2189,10 +2189,10 @@ async def admin_test_apify(user: dict = Depends(get_current_user)):
         if result:
             return {'status': 'ok', 'result': result, 'health': health}
         return {
-            'status': 'demo_or_failed',
-            'message': 'Apify returned no real data — likely demo mode or token issue',
+            'status': 'failed',
+            'message': 'TwitterAPI.io returned no data — check TWITTER_API_IO_KEY',
             'health': health,
-            'hint': 'Check https://console.apify.com — verify your plan covers the actor',
+            'hint': 'Verify key at https://twitterapi.io',
         }
     except Exception as e:
         return {'status': 'error', 'error': f'{type(e).__name__}: {e}'}
