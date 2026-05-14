@@ -126,10 +126,10 @@ async def _run_apify(input_data: dict, timeout: float = 90.0) -> Optional[list]:
 
 
 async def check_comment(tweet_id: str, target_username: str) -> dict:
-    """Check if target_username commented on tweet_id.
+    """Check if target_username replied to tweet_id.
 
-    Returns verified=True (found), verified=False (≥5 results fetched, no match),
-    or verified=None (inconclusive — Apify failure, too few results, etc.).
+    Uses Twitter search operator 'from:USER conversation_id:TWEET' which directly
+    returns only that user's replies in that conversation.
     """
     print(f'[twitter] check_comment: tweet={tweet_id} target={target_username}')
     target = normalize_username(target_username)
@@ -139,36 +139,37 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
         return {'verified': None, 'reason': 'no_tweet_id'}
 
     items = await _run_apify({
-        'searchTerms': [f'conversation_id:{tweet_id}'],
-        'sort':        'Top',
-        'maxItems':    200,
+        'searchTerms': [f'from:{target} conversation_id:{tweet_id}'],
+        'sort':        'Latest',
+        'maxItems':    10,
     }, timeout=120.0)
 
     if items is None:
         return {'verified': None, 'reason': 'apify_failed'}
 
+    if len(items) == 0:
+        print(f'[twitter] check_comment: no reply from @{target} in conversation {tweet_id}')
+        return {'verified': False, 'reason': 'no_comment_found'}
+
+    # Verify returned items actually belong to this user and conversation
     for item in items:
-        author       = item.get('author') or {}
-        author_uname = normalize_username(
-            author.get('userName') or author.get('username') or ''
-        )
-        if author_uname == target:
+        author      = item.get('author') or {}
+        author_name = normalize_username(author.get('userName') or author.get('username') or '')
+        conv_id     = str(item.get('conversationId') or item.get('conversation_id') or '')
+        if author_name == target and conv_id == str(tweet_id):
             print(f'[twitter] check_comment: MATCH for @{target}')
             return {'verified': True, 'reason': 'found_comment'}
 
-    if len(items) < 5:
-        print(f'[twitter] check_comment: only {len(items)} results — inconclusive')
-        return {'verified': None, 'reason': f'few_results:{len(items)}'}
-
-    print(f'[twitter] check_comment: no match for @{target} in {len(items)} results')
+    # Items returned but none matched — treat as no comment
+    print(f'[twitter] check_comment: {len(items)} results but no verified match for @{target}')
     return {'verified': False, 'reason': 'no_comment_found'}
 
 
 async def check_retweet(tweet_id: str, target_username: str) -> dict:
     """Check if target_username retweeted tweet_id.
 
-    Returns verified=True (found), verified=False (non-empty timeline, no match),
-    or verified=None (inconclusive — Apify failure or empty timeline).
+    Uses 'from:USER filter:nativeretweets' to fetch that user's retweets only.
+    Empty results are inconclusive (user may have no retweets or search is limited).
     """
     print(f'[twitter] check_retweet: tweet={tweet_id} target={target_username}')
     target = normalize_username(target_username)
@@ -178,17 +179,17 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
         return {'verified': None, 'reason': 'no_tweet_id'}
 
     items = await _run_apify({
-        'startUrls':  [f'https://twitter.com/{target}'],
-        'maxItems':   100,
-        'tweetTypes': ['retweet'],
+        'searchTerms': [f'from:{target} filter:nativeretweets'],
+        'sort':        'Latest',
+        'maxItems':    100,
     }, timeout=120.0)
 
     if items is None:
         return {'verified': None, 'reason': 'apify_failed'}
 
     if len(items) == 0:
-        print(f'[twitter] check_retweet: empty timeline for @{target} — inconclusive')
-        return {'verified': None, 'reason': 'empty_timeline'}
+        print(f'[twitter] check_retweet: empty results for @{target} retweets — inconclusive')
+        return {'verified': None, 'reason': 'empty_search_results'}
 
     for item in items:
         rt_id = (
@@ -196,6 +197,7 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
             or (item.get('retweetedStatus') or {}).get('id')
             or (item.get('retweetedTweet')  or {}).get('id')
             or (item.get('referencedTweet') or {}).get('id')
+            or item.get('quotedTweetId')
         )
         if rt_id and str(rt_id) == str(tweet_id):
             print(f'[twitter] check_retweet: MATCH for @{target}')
@@ -206,15 +208,17 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
 
 
 async def lookup_twitter_user_by_login(username: str) -> Optional[dict]:
-    """Look up basic Twitter user info by handle. Returns None if not found or on error."""
+    """Look up basic Twitter user info via 'from:USER' search.
+    Returns {'id', 'username', 'display_name'} or None if not found or on error."""
     target = normalize_username(username)
     if not target:
         return None
     print(f'[twitter] lookup_by_login: @{target}')
 
     items = await _run_apify({
-        'startUrls': [f'https://twitter.com/{target}'],
-        'maxItems':  1,
+        'searchTerms': [f'from:{target}'],
+        'sort':        'Latest',
+        'maxItems':    1,
     }, timeout=60.0)
 
     if not items:
