@@ -47,8 +47,10 @@ from cogs._twitter import extract_tweet_id
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MANUAL_CHECK_DAILY_LIMIT = 10
-# Guilds exempt from the manual check daily limit — same set as premium branding.
-UNLIMITED_MANUAL_CHECK_GUILD_IDS = PREMIUM_GUILD_IDS
+# Operational override — ONLY the bot owner's dev/test server.
+# Do NOT couple this to PREMIUM_GUILD_IDS: premium customers still get the daily
+# limit to prevent API cost runaway.  Add IDs here manually and deliberately.
+UNLIMITED_MANUAL_CHECK_GUILD_IDS: frozenset[int] = frozenset({1199707792706117642})
 
 DEFAULT_GUIDE_TITLE = "Raid System - How It Works"
 

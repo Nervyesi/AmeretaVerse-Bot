@@ -73,6 +73,9 @@ from database import (
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
+# Unlimited manual check exemption — independent of PREMIUM_GUILD_IDS.
+# Only the bot owner's dev/test server; do NOT add guilds here for premium plans.
+_UNLIMITED_MC_GUILDS: frozenset = frozenset({1199707792706117642})
 from r2_client import upload_file as r2_upload, delete_file as r2_delete, ALLOWED_EXTENSIONS
 
 load_dotenv()
@@ -1752,7 +1755,7 @@ class _RaidManualCheck(BaseModel):
 async def raid_get_settings(server_id: int, user: dict = Depends(get_current_user)):
     require_guild_admin(user, server_id)
     s = db_get_raid_settings(server_id)
-    return {**s, 'unlimited_manual_check': server_id in PREMIUM_GUILD_IDS}
+    return {**s, 'unlimited_manual_check': server_id in _UNLIMITED_MC_GUILDS}
 
 
 @app.patch('/api/servers/{server_id}/raid/settings')
@@ -1956,7 +1959,7 @@ async def raid_manual_check(
     require_guild_admin(user, server_id)
     print(f'[raid] manual-check endpoint: server={server_id} raid_id={body.raid_id} identifier={body.identifier!r}')
 
-    is_unlimited = server_id in PREMIUM_GUILD_IDS
+    is_unlimited = server_id in _UNLIMITED_MC_GUILDS
 
     settings   = db_check_reset_manual_count(server_id)
     used_today = settings.get('manual_check_count_today', 0)
