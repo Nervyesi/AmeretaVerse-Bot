@@ -24,6 +24,34 @@ _init_lock   = asyncio.Lock()
 
 TWSCRAPE_DB_PATH = os.getenv('TWSCRAPE_DB_PATH', '/data/twscrape.db')
 
+# Scraping health — tracks consecutive failures to detect auth/rate-limit outages
+SCRAPING_HEALTHY      = True
+_consecutive_failures = 0
+_FAILURE_THRESHOLD    = 3
+# Reasons that indicate the scraper itself is broken (not just "not found")
+_SCRAPER_ERROR_PREFIXES = ('scrape_error', 'verification_disabled', 'no_active_account', 'rate_limited')
+
+
+def _update_scraping_health(result: dict) -> None:
+    global SCRAPING_HEALTHY, _consecutive_failures
+    verified = result.get('verified')
+    reason   = result.get('reason', '')
+    if verified is not None:  # True or False = real result, scraper is working
+        if not SCRAPING_HEALTHY or _consecutive_failures > 0:
+            print(f'[twitter] health: real result received — resetting failure counter')
+            SCRAPING_HEALTHY = True
+        _consecutive_failures = 0
+    elif any(reason.startswith(p) for p in _SCRAPER_ERROR_PREFIXES):
+        _consecutive_failures += 1
+        print(f'[twitter] health: scraper failure #{_consecutive_failures} (reason={reason!r})')
+        if _consecutive_failures >= _FAILURE_THRESHOLD and SCRAPING_HEALTHY:
+            SCRAPING_HEALTHY = False
+            print(f'[twitter] SCRAPING_HEALTHY=False — {_consecutive_failures} consecutive scraper failures')
+
+
+def get_scraping_health() -> dict:
+    return {'healthy': SCRAPING_HEALTHY, 'consecutive_failures': _consecutive_failures}
+
 
 def _get_slot_credentials(slot: int) -> dict | None:
     """Read credentials for a numbered slot.
@@ -215,17 +243,25 @@ def normalize_username(u: str) -> str:
 
 
 async def check_comment(tweet_id: str, target_username: str) -> dict:
-    """Check if target_username commented on tweet_id."""
+    """Check if target_username commented on tweet_id.
+
+    Returns verified=True (found), verified=False (conclusively not found, ≥5 replies fetched),
+    or verified=None (inconclusive — any error, rate limit, or too few replies).
+    """
     print(f'[twitter] check_comment called: tweet_id={tweet_id} target={target_username}')
     target = normalize_username(target_username)
     if not target:
-        print('[twitter] check_comment: empty target — returning False')
-        return {'verified': False, 'reason': 'no_username'}
+        print('[twitter] check_comment: empty target — inconclusive')
+        r = {'verified': None, 'reason': 'no_username'}
+        _update_scraping_health(r)
+        return r
     try:
         api = await get_api()
         if api is None:
             print('[twitter] check_comment: api is None — verification disabled')
-            return {'verified': None, 'reason': 'verification_disabled'}
+            r = {'verified': None, 'reason': 'verification_disabled'}
+            _update_scraping_health(r)
+            return r
         print(f'[twitter] check_comment: fetching replies for tweet {tweet_id}...')
         from twscrape import gather
         replies = await gather(api.tweet_replies(int(tweet_id), limit=200))
@@ -234,32 +270,55 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             reply_user = normalize_username(getattr(reply.user, 'username', ''))
             if reply_user == target:
                 print(f'[twitter] check_comment: MATCH found for {target}')
-                return {'verified': True, 'reason': 'found_comment'}
-        print(f'[twitter] check_comment: no match for {target} in {len(replies)} replies')
-        return {'verified': False, 'reason': 'no_comment_found'}
+                r = {'verified': True, 'reason': 'found_comment'}
+                _update_scraping_health(r)
+                return r
+        if len(replies) < 5:
+            # Very few replies is suspicious — likely rate-limited or auth issue
+            print(f'[twitter] check_comment: only {len(replies)} replies — treating as inconclusive')
+            r = {'verified': None, 'reason': f'insufficient_replies:{len(replies)}'}
+            _update_scraping_health(r)
+            return r
+        print(f'[twitter] check_comment: no match for {target} in {len(replies)} replies — confirmed absent')
+        r = {'verified': False, 'reason': 'no_comment_found'}
+        _update_scraping_health(r)
+        return r
     except Exception as e:
         print(f'[twitter] check_comment EXCEPTION: {type(e).__name__}: {e}')
         _tb.print_exc()
-        return {'verified': None, 'reason': f'scrape_error:{type(e).__name__}'}
+        r = {'verified': None, 'reason': f'scrape_error:{type(e).__name__}'}
+        _update_scraping_health(r)
+        return r
 
 
 async def check_retweet(tweet_id: str, target_username: str) -> dict:
-    """Check if target_username retweeted tweet_id."""
+    """Check if target_username retweeted tweet_id.
+
+    Returns verified=True (found), verified=False (timeline non-empty, no retweet found),
+    or verified=None (inconclusive — any error, empty timeline, user not found, etc.).
+    """
     print(f'[twitter] check_retweet called: tweet_id={tweet_id} target={target_username}')
     target = normalize_username(target_username)
     if not target:
-        print('[twitter] check_retweet: empty target — returning False')
-        return {'verified': False, 'reason': 'no_username'}
+        print('[twitter] check_retweet: empty target — inconclusive')
+        r = {'verified': None, 'reason': 'no_username'}
+        _update_scraping_health(r)
+        return r
     try:
         api = await get_api()
         if api is None:
             print('[twitter] check_retweet: api is None — verification disabled')
-            return {'verified': None, 'reason': 'verification_disabled'}
+            r = {'verified': None, 'reason': 'verification_disabled'}
+            _update_scraping_health(r)
+            return r
         print(f'[twitter] check_retweet: looking up user {target}...')
         user = await api.user_by_login(target)
         if not user:
-            print(f'[twitter] check_retweet: user {target} not found on Twitter')
-            return {'verified': False, 'reason': 'user_not_found'}
+            # Could be auth failure returning null, not definitive "account doesn't exist"
+            print(f'[twitter] check_retweet: user {target} lookup returned None — inconclusive')
+            r = {'verified': None, 'reason': 'user_not_found'}
+            _update_scraping_health(r)
+            return r
         print(f'[twitter] check_retweet: user found id={user.id}, fetching timeline...')
         from twscrape import gather
         tweets = await gather(api.user_tweets(user.id, limit=200))
@@ -268,13 +327,25 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
             rt = getattr(tw, 'retweetedTweet', None)
             if rt and str(rt.id) == str(tweet_id):
                 print(f'[twitter] check_retweet: MATCH found — tweet {tweet_id} in timeline')
-                return {'verified': True, 'reason': 'found_retweet'}
-        print(f'[twitter] check_retweet: tweet {tweet_id} not found in {len(tweets)}-tweet timeline')
-        return {'verified': False, 'reason': 'no_retweet_found'}
+                r = {'verified': True, 'reason': 'found_retweet'}
+                _update_scraping_health(r)
+                return r
+        if len(tweets) == 0:
+            # Empty timeline is suspicious — likely auth/rate-limit issue
+            print(f'[twitter] check_retweet: empty timeline — treating as inconclusive')
+            r = {'verified': None, 'reason': 'empty_timeline'}
+            _update_scraping_health(r)
+            return r
+        print(f'[twitter] check_retweet: tweet {tweet_id} not in {len(tweets)}-tweet timeline — confirmed absent')
+        r = {'verified': False, 'reason': 'no_retweet_found'}
+        _update_scraping_health(r)
+        return r
     except Exception as e:
         print(f'[twitter] check_retweet EXCEPTION: {type(e).__name__}: {e}')
         _tb.print_exc()
-        return {'verified': None, 'reason': f'scrape_error:{type(e).__name__}'}
+        r = {'verified': None, 'reason': f'scrape_error:{type(e).__name__}'}
+        _update_scraping_health(r)
+        return r
 
 
 async def lookup_twitter_user_by_login(username: str) -> dict | None:

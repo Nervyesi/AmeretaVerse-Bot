@@ -1370,16 +1370,18 @@ def get_raid_leaderboard(guild_id: int, limit: int = 10) -> list:
 
 def add_raid_verification_log(
     guild_id: int, raid_id: int, user_id: int,
-    task: str, claimed: bool, verified: bool,
+    task: str, claimed: bool, verified,
     source: str, error_text: str = None,
 ):
+    # verified: 1=passed, 0=failed, -1=inconclusive; bool True/False also accepted
+    v_int = int(verified) if isinstance(verified, (int, bool)) else -1
     with get_connection() as conn:
         conn.execute(
             "INSERT INTO raid_verification_log "
             "(guild_id, raid_id, user_id, task, claimed, verified, source, error_text) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (guild_id, raid_id, user_id, task,
-             1 if claimed else 0, 1 if verified else 0, source, error_text),
+             1 if claimed else 0, v_int, source, error_text),
         )
 
 

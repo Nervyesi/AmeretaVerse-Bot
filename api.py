@@ -1935,7 +1935,14 @@ async def raid_verification_log(
                 "WHERE guild_id=? AND user_id=? AND raid_id=? ORDER BY task",
                 (server_id, d['user_id'], d['raid_id']),
             ).fetchall()
-            d['tasks'] = [dict(t) for t in task_rows]
+            tasks = []
+            for t in task_rows:
+                td = dict(t)
+                v = td.get('verified')
+                # Map DB int (1/0/-1) to JSON bool/null so frontend === comparisons work
+                td['verified'] = True if v == 1 else (False if v == 0 else None)
+                tasks.append(td)
+            d['tasks'] = tasks
             flags.append(d)
 
     return {'flags': flags}
@@ -1972,6 +1979,16 @@ async def raid_manual_check(
         'limit': _MANUAL_CHECK_DAILY_LIMIT,
         **result,
     }
+
+
+@app.get('/api/servers/{server_id}/raid/scraping-health')
+async def raid_scraping_health(server_id: int, user: dict = Depends(get_current_user)):
+    require_guild_admin(user, server_id)
+    try:
+        from cogs._twitter import get_scraping_health
+        return get_scraping_health()
+    except Exception as e:
+        return {'healthy': None, 'consecutive_failures': 0, 'error': str(e)}
 
 
 @app.post('/api/servers/{server_id}/raid/send-guide')

@@ -852,88 +852,105 @@ class RaidsCog(commands.Cog, name='Raids'):
         except Exception:
             tasks_claimed = set()
 
-        results        = {}
         comment_result = None
         retweet_result = None
 
         if 'comment' in tasks_claimed and allowed_tasks.get('comment'):
             comment_result = await tw_cc(tweet_id, twitter_username)
-            results['comment'] = {'claimed': True, **comment_result}
 
         if 'retweet' in tasks_claimed and allowed_tasks.get('retweet'):
             retweet_result = await tw_cr(tweet_id, twitter_username)
-            results['retweet'] = {'claimed': True, **retweet_result}
 
+        # Build like result — propagate inconclusive companions as None (not failure)
+        like_result = None
         if 'like' in tasks_claimed and allowed_tasks.get('like'):
-            # companions = other enabled tasks that user also claimed
             companions = (tasks_claimed & {t for t, v in allowed_tasks.items() if v}) - {'like'}
             if not companions:
-                results['like'] = {'claimed': True, 'verified': True, 'reason': 'like_always_pass'}
+                like_result = {'verified': True, 'reason': 'like_always_pass'}
             else:
-                companions_ok = all(
-                    (comment_result['verified'] is not False if c == 'comment' and comment_result else True)
-                    and
-                    (retweet_result['verified'] is not False if c == 'retweet' and retweet_result else True)
-                    for c in companions
+                any_companion_failed = (
+                    ('comment' in companions and comment_result and comment_result.get('verified') is False) or
+                    ('retweet' in companions and retweet_result and retweet_result.get('verified') is False)
                 )
-                results['like'] = {
-                    'claimed': True,
-                    'verified': companions_ok,
-                    'reason': 'companions_passed' if companions_ok else 'companions_failed',
-                }
+                any_companion_inconclusive = (
+                    ('comment' in companions and (not comment_result or comment_result.get('verified') is None)) or
+                    ('retweet' in companions and (not retweet_result or retweet_result.get('verified') is None))
+                )
+                if any_companion_failed:
+                    like_result = {'verified': False, 'reason': 'like_companion_failed'}
+                elif any_companion_inconclusive:
+                    like_result = {'verified': None, 'reason': 'like_companion_inconclusive'}
+                else:
+                    like_result = {'verified': True, 'reason': 'like_companions_passed'}
 
-        settings      = get_raid_settings(guild_id)
-        flagged_tasks = {t for t, r in results.items() if r.get('verified') is False}
+        # Build unified results dict (claimed=True for all, so frontend knows what was attempted)
+        results: dict = {}
+        if comment_result is not None: results['comment'] = {'claimed': True, **comment_result}
+        if retweet_result is not None: results['retweet'] = {'claimed': True, **retweet_result}
+        if like_result    is not None: results['like']    = {'claimed': True, **like_result}
 
-        if flagged_tasks:
-            deduct = sum(
-                round(raid['total_points'] * settings.get(f'point_ratio_{task}', 0) / 100)
-                for task in flagged_tasks
+        flagged_tasks      = {t for t, r in results.items() if r.get('verified') is False}
+        inconclusive_tasks = {t for t, r in results.items() if r.get('verified') is None}
+        any_real_failure   = bool(flagged_tasks)
+        any_inconclusive   = bool(inconclusive_tasks)
+
+        # Write log for all checked tasks — 1=passed, 0=failed, -1=inconclusive
+        for task, r in results.items():
+            v    = r.get('verified')
+            db_v = 1 if v is True else (0 if v is False else -1)
+            add_raid_verification_log(
+                guild_id, actual_raid_id, discord_user_id, task,
+                True, db_v, 'manual',
+                error_text=r.get('reason') if v is not True else None,
+            )
+
+        settings = get_raid_settings(guild_id)
+        deducted = 0
+
+        if any_real_failure:
+            deducted = sum(
+                round(raid['total_points'] * settings.get(f'point_ratio_{t}', 0) / 100)
+                for t in flagged_tasks
             )
             with get_connection() as conn:
                 conn.execute(
                     "UPDATE raid_participation SET verification_status='flagged', "
                     "flag_reason=?, points_earned=MAX(0, points_earned-?), "
                     "verified_at=datetime('now') WHERE participation_id=?",
-                    (', '.join(sorted(flagged_tasks)), deduct, part['participation_id']),
+                    (', '.join(sorted(flagged_tasks)), deducted, part['participation_id']),
                 )
-                if deduct > 0:
+                if deducted > 0:
                     conn.execute(
                         "UPDATE raid_user_points SET total_points=MAX(0,total_points-?) "
-                        "WHERE guild_id=? AND user_id=?", (deduct, guild_id, discord_user_id),
+                        "WHERE guild_id=? AND user_id=?", (deducted, guild_id, discord_user_id),
                     )
                     conn.execute(
                         "UPDATE users SET total_points=MAX(0,total_points-?) WHERE user_id=?",
-                        (deduct, discord_user_id),
+                        (deducted, discord_user_id),
                     )
-            for task in flagged_tasks:
-                add_raid_verification_log(
-                    guild_id, raid_id, discord_user_id, task, True, False, 'manual',
-                    error_text='manual_check',
-                )
-        else:
+            print(f'[raid] manual_check FLAGGED {discord_username} tasks={sorted(flagged_tasks)} deducted={deducted}')
+        elif not any_inconclusive:
+            # All checks conclusive and passed — mark verified
             with get_connection() as conn:
                 conn.execute(
                     "UPDATE raid_participation SET verification_status='verified', "
                     "verified_at=datetime('now') WHERE participation_id=?",
                     (part['participation_id'],),
                 )
-            for task in tasks_claimed:
-                add_raid_verification_log(
-                    guild_id, raid_id, discord_user_id, task, True, True, 'manual',
-                )
+        else:
+            print(f'[raid] manual_check inconclusive for {discord_username} — NOT flagged')
 
-        deducted = sum(
-            round(raid['total_points'] * settings.get(f'point_ratio_{t}', 0) / 100)
-            for t in flagged_tasks
-        ) if flagged_tasks else 0
+        from cogs._twitter import get_scraping_health as _tw_health
+        health = _tw_health()
 
         return {
             'discord_username': discord_username,
             'twitter_username': twitter_username,
-            'tasks': results,
-            'flagged': sorted(flagged_tasks),
-            'deducted': deducted,
+            'tasks':            results,
+            'flagged':          sorted(flagged_tasks),
+            'deducted':         deducted,
+            'inconclusive':     any_inconclusive,
+            'scraping_healthy': health['healthy'],
         }
 
     # ── Daily verification ─────────────────────────────────────────────────────
@@ -950,43 +967,50 @@ class RaidsCog(commands.Cog, name='Raids'):
         rows        = sample_pending_participations(sample_size)
         print(f'[raid] daily check: total={total} sampling={sample_size} ({pct}%)')
 
+        flagged_count = inconclusive_count = verified_count = 0
         for row in rows:
             try:
-                await self._verify_participation(row)
+                outcome = await self._verify_participation(row)
+                if   outcome == 'flagged':      flagged_count     += 1
+                elif outcome == 'inconclusive': inconclusive_count += 1
+                elif outcome == 'verified':     verified_count    += 1
             except Exception as e:
                 print(f'[raid] verify error: {type(e).__name__}: {e}')
+                inconclusive_count += 1
             await asyncio.sleep(2)
+        print(f'[raid] daily check done: flagged={flagged_count} verified={verified_count} inconclusive={inconclusive_count}')
+        if inconclusive_count > 0 and flagged_count == 0 and verified_count == 0:
+            print('[raid] daily check: all results inconclusive — Twitter verification may be offline, no flags issued')
 
     @daily_verification_check.before_loop
     async def before_daily_check(self):
         await self.bot.wait_until_ready()
 
-    async def _verify_participation(self, row: dict):
+    async def _verify_participation(self, row: dict) -> str:
+        """Verify one participation row. Returns 'flagged', 'verified', 'inconclusive', or 'skipped'."""
         from cogs._twitter import check_comment as tw_cc, check_retweet as tw_cr
 
         guild_id = row['guild_id']
 
         settings = get_raid_settings(guild_id)
         if not settings or not settings.get('enabled'):
-            return
+            return 'skipped'
 
         raid = get_guild_raid(row['raid_id'], guild_id)
         if not raid:
-            return
+            return 'skipped'
 
         x_username = get_user_x_username(row['user_id'])
         if not x_username:
-            return
+            return 'skipped'
 
         tweet_id = raid['tweet_id']
 
-        # Parse which tasks this raid allows
         try:
             allowed_tasks = json.loads(raid.get('tasks_json') or '{}')
         except Exception:
             allowed_tasks = {'like': True, 'comment': True, 'retweet': True}
 
-        # Parse what the user actually claimed — stored as {"like": true, "comment": false, ...}
         try:
             tc_raw = json.loads(row.get('tasks_claimed') or '{}')
             if isinstance(tc_raw, dict):
@@ -996,38 +1020,61 @@ class RaidsCog(commands.Cog, name='Raids'):
         except Exception:
             tasks_claimed = set()
 
-        # Only check tasks that the raid allows AND user claimed
         effective_tasks = tasks_claimed & {t for t, v in allowed_tasks.items() if v}
+        if not effective_tasks:
+            return 'skipped'
 
         comment_result = await tw_cc(tweet_id, x_username) if 'comment' in effective_tasks else None
         retweet_result = await tw_cr(tweet_id, x_username) if 'retweet' in effective_tasks else None
 
-        flagged_tasks = set()
-
-        # verified is False = confirmed failure; None = scraper error (inconclusive — never flag)
-        if comment_result and comment_result['verified'] is False:
-            flagged_tasks.add('comment')
-        if retweet_result and retweet_result['verified'] is False:
-            flagged_tasks.add('retweet')
-
+        # Build like result based on companion outcomes (None companions → inconclusive, not failure)
+        like_result = None
         if 'like' in effective_tasks:
             companions = effective_tasks - {'like'}
-            if companions:
+            if not companions:
+                like_result = {'verified': True, 'reason': 'like_only_trusted'}
+            else:
                 any_companion_failed = (
-                    ('comment' in companions and comment_result and comment_result['verified'] is False) or
-                    ('retweet' in companions and retweet_result and retweet_result['verified'] is False)
+                    ('comment' in companions and comment_result and comment_result.get('verified') is False) or
+                    ('retweet' in companions and retweet_result and retweet_result.get('verified') is False)
+                )
+                any_companion_inconclusive = (
+                    ('comment' in companions and (not comment_result or comment_result.get('verified') is None)) or
+                    ('retweet' in companions and (not retweet_result or retweet_result.get('verified') is None))
                 )
                 if any_companion_failed:
-                    flagged_tasks.add('like')
-            # If like is the only effective task, never flag it
+                    like_result = {'verified': False, 'reason': 'like_companion_failed'}
+                elif any_companion_inconclusive:
+                    like_result = {'verified': None, 'reason': 'like_companion_inconclusive'}
+                else:
+                    like_result = {'verified': True, 'reason': 'like_companions_passed'}
 
-        if flagged_tasks:
+        task_results: dict = {}
+        if comment_result is not None: task_results['comment'] = comment_result
+        if retweet_result is not None: task_results['retweet'] = retweet_result
+        if like_result    is not None: task_results['like']    = like_result
+
+        flagged_tasks      = {t for t, r in task_results.items() if r.get('verified') is False}
+        inconclusive_tasks = {t for t, r in task_results.items() if r.get('verified') is None}
+        any_real_failure   = bool(flagged_tasks)
+        any_inconclusive   = bool(inconclusive_tasks)
+
+        # Write log for every checked task — 1=passed, 0=failed, -1=inconclusive
+        for task, r in task_results.items():
+            v    = r.get('verified')
+            db_v = 1 if v is True else (0 if v is False else -1)
+            add_raid_verification_log(
+                guild_id, row['raid_id'], row['user_id'], task,
+                True, db_v, 'auto',
+                error_text=r.get('reason') if v is not True else None,
+            )
+
+        if any_real_failure:
             deduct      = sum(
                 round(raid['total_points'] * settings.get(f'point_ratio_{t}', 0) / 100)
                 for t in flagged_tasks
             )
             flag_reason = ', '.join(sorted(flagged_tasks))
-
             with get_connection() as conn:
                 conn.execute(
                     "UPDATE raid_participation SET verification_status='flagged', "
@@ -1045,24 +1092,22 @@ class RaidsCog(commands.Cog, name='Raids'):
                         "UPDATE users SET total_points=MAX(0,total_points-?) WHERE user_id=?",
                         (deduct, row['user_id']),
                     )
+            print(f'[raid] FLAGGED user {row["user_id"]} tasks={flag_reason} deducted={deduct}pts')
+            return 'flagged'
 
-            for task in flagged_tasks:
-                add_raid_verification_log(
-                    guild_id, row['raid_id'], row['user_id'],
-                    task, True, False, 'auto', error_text=flag_reason,
-                )
-            print(f'[raid] flagged user {row["user_id"]} tasks={flag_reason} deducted={deduct}pts')
-        else:
-            with get_connection() as conn:
-                conn.execute(
-                    "UPDATE raid_participation SET verification_status='verified', "
-                    "verified_at=datetime('now') WHERE participation_id=?",
-                    (row['participation_id'],),
-                )
-            for task in effective_tasks:
-                add_raid_verification_log(
-                    guild_id, row['raid_id'], row['user_id'], task, True, True, 'auto',
-                )
+        if any_inconclusive:
+            # Leave participation as 'pending' for future retry — do NOT mark verified
+            print(f'[raid] inconclusive: user {row["user_id"]} in raid {row["raid_id"]} — NOT flagged, left pending')
+            return 'inconclusive'
+
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE raid_participation SET verification_status='verified', "
+                "verified_at=datetime('now') WHERE participation_id=?",
+                (row['participation_id'],),
+            )
+        print(f'[raid] verified: user {row["user_id"]} in raid {row["raid_id"]}')
+        return 'verified'
 
 
 async def setup(bot):
