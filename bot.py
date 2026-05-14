@@ -30,9 +30,12 @@ async def on_ready():
             print(f'[startup] Apify token present, actor={APIFY_ACTOR}')
             test = await lookup_twitter_user_by_login('twitter')
             if test and test.get('username'):
-                print(f'[startup] Apify TEST OK: got @{test["username"]}')
+                print(f'[startup] Apify TEST OK: got real user @{test["username"]} (id={test.get("id", "?")})')
             else:
-                print('[startup] Apify TEST: returned None — check token and actor')
+                from cogs._twitter import SCRAPING_HEALTHY, _consecutive_failures
+                print(f'[startup] Apify TEST returned None — verification will be inconclusive (healthy={SCRAPING_HEALTHY})')
+                print('[startup] Possible causes: demo mode, plan limit, or actor permissions')
+                print('[startup] Check: https://console.apify.com — verify plan supports the actor')
         else:
             print('[startup] APIFY_TOKEN not configured — verification disabled')
     except Exception as e:

@@ -80,7 +80,7 @@ async def _run_apify(input_data: dict, timeout: float = 90.0) -> Optional[list]:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=input_data)
 
-        if resp.status_code != 200:
+        if resp.status_code not in (200, 201):
             print(f'[twitter] Apify HTTP {resp.status_code}: {resp.text[:300]}')
             await _record_health(success=False)
             return None
@@ -91,7 +91,26 @@ async def _run_apify(input_data: dict, timeout: float = 90.0) -> Optional[list]:
             await _record_health(success=False)
             return None
 
-        print(f'[twitter] Apify OK: {len(items)} items')
+        # Detect Apify demo mode — returned when plan doesn't cover this actor
+        # Demo items look like: [{"demo": true}, {"demo": true}, ...]
+        if items:
+            all_demo = all(
+                isinstance(item, dict) and set(item.keys()) <= {'demo'} and item.get('demo') is True
+                for item in items
+            )
+            if all_demo:
+                print(f'[twitter] APIFY DEMO MODE — {len(items)} demo items, no real data returned')
+                print('[twitter] Fix: upgrade Apify plan, or check actor pricing/permissions at console.apify.com')
+                await _record_health(success=False)
+                return None
+
+            # Filter out any stray demo items mixed with real data
+            real_items = [item for item in items if not (isinstance(item, dict) and item.get('demo') is True)]
+            if len(real_items) < len(items):
+                print(f'[twitter] filtered {len(items) - len(real_items)} demo items, {len(real_items)} real items remain')
+            items = real_items
+
+        print(f'[twitter] Apify OK: {len(items)} items (HTTP {resp.status_code})')
         await _record_health(success=True)
         return items
 
