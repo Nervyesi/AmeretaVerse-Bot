@@ -276,6 +276,42 @@ def _build_personal_panel_view(raid_id: int, state: dict, user_id: int, allowed_
     return view
 
 
+def _normalize_point_ratio(settings: dict, allowed_tasks: dict) -> dict:
+    """Rescale point ratios so enabled tasks always sum to exactly 100%.
+
+    When some tasks are disabled (e.g. retweet off), the remaining tasks'
+    percentages are rescaled so their sum is still 100, preserving the
+    relative proportions of the enabled tasks.
+    """
+    raw = {
+        'like':    int(settings.get('point_ratio_like',    12)),
+        'comment': int(settings.get('point_ratio_comment', 40)),
+        'retweet': int(settings.get('point_ratio_retweet', 48)),
+    }
+    enabled = [t for t in ('like', 'comment', 'retweet') if allowed_tasks.get(t, False)]
+    enabled_total = sum(raw[t] for t in enabled)
+
+    if not enabled:
+        return {'like': 0, 'comment': 0, 'retweet': 0}
+
+    if enabled_total == 0:
+        equal = 100 // len(enabled)
+        return {t: (equal if t in enabled else 0) for t in ('like', 'comment', 'retweet')}
+
+    normalized: dict = {}
+    running = 0
+    for i, t in enumerate(enabled):
+        if i == len(enabled) - 1:
+            normalized[t] = 100 - running  # last task gets the remainder
+        else:
+            normalized[t] = raw[t] * 100 // enabled_total
+            running += normalized[t]
+    for t in ('like', 'comment', 'retweet'):
+        if t not in normalized:
+            normalized[t] = 0
+    return normalized
+
+
 async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: int, user_id: int):
     try:
         guild_id = interaction.guild_id or 0
@@ -325,21 +361,19 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
                 )
                 return
 
-        settings  = get_raid_settings(guild_id)
-        r_like    = settings.get('point_ratio_like',    12)
-        r_comment = settings.get('point_ratio_comment', 40)
-        r_retweet = settings.get('point_ratio_retweet', 48)
-        total     = int(raid['total_points'])
+        settings = get_raid_settings(guild_id)
+        nr       = _normalize_point_ratio(settings, allowed)
+        total    = int(raid['total_points'])
 
         earned, lines = 0, []
         if claimed['like']:
-            pts = total * r_like // 100; earned += pts
+            pts = total * nr['like'] // 100; earned += pts
             lines.append(f'❤️ Like — {pts} pts')
         if claimed['comment']:
-            pts = total * r_comment // 100; earned += pts
+            pts = total * nr['comment'] // 100; earned += pts
             lines.append(f'💬 Comment — {pts} pts')
         if claimed['retweet']:
-            pts = total * r_retweet // 100; earned += pts
+            pts = total * nr['retweet'] // 100; earned += pts
             lines.append(f'🔁 Retweet — {pts} pts')
 
         with get_connection() as conn:
@@ -802,17 +836,20 @@ class RaidsCog(commands.Cog, name='Raids'):
                 )
             }
 
-        raid = get_guild_raid(raid_id, guild_id)
+        # Resolve raid: display_number FIRST (what admin sees), PK as fallback
+        raid = None
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM raids WHERE guild_id=? AND display_number=? LIMIT 1",
+                (guild_id, raid_id),
+            ).fetchone()
+            if row:
+                raid = dict(row)
+                print(f'[raid] manual_check: resolved by display_number={raid_id} → raid_id={raid["raid_id"]}')
         if not raid:
-            print(f'[raid] manual_check: raid_id={raid_id} not found by PK — trying display_number fallback')
-            with get_connection() as conn:
-                row = conn.execute(
-                    "SELECT * FROM raids WHERE guild_id=? AND display_number=? LIMIT 1",
-                    (guild_id, raid_id),
-                ).fetchone()
-                if row:
-                    raid = dict(row)
-                    print(f'[raid] manual_check: resolved via display_number={raid_id}, real raid_id={raid["raid_id"]}')
+            raid = get_guild_raid(raid_id, guild_id)
+            if raid:
+                print(f'[raid] manual_check: resolved by PK={raid_id}')
         if not raid:
             with get_connection() as conn:
                 all_ids = [r[0] for r in conn.execute(

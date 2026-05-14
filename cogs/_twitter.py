@@ -111,19 +111,25 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
 
-    cursor   = None
-    seen     = 0
-    max_pages = 5
+    cursor              = None
+    seen                = 0
+    max_pages           = 5
+    api_call_succeeded  = False
 
-    for page in range(max_pages):
+    for _page in range(max_pages):
         params: dict = {'tweetId': str(tweet_id)}
         if cursor:
             params['cursor'] = cursor
 
         data = await _api_get('/twitter/tweet/replies', params, timeout=30.0)
         if data is None:
-            return {'verified': None, 'reason': 'api_error'}
+            if not api_call_succeeded:
+                # First call failed — we have no data at all, inconclusive
+                return {'verified': None, 'reason': 'api_error'}
+            # Later page failed but we already scanned some replies — treat as done
+            break
 
+        api_call_succeeded = True
         tweets = data.get('tweets') or data.get('replies') or data.get('data') or []
         if not isinstance(tweets, list):
             tweets = []
@@ -142,10 +148,7 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
         if not cursor or len(tweets) == 0:
             break
 
-    if seen == 0:
-        print(f'[twitter] check_comment: zero replies returned — inconclusive')
-        return {'verified': None, 'reason': 'no_replies_returned'}
-
+    # API succeeded — conclusive result: user did not comment
     print(f'[twitter] check_comment: no match for @{target} in {seen} replies')
     return {'verified': False, 'reason': 'no_comment_found'}
 
@@ -174,8 +177,9 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
         tweets = []
 
     if len(tweets) == 0:
-        print(f'[twitter] check_retweet: empty timeline for @{target} — inconclusive')
-        return {'verified': None, 'reason': 'empty_timeline'}
+        # API succeeded but user has no recent tweets — conclusive: no retweet
+        print(f'[twitter] check_retweet: API returned 0 tweets for @{target} — no recent activity')
+        return {'verified': False, 'reason': 'no_recent_activity'}
 
     for t in tweets:
         rt_id = (
