@@ -724,6 +724,22 @@ def init_db():
             print(f'[migration] Closed {r2.rowcount} stub tickets with channel_id=0')
 
 
+    # Informational audit: warn if any guild's max display_number doesn't match its raid count.
+    # This can happen if display_number was assigned without a guild_id filter in older code.
+    # We do NOT renumber historical data — just log so admins are aware of gaps.
+    with get_connection() as conn:
+        gap_rows = conn.execute(
+            "SELECT guild_id, COUNT(*) AS cnt, MAX(display_number) AS maxd "
+            "FROM raids GROUP BY guild_id HAVING maxd IS NOT NULL AND maxd != cnt"
+        ).fetchall()
+        for r in gap_rows:
+            print(
+                f'[raid] guild {r["guild_id"]} has {r["cnt"]} raids but '
+                f'max display_number={r["maxd"]} — gap detected '
+                f'(historical only; new raids use guild-scoped numbering)'
+            )
+
+
 def ensure_guild_defaults(guild_id: int):
     """Insert default config keys for a guild if they don't already exist."""
     with get_connection() as conn:

@@ -42,11 +42,13 @@ from database import (
     list_guild_raids,
 )
 from cogs._utils import resolve_channel, resolve_role
-from cogs._branding import build_branded_embed
+from cogs._branding import build_branded_embed, PREMIUM_GUILD_IDS
 from cogs._twitter import extract_tweet_id
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MANUAL_CHECK_DAILY_LIMIT = 10
+# Guilds exempt from the manual check daily limit — same set as premium branding.
+UNLIMITED_MANUAL_CHECK_GUILD_IDS = PREMIUM_GUILD_IDS
 
 DEFAULT_GUIDE_TITLE = "Raid System - How It Works"
 

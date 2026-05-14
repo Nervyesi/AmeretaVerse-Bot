@@ -1751,7 +1751,8 @@ class _RaidManualCheck(BaseModel):
 @app.get('/api/servers/{server_id}/raid/settings')
 async def raid_get_settings(server_id: int, user: dict = Depends(get_current_user)):
     require_guild_admin(user, server_id)
-    return db_get_raid_settings(server_id)
+    s = db_get_raid_settings(server_id)
+    return {**s, 'unlimited_manual_check': server_id in PREMIUM_GUILD_IDS}
 
 
 @app.patch('/api/servers/{server_id}/raid/settings')
@@ -1955,9 +1956,11 @@ async def raid_manual_check(
     require_guild_admin(user, server_id)
     print(f'[raid] manual-check endpoint: server={server_id} raid_id={body.raid_id} identifier={body.identifier!r}')
 
+    is_unlimited = server_id in PREMIUM_GUILD_IDS
+
     settings   = db_check_reset_manual_count(server_id)
     used_today = settings.get('manual_check_count_today', 0)
-    if used_today >= _MANUAL_CHECK_DAILY_LIMIT:
+    if not is_unlimited and used_today >= _MANUAL_CHECK_DAILY_LIMIT:
         raise HTTPException(
             status_code=429,
             detail=f'Daily manual check limit ({_MANUAL_CHECK_DAILY_LIMIT}) reached. Resets at midnight UTC.',
@@ -1971,12 +1974,13 @@ async def raid_manual_check(
         raise HTTPException(status_code=503, detail='Raids cog not loaded')
 
     result = await cog.manual_check(server_id, body.raid_id, body.identifier)
-    if 'error' not in result:
+    if 'error' not in result and not is_unlimited:
         db_upsert_raid_settings(server_id, manual_check_count_today=used_today + 1)
 
     return {
-        'used_today': used_today + (0 if 'error' in result else 1),
-        'limit': _MANUAL_CHECK_DAILY_LIMIT,
+        'used_today':       used_today + (0 if ('error' in result or is_unlimited) else 1),
+        'limit':            None if is_unlimited else _MANUAL_CHECK_DAILY_LIMIT,
+        'unlimited':        is_unlimited,
         **result,
     }
 
