@@ -2168,7 +2168,7 @@ async def tw_list_accounts(user: dict = Depends(get_current_user)):
 async def tw_set_account_active(
     slot: int, body: _TwAccountActivate, user: dict = Depends(get_current_user),
 ):
-    """Activate or deactivate a Twitter account slot, then reload the twscrape pool."""
+    """Activate or deactivate a Twitter account slot (legacy endpoint — no-op pool reload with Apify)."""
     require_global_admin(user)
     from database import set_twitter_account_active
     if not set_twitter_account_active(slot, 1 if body.active else 0):

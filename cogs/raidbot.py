@@ -6,7 +6,7 @@ Flow:
   2. User clicks Join Raid → bot sends ephemeral personal panel with task toggles.
   3. User toggles tasks silently (edit_message, no new messages), then confirms.
      Confirm records participation and shows result in the same ephemeral.
-  4. Daily midnight UTC: adaptive sample of pending participations verified via twscrape.
+  4. Daily midnight UTC: adaptive sample of pending participations verified via Apify.
   5. Flagged users have points deducted; verification log updated.
 """
 

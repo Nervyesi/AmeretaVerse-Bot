@@ -23,14 +23,21 @@ async def on_ready():
         ensure_guild_defaults(guild.id)
     print(f'Bot is online: {bot.user}')
 
-    print('[startup] Initializing Twitter API pool...')
+    print('[startup] Checking Apify configuration...')
     try:
-        from cogs._twitter import get_api
-        await get_api()
-        print('[startup] Twitter API pool initialization complete')
+        from cogs._twitter import APIFY_TOKEN, APIFY_ACTOR, lookup_twitter_user_by_login
+        if APIFY_TOKEN:
+            print(f'[startup] Apify token present, actor={APIFY_ACTOR}')
+            test = await lookup_twitter_user_by_login('twitter')
+            if test and test.get('username'):
+                print(f'[startup] Apify TEST OK: got @{test["username"]}')
+            else:
+                print('[startup] Apify TEST: returned None — check token and actor')
+        else:
+            print('[startup] APIFY_TOKEN not configured — verification disabled')
     except Exception as e:
         import traceback
-        print(f'[startup] Twitter API init FAILED: {type(e).__name__}: {e}')
+        print(f'[startup] Apify check failed: {type(e).__name__}: {e}')
         traceback.print_exc()
 
 if __name__ == '__main__':
