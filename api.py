@@ -1754,8 +1754,13 @@ class _RaidManualCheck(BaseModel):
 @app.get('/api/servers/{server_id}/raid/settings')
 async def raid_get_settings(server_id: int, user: dict = Depends(get_current_user)):
     require_guild_admin(user, server_id)
+    from cogs.raidbot import LIVE_VERIFICATION_GUILD_IDS as _LIVE_VER_GUILDS
     s = db_get_raid_settings(server_id)
-    return {**s, 'unlimited_manual_check': server_id in _UNLIMITED_MC_GUILDS}
+    return {
+        **s,
+        'unlimited_manual_check': server_id in _UNLIMITED_MC_GUILDS,
+        'live_verification_mode': server_id in _LIVE_VER_GUILDS,
+    }
 
 
 @app.patch('/api/servers/{server_id}/raid/settings')
