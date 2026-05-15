@@ -1872,6 +1872,7 @@ async def raid_create(
                          channel_id=str(channel.id), message_id=str(msg.id))
 
     return {'ok': True, 'raid_id': raid_id,
+            'display_number': raid.get('display_number', raid_id),
             'message_id': str(msg.id), 'channel_id': str(channel.id)}
 
 
