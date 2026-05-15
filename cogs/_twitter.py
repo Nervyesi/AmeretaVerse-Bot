@@ -154,45 +154,51 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
 
 
 async def check_retweet(tweet_id: str, target_username: str) -> dict:
-    """Check if target_username retweeted tweet_id.
+    """Check if target_username retweeted tweet_id via /twitter/tweet/retweeters.
 
-    Fetches user's recent tweets including retweets.
-    Zero tweets returned → inconclusive. Data present + no match → False.
+    API success + user absent from retweeters list = verified=False (conclusive).
+    Only genuine API/network failure returns verified=None.
     """
     print(f'[twitter] check_retweet: tweet={tweet_id} target={target_username}')
     target = normalize_username(target_username)
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
 
-    data = await _api_get(
-        '/twitter/user/last_tweets',
-        {'userName': target, 'includeRetweets': 'true'},
-        timeout=30.0,
-    )
-    if data is None:
-        return {'verified': None, 'reason': 'api_error'}
+    cursor             = None
+    seen               = 0
+    max_pages          = 4
+    api_call_succeeded = False
 
-    tweets = data.get('tweets') or data.get('data') or []
-    if not isinstance(tweets, list):
-        tweets = []
+    for _page in range(max_pages):
+        params: dict = {'tweetId': str(tweet_id)}
+        if cursor:
+            params['cursor'] = cursor
 
-    if len(tweets) == 0:
-        # API succeeded but user has no recent tweets — conclusive: no retweet
-        print(f'[twitter] check_retweet: API returned 0 tweets for @{target} — no recent activity')
-        return {'verified': False, 'reason': 'no_recent_activity'}
+        data = await _api_get('/twitter/tweet/retweeters', params, timeout=30.0)
+        if data is None:
+            if not api_call_succeeded:
+                return {'verified': None, 'reason': 'api_error'}
+            break  # later-page failure but we already scanned some retweeters
 
-    for t in tweets:
-        rt_id = (
-            t.get('retweetedStatusId')
-            or (t.get('retweetedStatus') or {}).get('id')
-            or (t.get('retweetedTweet')  or {}).get('id')
-            or t.get('retweet_id')
-        )
-        if rt_id and str(rt_id) == str(tweet_id):
-            print(f'[twitter] check_retweet: MATCH for @{target}')
-            return {'verified': True, 'reason': 'found_retweet'}
+        api_call_succeeded = True
+        users = data.get('users') or data.get('retweeters') or data.get('data') or []
+        if not isinstance(users, list):
+            users = []
 
-    print(f'[twitter] check_retweet: tweet {tweet_id} not in @{target} timeline ({len(tweets)} tweets)')
+        for u in users:
+            uname = normalize_username(
+                u.get('userName') or u.get('username') or u.get('screen_name') or ''
+            )
+            if uname == target:
+                print(f'[twitter] check_retweet: MATCH for @{target}')
+                return {'verified': True, 'reason': 'found_retweet'}
+
+        seen  += len(users)
+        cursor = data.get('next_cursor') or data.get('nextCursor') or data.get('cursor')
+        if not cursor or len(users) == 0:
+            break
+
+    print(f'[twitter] check_retweet: @{target} not in {seen} retweeters of tweet {tweet_id}')
     return {'verified': False, 'reason': 'no_retweet_found'}
 
 
