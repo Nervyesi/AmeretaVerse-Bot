@@ -198,15 +198,44 @@ def get_session(user_id: int) -> dict | None:
 
 # ── Auth check helper ─────────────────────────────────────────────────────────
 
-def require_guild_admin(user: dict, guild_id: int):
-    """Raise 403 if user is not admin of the requested guild."""
-    guilds = user.get('guilds', [])
-    for g in guilds:
-        if int(g['id']) == guild_id:
-            perms = int(g.get('permissions', 0))
-            if perms & 0x8:  # ADMINISTRATOR flag
-                return
-    raise HTTPException(status_code=403, detail='You are not an administrator of this server')
+def _get_bot_instance():
+    """Return the running discord.Bot instance, or raise 503."""
+    try:
+        from shared_bot import bot as _bot
+    except ImportError:
+        try:
+            from bot import bot as _bot
+        except ImportError:
+            raise HTTPException(status_code=503, detail='Bot module not available')
+    if not _bot or not _bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready')
+    return _bot
+
+
+def require_guild_admin(user: dict, server_id: int) -> dict:
+    """Raise HTTPException if user is not the guild owner or does not have Administrator.
+    Returns permission info dict on success.
+    Uses discord.py's in-memory guild/member cache — updated in real-time by Discord gateway."""
+    user_id = int(user.get('user_id') or user.get('id') or 0)
+    if not user_id:
+        raise HTTPException(status_code=401, detail='Not authenticated')
+
+    bot_instance = _get_bot_instance()
+    guild = bot_instance.get_guild(int(server_id))
+    if not guild:
+        raise HTTPException(status_code=404, detail='Bot is not in this guild')
+
+    is_owner = (str(guild.owner_id) == str(user_id))
+
+    member = guild.get_member(user_id)
+    is_admin = bool(member and member.guild_permissions.administrator)
+    has_access = is_owner or is_admin
+
+    if not has_access:
+        print(f'[security] DENIED: user_id={user_id} attempted access to guild={server_id} — not owner, not admin')
+        raise HTTPException(status_code=403, detail='You need the Administrator permission (or be the server owner) to access this server\'s dashboard.')
+
+    return {'is_owner': is_owner, 'is_admin': is_admin, 'has_access': True}
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 #  AUTH ENDPOINTS
@@ -272,28 +301,33 @@ async def auth_me(user: dict = Depends(get_current_user)):
 
 @app.get('/api/servers')
 async def list_servers(user: dict = Depends(get_current_user)):
-    """
-    Return servers where:
-    - user has Administrator permission AND
-    - the bot is present (bot.get_guild returns non-None)
-    """
+    """Return servers where the bot is present AND the user is the guild owner or has Administrator."""
+    bot_instance = _get_bot_instance()
+    user_id = int(user.get('user_id') or user.get('id') or 0)
     result = []
-    for g in user.get('guilds', []):
-        guild_id = int(g['id'])
-        guild = bot.get_guild(guild_id)
-        if guild is None:
+    for guild in bot_instance.guilds:
+        is_owner = (str(guild.owner_id) == str(user_id))
+        icon_url = str(guild.icon.url) if guild.icon else None
+        if is_owner:
+            result.append({
+                'id':         str(guild.id),
+                'name':       guild.name,
+                'icon':       icon_url,
+                'members':    guild.member_count,
+                'is_premium': guild.id in PREMIUM_GUILD_IDS,
+                'role':       'owner',
+            })
             continue
-        icon_url = (
-            f'{DISCORD_CDN}/icons/{guild_id}/{guild.icon.key}.png'
-            if guild.icon else None
-        )
-        result.append({
-            'id':         str(guild_id),
-            'name':       guild.name,
-            'icon':       icon_url,
-            'members':    guild.member_count,
-            'is_premium': guild_id in PREMIUM_GUILD_IDS,
-        })
+        member = guild.get_member(user_id)
+        if member and member.guild_permissions.administrator:
+            result.append({
+                'id':         str(guild.id),
+                'name':       guild.name,
+                'icon':       icon_url,
+                'members':    guild.member_count,
+                'is_premium': guild.id in PREMIUM_GUILD_IDS,
+                'role':       'admin',
+            })
     return result
 
 
