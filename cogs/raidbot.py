@@ -10,6 +10,8 @@ Flow:
   5. Flagged users have points deducted; verification log updated.
 """
 
+import io
+import csv
 import json
 import asyncio
 import traceback
@@ -723,7 +725,7 @@ class RaidJoinButton(
             tweet_url = raid.get('tweet_url', '')
             await interaction.response.send_message(
                 content=(
-                    f'🐦 **Tweet:** {tweet_url}\n\n'
+                    f'🐦 **Tweet:** <{tweet_url}>\n\n'
                     '**Complete the tasks on X, then toggle them below and click ✅ Confirm.**'
                 ),
                 view=view,
@@ -839,9 +841,11 @@ class RaidsCog(commands.Cog, name='Raids'):
     def __init__(self, bot):
         self.bot = bot
         self.daily_verification_check.start()
+        self.hourly_auto_end_task.start()
 
     def cog_unload(self):
         self.daily_verification_check.cancel()
+        self.hourly_auto_end_task.cancel()
 
     # ── /raid command group ───────────────────────────────────────────────────
 
@@ -874,6 +878,84 @@ class RaidsCog(commands.Cog, name='Raids'):
             return
 
         await interaction.response.send_modal(RaidPostModal(self.bot))
+
+    @app_commands.command(name='raiders', description='Admin: export raid participants as CSV.')
+    @app_commands.describe(raid='Raid display number (e.g. 7 or 0007) or full tweet URL')
+    async def raiders_cmd(self, interaction: discord.Interaction, raid: str):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message('⚠️ Admin only.', ephemeral=True)
+            return
+
+        guild_id = interaction.guild_id or 0
+        target   = raid.strip().lstrip('#')
+        resolved: dict | None = None
+
+        with get_connection() as conn:
+            # Try display_number first
+            try:
+                num = int(target)
+                row = conn.execute(
+                    "SELECT * FROM raids WHERE guild_id=? AND display_number=? LIMIT 1",
+                    (guild_id, num),
+                ).fetchone()
+                if row:
+                    resolved = dict(row)
+            except (ValueError, TypeError):
+                pass
+
+            # Try tweet URL / tweet_id
+            if not resolved:
+                tweet_id = extract_tweet_id(target)
+                if tweet_id:
+                    row = conn.execute(
+                        "SELECT * FROM raids WHERE guild_id=? AND tweet_id=? "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (guild_id, tweet_id),
+                    ).fetchone()
+                    if row:
+                        resolved = dict(row)
+
+        if not resolved:
+            await interaction.response.send_message(
+                f'⚠️ Raid not found: `{raid}`. Use display number (e.g. `7`) or full tweet URL.',
+                ephemeral=True,
+            )
+            return
+
+        raid_id     = resolved['raid_id']
+        display_num = str(resolved.get('display_number', raid_id)).zfill(4)
+
+        await interaction.response.defer(ephemeral=True)
+
+        csv_rows = _build_raiders_csv_rows(guild_id, raid_id)
+        if not csv_rows:
+            await interaction.followup.send(
+                f'📭 No participants found for Raid #{display_num}.', ephemeral=True
+            )
+            return
+
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=[
+            'discord_id', 'discord_username', 'x_handle',
+            'like_claimed', 'comment_claimed', 'retweet_claimed',
+            'like_verified', 'comment_verified', 'retweet_verified',
+            'points_earned', 'verification_status', 'flagged', 'submitted_at',
+        ])
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+        csv_bytes = buf.getvalue().encode('utf-8-sig')  # BOM for Excel/Sheets
+        ts        = datetime.now().strftime('%Y%m%d_%H%M')
+        filename  = f'raid_{display_num}_participants_{ts}.csv'
+
+        await interaction.followup.send(
+            content=(
+                f'✅ **Raid #{display_num}** — {len(csv_rows)} participants exported.\n'
+                'Open in Google Sheets (File → Import → Upload) or Excel.'
+            ),
+            file=discord.File(io.BytesIO(csv_bytes), filename=filename),
+            ephemeral=True,
+        )
 
     @raid_group.command(name='leaderboard', description='Top raiders in this server')
     async def raid_leaderboard(self, interaction: discord.Interaction):
@@ -1258,6 +1340,25 @@ class RaidsCog(commands.Cog, name='Raids'):
     async def before_daily_check(self):
         await self.bot.wait_until_ready()
 
+    # ── Hourly auto-end ────────────────────────────────────────────────────────
+
+    @tasks.loop(hours=1)
+    async def hourly_auto_end_task(self):
+        """Sweep for raids older than 48h and mark them ended. Keeps Active Raids list clean."""
+        with get_connection() as conn:
+            result = conn.execute(
+                "UPDATE raids SET status='ended', ended_reason='auto_48h' "
+                "WHERE status='active' AND posted_at IS NOT NULL "
+                "AND datetime(posted_at) < datetime('now', '-48 hours')"
+            )
+            count = result.rowcount
+        if count:
+            print(f'[raid] hourly_auto_end: closed {count} raid(s) older than 48h')
+
+    @hourly_auto_end_task.before_loop
+    async def before_hourly_auto_end(self):
+        await self.bot.wait_until_ready()
+
     async def _verify_participation(self, row: dict) -> str:
         """Verify one participation row. Returns 'flagged', 'verified', 'inconclusive', or 'skipped'."""
         from cogs._twitter import check_comment as tw_cc, check_retweet as tw_cr
@@ -1380,6 +1481,79 @@ class RaidsCog(commands.Cog, name='Raids'):
             )
         print(f'[raid] verified: user {row["user_id"]} in raid {row["raid_id"]}')
         return 'verified'
+
+
+def _build_raiders_csv_rows(guild_id: int, raid_id: int) -> list:
+    """Return list of dicts for CSV export: one row per raid participant."""
+    rows = []
+    with get_connection() as conn:
+        parts = conn.execute(
+            """SELECT p.*, u.username, u.x_username
+               FROM raid_participation p
+               LEFT JOIN users u ON u.user_id = p.user_id
+               WHERE p.guild_id=? AND p.raid_id=?
+               ORDER BY p.created_at ASC""",
+            (guild_id, raid_id),
+        ).fetchall()
+
+        for p in parts:
+            p = dict(p)
+            try:
+                claimed = json.loads(p.get('tasks_claimed') or '{}')
+            except Exception:
+                claimed = {}
+            if not isinstance(claimed, dict):
+                claimed = {}
+
+            verif_rows = conn.execute(
+                """SELECT task, verified FROM raid_verification_log
+                   WHERE guild_id=? AND raid_id=? AND user_id=?
+                   ORDER BY checked_at DESC""",
+                (guild_id, raid_id, p['user_id']),
+            ).fetchall()
+
+            verif_map: dict = {}
+            for v in verif_rows:
+                if v['task'] not in verif_map:
+                    verif_map[v['task']] = v['verified']
+
+            def _verdict(task: str) -> str:
+                if not claimed.get(task):
+                    return ''
+                val = verif_map.get(task)
+                if val == 1:  return 'verified'
+                if val == 0:  return 'failed'
+                if val == -1: return 'inconclusive'
+                return 'pending'
+
+            verdicts = [_verdict(t) for t in ('like', 'comment', 'retweet') if claimed.get(t)]
+            if not verdicts:
+                overall = 'pending'
+            elif all(v == 'verified' for v in verdicts):
+                overall = 'verified'
+            elif any(v == 'failed' for v in verdicts):
+                overall = 'partial' if any(v == 'verified' for v in verdicts) else 'failed'
+            elif any(v == 'inconclusive' for v in verdicts):
+                overall = 'inconclusive'
+            else:
+                overall = 'pending'
+
+            rows.append({
+                'discord_id':          p['user_id'],
+                'discord_username':    p.get('username') or '',
+                'x_handle':            p.get('x_username') or '',
+                'like_claimed':        'yes' if claimed.get('like')    else '',
+                'comment_claimed':     'yes' if claimed.get('comment') else '',
+                'retweet_claimed':     'yes' if claimed.get('retweet') else '',
+                'like_verified':       _verdict('like'),
+                'comment_verified':    _verdict('comment'),
+                'retweet_verified':    _verdict('retweet'),
+                'points_earned':       p.get('points_earned') or 0,
+                'verification_status': overall,
+                'flagged':             'yes' if p.get('verification_status') == 'flagged' else '',
+                'submitted_at':        p.get('created_at') or '',
+            })
+    return rows
 
 
 async def setup(bot):
