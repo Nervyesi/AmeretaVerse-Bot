@@ -2211,6 +2211,78 @@ async def admin_test_twitter(user: dict = Depends(get_current_user)):
         return {'status': 'error', 'error': f'{type(e).__name__}: {e}'}
 
 
+# ── Engage admin endpoints ────────────────────────────────────────────────────
+
+_AMERETAVERSE_GID = 1199707792706117642
+
+
+@app.get('/api/servers/{server_id}/engage/pools')
+async def engage_pools_get(server_id: int, user: dict = Depends(get_current_user)):
+    require_guild_admin(user, server_id)
+    import json as _json
+    from database import list_engage_pools, ensure_default_pool
+    pools = list_engage_pools(server_id)
+    if not pools and server_id != _AMERETAVERSE_GID:
+        ensure_default_pool(server_id)
+        pools = list_engage_pools(server_id)
+    for p in pools:
+        try:
+            p['allowed_role_ids'] = _json.loads(p.get('allowed_role_ids') or '[]')
+        except Exception:
+            p['allowed_role_ids'] = []
+    return {
+        'guild_id':      str(server_id),
+        'is_multi_pool': server_id == _AMERETAVERSE_GID,
+        'pools':         pools,
+    }
+
+
+@app.put('/api/servers/{server_id}/engage/pools/{pool_id}')
+async def engage_pool_update(
+    server_id: int, pool_id: int, body: dict,
+    user: dict = Depends(get_current_user),
+):
+    require_guild_admin(user, server_id)
+    import json as _json
+    from database import get_engage_pool_by_id, update_engage_pool
+    pool = get_engage_pool_by_id(pool_id)
+    if not pool or str(pool['guild_id']) != str(server_id):
+        raise HTTPException(status_code=404, detail='Pool not found in this guild')
+
+    allowed = {
+        'enabled', 'channel_id', 'allowed_role_ids',
+        'submit_cost', 'ttl_hours', 'auto_reset_daily',
+        'min_followers', 'daily_submission_limit',
+        'point_ratio_like', 'point_ratio_comment', 'point_ratio_retweet',
+        'total_points_per_engage', 'allow_like', 'allow_comment', 'allow_retweet',
+        'embed_color', 'embed_thumbnail_url', 'embed_footer_text', 'embed_footer_icon_url',
+        'guide_title', 'guide_description', 'guide_image_url',
+    }
+    payload = {k: v for k, v in body.items() if k in allowed}
+
+    if 'allowed_role_ids' in payload:
+        ids = payload['allowed_role_ids']
+        if not isinstance(ids, list):
+            ids = []
+        payload['allowed_role_ids'] = _json.dumps([str(x).strip() for x in ids if str(x).strip()])
+
+    if 'ttl_hours' in payload:
+        v = payload['ttl_hours']
+        payload['ttl_hours'] = None if v in ('', None, 0, '0') else int(v)
+
+    if 'channel_id' in payload:
+        v = payload['channel_id']
+        payload['channel_id'] = None if v in ('', None) else str(v).lstrip('#').strip()
+
+    update_engage_pool(pool_id, **payload)
+    updated = get_engage_pool_by_id(pool_id)
+    try:
+        updated['allowed_role_ids'] = _json.loads(updated.get('allowed_role_ids') or '[]')
+    except Exception:
+        updated['allowed_role_ids'] = []
+    return updated
+
+
 # ── Health check ───────────────────────────────────────────────────────────────
 
 @app.get('/health')
