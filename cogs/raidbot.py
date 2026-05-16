@@ -452,14 +452,68 @@ async def _live_verify_and_award(
         return
 
     if any_failed:
-        lines = []
+        raid_mode = raid.get('mode', 'partial')
+
+        if raid_mode == 'all':
+            # All-or-nothing: any failure means no points, no participation record
+            lines = []
+            for task in ('like', 'comment', 'retweet'):
+                if not claimed.get(task): continue
+                v = results.get(task, {}).get('verified')
+                icon, lbl = _task_emoji[task], _task_label[task]
+                if v is True:    lines.append(f'{icon} {lbl} — ✅ verified')
+                elif v is False: lines.append(f'{icon} {lbl} — ❌ not found on X')
+                else:            lines.append(f'{icon} {lbl} — ⚠️ inconclusive')
+
+            for task, r in results.items():
+                v = r.get('verified')
+                db_v = 1 if v is True else (0 if v is False else -1)
+                add_raid_verification_log(guild_id, raid_id, user_id, task,
+                                          True, db_v, 'live', error_text=r.get('reason'))
+            _clear_panel_state(user_id, raid_id)
+            print(f'[raid] live_verify FAILED (mode=all): user={user_id} raid={raid_id}')
+
+            embed = build_branded_embed(guild_id,
+                title='❌ Verification failed — no points awarded',
+                description=(
+                    'This raid requires ALL tasks to be verified. No points were credited.\n\n'
+                    '**Results:**\n' + '\n'.join(lines) +
+                    '\n\nCompleted the tasks but seeing this? X can take a few minutes to sync — '
+                    'try again shortly.\n\n'
+                    f'Raid #{display_num:04d}'
+                ),
+                cog_prefix='raid', use_thumbnail=True, use_image=False, use_footer=True,
+            )
+            await interaction.edit_original_response(content=None, embed=embed)
+            return
+
+        # mode='partial' — award points for each task that individually passed
+        earned = 0
+        lines  = []
+        effective_claimed = {}
         for task in ('like', 'comment', 'retweet'):
-            if not claimed.get(task): continue
-            v = results.get(task, {}).get('verified')
-            icon, label = _task_emoji[task], _task_label[task]
-            if v is True:    lines.append(f'{icon} {label} — ✅ verified')
-            elif v is False: lines.append(f'{icon} {label} — ❌ not found on X')
-            else:            lines.append(f'{icon} {label} — ⚠️ inconclusive')
+            if not claimed.get(task):
+                effective_claimed[task] = False
+                continue
+            v   = results.get(task, {}).get('verified')
+            pts = total * nr[task] // 100
+            if v is True:
+                earned += pts
+                effective_claimed[task] = True
+                lines.append(f'{_task_emoji[task]} {_task_label[task]} — ✅ {pts} pts')
+            elif v is False:
+                effective_claimed[task] = False
+                lines.append(f'{_task_emoji[task]} {_task_label[task]} — ❌ not found on X (0 pts)')
+            else:
+                effective_claimed[task] = False
+                lines.append(f'{_task_emoji[task]} {_task_label[task]} — ⚠️ inconclusive (0 pts)')
+
+        if earned > 0:
+            create_raid_participation(guild_id, raid_id, user_id, json.dumps(effective_claimed), earned)
+            upsert_raid_user_points(guild_id, user_id, earned, delta_raids=1)
+            with get_connection() as conn:
+                conn.execute("UPDATE users SET total_points=total_points+? WHERE user_id=?",
+                             (earned, user_id))
 
         for task, r in results.items():
             v = r.get('verified')
@@ -467,13 +521,14 @@ async def _live_verify_and_award(
             add_raid_verification_log(guild_id, raid_id, user_id, task,
                                       True, db_v, 'live', error_text=r.get('reason'))
         _clear_panel_state(user_id, raid_id)
-        print(f'[raid] live_verify FAILED: user={user_id} raid={raid_id}')
+        print(f'[raid] live_verify PARTIAL: user={user_id} raid={raid_id} earned={earned}')
 
+        title    = f'⚠️ Partial — {earned} pts earned' if earned > 0 else '❌ Verification failed — no points awarded'
+        desc_top = 'Some tasks were verified, others were not.' if earned > 0 else 'None of your tasks could be verified.'
         embed = build_branded_embed(guild_id,
-            title='❌ Verification failed — no points awarded',
+            title=title,
             description=(
-                'Your tasks could not be verified on X. No points were credited.\n\n'
-                '**Results:**\n' + '\n'.join(lines) +
+                f'{desc_top}\n\n**Results:**\n' + '\n'.join(lines) +
                 '\n\nCompleted the tasks but seeing this? X can take a few minutes to sync — '
                 'try again shortly.\n\n'
                 f'Raid #{display_num:04d}'
