@@ -382,6 +382,10 @@ def init_db():
             "ALTER TABLE raid_settings ADD COLUMN raid_guide_image_url TEXT DEFAULT ''",
             "ALTER TABLE raid_settings ADD COLUMN raid_guide_color TEXT DEFAULT ''",
             "ALTER TABLE raid_settings ADD COLUMN raid_guide_footer_text TEXT DEFAULT ''",
+            # engage_pools new columns
+            "ALTER TABLE engage_pools ADD COLUMN allowed_role_ids TEXT DEFAULT '[]'",
+            "ALTER TABLE engage_pools ADD COLUMN auto_reset_daily INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE engage_pools ADD COLUMN embed_footer_icon_url TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -1602,11 +1606,11 @@ def list_engage_pools(guild_id: str) -> list:
 
 def update_engage_pool(pool_id: int, **kwargs) -> bool:
     allowed = {
-        'enabled', 'channel_id', 'submit_cost', 'ttl_hours', 'min_followers',
-        'daily_submission_limit', 'point_ratio_like', 'point_ratio_comment',
-        'point_ratio_retweet', 'total_points_per_engage',
-        'allow_like', 'allow_comment', 'allow_retweet',
-        'embed_color', 'embed_thumbnail_url', 'embed_footer_text',
+        'enabled', 'channel_id', 'allowed_role_ids', 'submit_cost', 'ttl_hours',
+        'auto_reset_daily', 'min_followers', 'daily_submission_limit',
+        'point_ratio_like', 'point_ratio_comment', 'point_ratio_retweet',
+        'total_points_per_engage', 'allow_like', 'allow_comment', 'allow_retweet',
+        'embed_color', 'embed_thumbnail_url', 'embed_footer_text', 'embed_footer_icon_url',
         'guide_title', 'guide_description', 'guide_image_url', 'display_name',
     }
     sets = {k: v for k, v in kwargs.items() if k in allowed}
@@ -1622,10 +1626,12 @@ def update_engage_pool(pool_id: int, **kwargs) -> bool:
 def create_engage_submission(
     guild_id: str, pool_id: int, submitter_user_id: str,
     tweet_url: str, tweet_id: str, submitter_x_username: str,
-    cost_paid: int, ttl_hours: int,
+    cost_paid: int, ttl_hours,
 ) -> dict:
     import datetime as _dt
-    expires_at = (_dt.datetime.utcnow() + _dt.timedelta(hours=ttl_hours)).isoformat()
+    expires_at = None
+    if ttl_hours is not None:
+        expires_at = (_dt.datetime.utcnow() + _dt.timedelta(hours=int(ttl_hours))).isoformat()
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO engage_submissions
@@ -1802,6 +1808,65 @@ def count_pending_engage_actions(pool_id: int) -> int:
             (pool_id,)
         ).fetchone()
     return row[0] if row else 0
+
+
+# ── Engage module extra helpers ────────────────────────────────────────────────
+
+_ENGAGE_AMERETAVERSE_GID = '1199707792706117642'
+
+
+def ensure_default_pool(guild_id) -> dict:
+    """For non-AmeretaVerse guilds: ensure exactly one 'default' pool row exists. Returns it."""
+    gid = str(guild_id)
+    if gid == _ENGAGE_AMERETAVERSE_GID:
+        raise ValueError(
+            'AmeretaVerse main uses community/creator pools — '
+            'do not call ensure_default_pool for it.'
+        )
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM engage_pools WHERE guild_id=? AND name='default'", (gid,)
+        ).fetchone()
+        if row:
+            return dict(row)
+        conn.execute(
+            "INSERT INTO engage_pools "
+            "(guild_id, name, display_name, pool_type, min_followers) "
+            "VALUES (?,'default','Engage','default',100)",
+            (gid,),
+        )
+        row = conn.execute(
+            "SELECT * FROM engage_pools WHERE guild_id=? AND name='default'", (gid,)
+        ).fetchone()
+        return dict(row)
+
+
+# Alias names used in cogs/engage.py (spec-required names)
+
+def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_id=None) -> list:
+    """Alias for list_active_submissions with spec-required name."""
+    return list_active_submissions(pool_id, limit=limit, exclude_user_id=exclude_user_id)
+
+
+def expire_old_engage_submissions() -> int:
+    """Alias for expire_old_submissions with spec-required name."""
+    return expire_old_submissions()
+
+
+def get_user_daily_engage_submissions(pool_id: int, user_id) -> int:
+    """Alias for get_user_daily_submission_count with spec-required name."""
+    return get_user_daily_submission_count(pool_id, str(user_id))
+
+
+def reset_engage_pool_daily(pool_id: int) -> int:
+    """Expire all active submissions in a pool (daily reset)."""
+    with get_connection() as conn:
+        c = conn.execute(
+            "UPDATE engage_submissions SET status='expired' "
+            "WHERE pool_id=? AND status='active'",
+            (pool_id,),
+        )
+    return c.rowcount
 
 
 if __name__ == '__main__':
