@@ -389,7 +389,7 @@ async def _live_verify_and_award(
 
     # Signal that verification is in progress (must respond to interaction immediately)
     await interaction.response.edit_message(
-        content='⏳ Verifying your tasks on X… (a few seconds)',
+        content='⏳ Verifying your tasks on X… (2-4 seconds)',
         embed=None, view=None,
     )
 
