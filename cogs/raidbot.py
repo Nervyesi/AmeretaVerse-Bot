@@ -720,8 +720,12 @@ class RaidJoinButton(
                 pass
             state = _get_panel_state(user_id, self.raid_id)
             view  = _build_personal_panel_view(self.raid_id, state, user_id, allowed_tasks)
+            tweet_url = raid.get('tweet_url', '')
             await interaction.response.send_message(
-                content='**Select the tasks you completed, then click ✅ Confirm.**',
+                content=(
+                    f'🐦 **Tweet:** {tweet_url}\n\n'
+                    '**Complete the tasks on X, then toggle them below and click ✅ Confirm.**'
+                ),
                 view=view,
                 ephemeral=True,
             )
@@ -932,27 +936,20 @@ class RaidsCog(commands.Cog, name='Raids'):
     @app_commands.command(name='setx', description='Link your X (Twitter) username to your profile')
     @app_commands.describe(username='Your X username without the @ symbol')
     async def setx(self, interaction: discord.Interaction, username: str):
-        username = username.lstrip('@').strip()
+        import re as _re
+        clean = username.strip().lstrip('@').strip()
+
+        if not _re.match(r'^[A-Za-z0-9_]{1,15}$', clean):
+            await interaction.response.send_message(
+                '⚠️ Invalid X username. Use letters, numbers, and underscores only (max 15 characters). '
+                'Do not include the `@` — the bot handles that automatically.',
+                ephemeral=True,
+            )
+            return
+
         now = datetime.now(timezone.utc)
 
-        with get_connection() as conn:
-            user = conn.execute(
-                "SELECT x_username, x_username_set_at FROM users WHERE user_id=?",
-                (interaction.user.id,),
-            ).fetchone()
-
-        if user and user['x_username'] and user['x_username_set_at']:
-            set_at = datetime.fromisoformat(user['x_username_set_at'])
-            if set_at.tzinfo is None:
-                set_at = set_at.replace(tzinfo=timezone.utc)
-            days_since = (now - set_at).days
-            if days_since < 7:
-                days_left = 7 - days_since
-                await interaction.response.send_message(
-                    f'⏳ You can change your X username in **{days_left} day{"s" if days_left != 1 else ""}**.',
-                    ephemeral=True,
-                )
-                return
+        # Cooldown disabled for testing — re-enable later if abuse seen
 
         with get_connection() as conn:
             conn.execute(
@@ -962,11 +959,13 @@ class RaidsCog(commands.Cog, name='Raids'):
             )
             conn.execute(
                 "UPDATE users SET x_username=?, x_username_set_at=? WHERE user_id=?",
-                (username, now.isoformat(), interaction.user.id),
+                (clean, now.isoformat(), interaction.user.id),
             )
 
         await interaction.response.send_message(
-            f'✅ X username set to **@{username}**.', ephemeral=True
+            f'✅ X account linked: **@{clean}**\n\n'
+            'The bot will check your Twitter activity against this username when you join raids or engage.',
+            ephemeral=True,
         )
 
     # ── Target resolution for manual check ───────────────────────────────────
