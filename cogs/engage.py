@@ -1,733 +1,611 @@
+"""
+engage.py — Per-guild, per-pool engage-for-engage system.
+
+Commands:
+  /engage    — Browse active submissions and engage with tweets to earn engage points
+  /submit    — Submit your tweet to the pool (costs engage points)
+  /engage-stats — Your engage point balance and activity
+  /engage-leaderboard — Top earners in this pool
+
+Architecture:
+  - Pool-scoped: all queries use pool_id, not just guild_id
+  - Channel-based pool resolution: each pool has its own Discord channel
+  - Live verification for LIVE_VERIFICATION_GUILD_IDS, adaptive daily check for others
+  - engage_points are completely separate from raid community points
+"""
+
+import json
+import asyncio
+import traceback
+import requests
+from datetime import datetime, timezone, time as dtime
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import json
-import re
-from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass, field
+
 from database import (
     get_connection,
-    get_config as _db_get_config,
-    set_config as _db_set_config,
-    get_all_config as _db_get_all_config,
+    get_user_x_username,
+    get_engage_pool_by_id,
+    get_engage_pool_by_channel,
+    list_engage_pools,
+    update_engage_pool,
+    create_engage_submission,
+    list_active_submissions,
+    expire_old_submissions,
+    get_user_daily_submission_count,
+    get_engage_action,
+    upsert_engage_action,
+    add_engage_verification_log,
+    upsert_engage_user_points,
+    get_engage_user_points,
+    get_engage_leaderboard,
+    sample_pending_engage_actions,
+    count_pending_engage_actions,
 )
-
-LOGO_URL = "https://i.imgur.com/FNE8Li0.png"
-ENGAGE_CHANNEL_NAME = "engage"
-CREATOR_ENGAGE_CHANNEL_NAME = "creator-engage"
-
-
-# ── pool context ───────────────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class PoolCtx:
-    is_creator: bool
-    channel_name: str
-    links_table: str
-    part_table: str
-    points_col: str
-    cfg_prefix: str
-    label: str
-
-
-USER_POOL = PoolCtx(
-    is_creator=False,
-    channel_name=ENGAGE_CHANNEL_NAME,
-    links_table="engage_links",
-    part_table="engage_participation",
-    points_col="engage_points",
-    cfg_prefix="engage",
-    label="Engage-for-Engage",
+from cogs._twitter import (
+    check_comment,
+    check_retweet,
+    extract_tweet_id,
+    normalize_username,
+    lookup_twitter_user_by_login,
 )
+from cogs._branding import build_branded_embed
+from cogs.raidbot import LIVE_VERIFICATION_GUILD_IDS
 
-CREATOR_POOL = PoolCtx(
-    is_creator=True,
-    channel_name=CREATOR_ENGAGE_CHANNEL_NAME,
-    links_table="creator_engage_links",
-    part_table="creator_engage_participation",
-    points_col="creator_engage_points",
-    cfg_prefix="creator_engage",
-    label="Creator Engage",
-)
+# ── Session state ───────────────────────────────────────────────────────────
+# Stores per-user engage session while browsing the slideshow
+# key: user_id → {pool_id, guild_id, queue: list[dict], index: int, selections: {sub_id: {like,comment,retweet}}}
+_sessions: dict[int, dict] = {}
 
 
-def get_pool(interaction: discord.Interaction) -> PoolCtx:
-    creator_role = discord.utils.get(interaction.user.roles, name="Creator")
-    return CREATOR_POOL if creator_role else USER_POOL
+def _get_session(user_id: int) -> dict | None:
+    return _sessions.get(user_id)
 
 
-# ── per-guild config helpers ───────────────────────────────────────────────────
-
-def get_cfg(guild_id: int, key: str, default: str = "0") -> str:
-    val = _db_get_config(guild_id, key)
-    return val if val is not None else default
+def _set_session(user_id: int, data: dict) -> None:
+    _sessions[user_id] = data
 
 
-def get_cfg_int(guild_id: int, key: str, default: int = 0) -> int:
-    return int(float(get_cfg(guild_id, key, str(default))))
+def _clear_session(user_id: int) -> None:
+    _sessions.pop(user_id, None)
 
 
-def get_cfg_float(guild_id: int, key: str, default: float = 0.0) -> float:
-    return float(get_cfg(guild_id, key, str(default)))
+# ── View builders ──────────────────────────────────────────────────────────
 
+def _build_engage_panel_view(user_id: int, session: dict) -> discord.ui.View:
+    idx      = session['index']
+    queue    = session['queue']
+    sub      = queue[idx]
+    sub_id   = sub['submission_id']
+    pool     = session['pool']
+    sels     = session['selections'].get(sub_id, {'like': False, 'comment': False, 'retweet': False})
+    total    = len(queue)
+    view     = discord.ui.View(timeout=600)
 
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-def extract_twitter_handle(url: str) -> str:
-    match = re.search(r"https?://(?:x\.com|twitter\.com)/(\w+)/status/", url)
-    return match.group(1) if match else "unknown"
-
-
-def validate_tweet_link(url: str) -> bool:
-    return bool(re.match(r"https?://(x\.com|twitter\.com)/\w+/status/\d+", url))
-
-
-def calc_engage_points(done: set, cfg_prefix: str = "engage", guild_id: int = 0) -> int:
-    weights = {
-        "like":    get_cfg_float(guild_id, f"{cfg_prefix}_weight_like",    12.5),
-        "comment": get_cfg_float(guild_id, f"{cfg_prefix}_weight_comment", 40.0),
-        "retweet": get_cfg_float(guild_id, f"{cfg_prefix}_weight_retweet", 47.5),
-    }
-    total = get_cfg_int(guild_id, f"{cfg_prefix}_points_per_link", 10)
-    total_w = sum(weights.values())
-    if not total_w or not done:
-        return 0
-    done_w = sum(weights.get(t, 0) for t in done)
-    return round(total * done_w / total_w)
-
-
-def upsert_user(user_id: int, username: str):
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO users (user_id, username) VALUES (?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
-            (user_id, username),
-        )
-
-
-def get_available_links(user_id: int, limit: int, ctx: PoolCtx) -> list:
-    now = datetime.now(timezone.utc).isoformat()
-    lt = ctx.links_table
-    pt = ctx.part_table
-
-    with get_connection() as conn:
-        submitted_links = conn.execute(
-            f"""
-            SELECT el.link_id, el.tweet_link, el.user_id AS owner_id, 'submit' AS source
-            FROM {lt} el
-            WHERE el.active = 1
-              AND el.expires_at > ?
-              AND el.user_id != ?
-              AND el.link_id NOT IN (
-                  SELECT ep.link_id FROM {pt} ep WHERE ep.user_id = ?
-              )
-            ORDER BY RANDOM()
-            LIMIT ?
-            """,
-            (now, user_id, user_id, limit),
-        ).fetchall()
-
-        remaining = limit - len(submitted_links)
-        raid_links = []
-        if not ctx.is_creator and remaining > 0:
-            raid_links = conn.execute(
-                """
-                SELECT r.raid_id AS link_id, r.tweet_link, r.created_by AS owner_id, 'raid' AS source
-                FROM raids r
-                WHERE r.active = 1
-                  AND r.raid_id NOT IN (
-                      SELECT rp.raid_id FROM raid_participation rp WHERE rp.user_id = ?
-                  )
-                  AND r.tweet_link NOT IN (
-                      SELECT el.tweet_link FROM engage_links el
-                      WHERE el.link_id IN (
-                          SELECT ep.link_id FROM engage_participation ep WHERE ep.user_id = ?
-                      )
-                  )
-                ORDER BY RANDOM()
-                LIMIT ?
-                """,
-                (user_id, user_id, remaining),
-            ).fetchall()
-
-    return list(submitted_links) + list(raid_links)
-
-
-# ── session state ──────────────────────────────────────────────────────────────
-
-@dataclass
-class EngageSession:
-    links: list
-    ctx: PoolCtx
-    guild_id: int = 0
-    index: int = 0
-    task_state: dict = field(default_factory=dict)
-    submitted: dict = field(default_factory=dict)
-    skipped: set = field(default_factory=set)
-
-    def current_link(self):
-        return self.links[self.index] if self.index < len(self.links) else None
-
-    def is_done(self) -> bool:
-        return self.index >= len(self.links)
-
-    def total_points(self) -> int:
-        return sum(self.submitted.values())
-
-    def toggle_task(self, task: str):
-        s = self.task_state.setdefault(self.index, set())
-        s.discard(task) if task in s else s.add(task)
-
-    def current_tasks(self) -> set:
-        return self.task_state.get(self.index, set())
-
-
-active_sessions: dict[int, EngageSession] = {}
-
-
-# ── step 2: list view ─────────────────────────────────────────────────────────
-
-class EngageListView(discord.ui.View):
-    def __init__(self, user_id: int, session: EngageSession):
-        super().__init__(timeout=300)
-        self.user_id = user_id
-        self.session = session
-
-    @discord.ui.button(label="Start Engage ⚡", style=discord.ButtonStyle.success, row=0)
-    async def start_engage(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ This is not your panel.", ephemeral=True)
-            return
-        self.session.index = 0
-        view = EngageTweetView(self.user_id, self.session)
-        await interaction.response.edit_message(embed=view.build_embed(), view=view)
-
-    async def on_timeout(self):
-        active_sessions.pop(self.user_id, None)
-
-
-# ── steps 3-5: per-tweet view ─────────────────────────────────────────────────
-
-class EngageTweetView(discord.ui.View):
-    def __init__(self, user_id: int, session: EngageSession):
-        super().__init__(timeout=600)
-        self.user_id = user_id
-        self.session = session
-        self._rebuild()
-
-    def _rebuild(self):
-        self.clear_items()
-        tasks = self.session.current_tasks()
-        index = self.session.index
-
-        for task, label, emoji in [
-            ("like",    "Like",    "👍"),
-            ("comment", "Comment", "💬"),
-            ("retweet", "Retweet", "🔁"),
-        ]:
-            active = task in tasks
-            btn = discord.ui.Button(
-                label=f"{emoji} {label}",
-                style=discord.ButtonStyle.success if active else discord.ButtonStyle.secondary,
-                row=0,
-            )
-            btn.callback = self._make_toggle(task)
-            self.add_item(btn)
-
-        prev_btn = discord.ui.Button(
-            label="◀ Previous",
-            style=discord.ButtonStyle.primary,
-            disabled=(index == 0),
-            row=1,
-        )
-        prev_btn.callback = self._on_prev
-        self.add_item(prev_btn)
-
-        next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.primary, row=1)
-        next_btn.callback = self._on_next
-        self.add_item(next_btn)
-
-        submit_btn = discord.ui.Button(label="Submit ✅", style=discord.ButtonStyle.success, row=1)
-        submit_btn.callback = self._on_submit
-        self.add_item(submit_btn)
-
-    def build_embed(self) -> discord.Embed:
-        session = self.session
-        if session.is_done():
-            return self._summary_embed()
-
-        index = session.index
-        link = session.current_link()
-        total = len(session.links)
-        handle = extract_twitter_handle(link["tweet_link"])
-        tasks = session.current_tasks()
-
-        check = {t: "✅" if t in tasks else "⬜" for t in ("like", "comment", "retweet")}
-        pts = calc_engage_points(tasks, session.ctx.cfg_prefix, session.guild_id)
-
-        already = index in session.submitted
-        status_note = f"\n✔ Submitted (+{session.submitted[index]} pts)" if already else ""
-
-        embed = discord.Embed(title=f"Tweet {index + 1} of {total} ⚡", color=0x94730D)
-        embed.add_field(
-            name=f"@{handle}",
-            value=f"[Open Tweet]({link['tweet_link']})\n`{link['tweet_link']}`",
-            inline=False,
-        )
-        embed.add_field(
-            name="Tasks",
-            value=f"{check['like']} Like\n{check['comment']} Comment\n{check['retweet']} Retweet",
-            inline=True,
-        )
-        embed.add_field(name="Points Preview", value=f"`+{pts} pts`{status_note}", inline=True)
-        embed.set_footer(
-            text=f"AmeretaVerse • {session.ctx.label} | Toggle tasks → Submit  |  Next to skip"
-        )
-        return embed
-
-    def _summary_embed(self) -> discord.Embed:
-        session = self.session
-        total_pts = session.total_points()
-        lines = []
-        for i, link in enumerate(session.links):
-            handle = extract_twitter_handle(link["tweet_link"])
-            if i in session.submitted:
-                lines.append(f"✅ @{handle} — +{session.submitted[i]} pts")
-            elif i in session.skipped:
-                lines.append(f"⏭ @{handle} — skipped")
-            else:
-                lines.append(f"⬜ @{handle} — not reached")
-
-        embed = discord.Embed(
-            title="engage session complete. 🔥",
-            description="\n".join(lines),
-            color=0x94730D,
-        )
-        embed.add_field(name="Engaged",      value=f"`{len(session.submitted)}`", inline=True)
-        embed.add_field(name="Skipped",      value=f"`{len(session.skipped)}`",   inline=True)
-        embed.add_field(name="Total Points", value=f"`+{total_pts} pts`",         inline=True)
-        embed.set_thumbnail(url=LOGO_URL)
-        embed.set_footer(text=f"AmeretaVerse • {session.ctx.label} | keep grinding, habibi 💰")
-        return embed
-
-    def _make_toggle(self, task: str):
-        async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.user_id:
-                await interaction.response.send_message("❌ Not your panel.", ephemeral=True)
+    def _toggle_cb(task: str):
+        async def cb(inter: discord.Interaction):
+            if inter.user.id != user_id:
+                await inter.response.send_message('❌ Not your session.', ephemeral=True)
                 return
-            self.session.toggle_task(task)
-            self._rebuild()
-            await interaction.response.edit_message(embed=self.build_embed(), view=self)
-        return callback
+            s = _sessions.get(user_id)
+            if not s:
+                await inter.response.send_message('❌ Session expired.', ephemeral=True)
+                return
+            curr_sub_id = s['queue'][s['index']]['submission_id']
+            sels_now = s['selections'].setdefault(curr_sub_id, {'like': False, 'comment': False, 'retweet': False})
+            sels_now[task] = not sels_now[task]
+            new_view = _build_engage_panel_view(user_id, s)
+            embed    = _build_engage_embed(s)
+            await inter.response.edit_message(embed=embed, view=new_view)
+        return cb
 
-    async def _on_prev(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Not your panel.", ephemeral=True)
+    # Task toggle buttons (row 0)
+    task_cfg = [
+        ('like',    '❤️', 'Like',    pool.get('allow_like', 1)),
+        ('comment', '💬', 'Comment', pool.get('allow_comment', 1)),
+        ('retweet', '🔁', 'Retweet', pool.get('allow_retweet', 1)),
+    ]
+    for task, emoji, label, allowed in task_cfg:
+        if not allowed:
+            continue
+        is_on = sels.get(task, False)
+        btn = discord.ui.Button(
+            style=discord.ButtonStyle.success if is_on else discord.ButtonStyle.secondary,
+            label=label, emoji=emoji, row=0,
+            custom_id=f'engage:toggle:{task}:{user_id}:{sub_id}',
+        )
+        btn.callback = _toggle_cb(task)
+        view.add_item(btn)
+
+    # Navigation + submit (row 1)
+    async def prev_cb(inter: discord.Interaction):
+        if inter.user.id != user_id:
+            await inter.response.send_message('❌ Not your session.', ephemeral=True)
             return
-        if self.session.index > 0:
-            self.session.index -= 1
-        self._rebuild()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    async def _on_next(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Not your panel.", ephemeral=True)
+        s = _sessions.get(user_id)
+        if not s or s['index'] <= 0:
+            await inter.response.defer()
             return
-        self.session.skipped.add(self.session.index)
-        self.session.index += 1
-        if self.session.is_done():
-            active_sessions.pop(self.user_id, None)
-            self.stop()
-            await interaction.response.edit_message(embed=self.build_embed(), view=None)
-        else:
-            self._rebuild()
-            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        s['index'] -= 1
+        new_view = _build_engage_panel_view(user_id, s)
+        embed    = _build_engage_embed(s)
+        await inter.response.edit_message(embed=embed, view=new_view)
 
-    async def _on_submit(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Not your panel.", ephemeral=True)
+    async def next_cb(inter: discord.Interaction):
+        if inter.user.id != user_id:
+            await inter.response.send_message('❌ Not your session.', ephemeral=True)
             return
-
-        tasks = self.session.current_tasks()
-        if not tasks:
-            await interaction.response.send_message(
-                "⚠️ Toggle at least one task before submitting, habibi.", ephemeral=True
-            )
+        s = _sessions.get(user_id)
+        if not s:
+            await inter.response.send_message('❌ Session expired.', ephemeral=True)
             return
+        if s['index'] >= len(s['queue']) - 1:
+            await _finalize_session(inter, user_id)
+            return
+        s['index'] += 1
+        new_view = _build_engage_panel_view(user_id, s)
+        embed    = _build_engage_embed(s)
+        await inter.response.edit_message(embed=embed, view=new_view)
 
-        ctx = self.session.ctx
-        index = self.session.index
-        link = self.session.current_link()
-        points = calc_engage_points(tasks, ctx.cfg_prefix, interaction.guild_id)
-        user_id = interaction.user.id
-        pt = ctx.part_table
-        pc = ctx.points_col
+    async def submit_cb(inter: discord.Interaction):
+        if inter.user.id != user_id:
+            await inter.response.send_message('❌ Not your session.', ephemeral=True)
+            return
+        s = _sessions.get(user_id)
+        if not s:
+            await inter.response.send_message('❌ Session expired.', ephemeral=True)
+            return
+        curr_sub_id = s['queue'][s['index']]['submission_id']
+        sels_curr   = s['selections'].get(curr_sub_id, {})
+        if not any(sels_curr.values()):
+            await inter.response.send_message('⚠️ Select at least one task before submitting.', ephemeral=True)
+            return
+        if s['index'] >= len(s['queue']) - 1:
+            await _finalize_session(inter, user_id)
+            return
+        s['index'] += 1
+        new_view = _build_engage_panel_view(user_id, s)
+        embed    = _build_engage_embed(s)
+        await inter.response.edit_message(embed=embed, view=new_view)
 
-        upsert_user(user_id, str(interaction.user))
-        with get_connection() as conn:
-            existing = conn.execute(
-                f"SELECT id, points_earned FROM {pt} WHERE link_id=? AND user_id=?",
-                (link["link_id"], user_id),
-            ).fetchone()
+    prev_btn = discord.ui.Button(
+        style=discord.ButtonStyle.secondary, label='◀️ Prev',
+        disabled=(idx == 0), row=1,
+        custom_id=f'engage:prev:{user_id}',
+    )
+    prev_btn.callback = prev_cb
 
-            if existing:
-                old_pts = existing["points_earned"]
-                conn.execute(
-                    f"UPDATE {pt} SET tasks_completed=?, points_earned=? "
-                    f"WHERE link_id=? AND user_id=?",
-                    (json.dumps(sorted(tasks)), points, link["link_id"], user_id),
-                )
-                conn.execute(
-                    f"UPDATE users SET {pc} = {pc} + ? WHERE user_id=?",
-                    (points - old_pts, user_id),
-                )
-            else:
-                conn.execute(
-                    f"INSERT INTO {pt} (link_id, user_id, tasks_completed, points_earned) "
-                    f"VALUES (?,?,?,?)",
-                    (link["link_id"], user_id, json.dumps(sorted(tasks)), points),
-                )
-                conn.execute(
-                    f"UPDATE users SET {pc} = {pc} + ? WHERE user_id=?",
-                    (points, user_id),
-                )
+    next_btn = discord.ui.Button(
+        style=discord.ButtonStyle.secondary, label='Next ▶️',
+        row=1, custom_id=f'engage:next:{user_id}',
+    )
+    next_btn.callback = next_cb
 
-        self.session.submitted[index] = points
-        self.session.skipped.discard(index)
-        self.session.index += 1
+    submit_btn = discord.ui.Button(
+        style=discord.ButtonStyle.primary,
+        label='✅ Done & Next' if idx < total - 1 else '✅ Finish',
+        row=1, custom_id=f'engage:submit:{user_id}',
+    )
+    submit_btn.callback = submit_cb
 
-        if self.session.is_done():
-            active_sessions.pop(self.user_id, None)
-            self.stop()
-            await interaction.response.edit_message(embed=self.build_embed(), view=None)
-        else:
-            self._rebuild()
-            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+    finish_btn = discord.ui.Button(
+        style=discord.ButtonStyle.danger, label='Exit',
+        row=1, custom_id=f'engage:exit:{user_id}',
+    )
+    async def exit_cb(inter: discord.Interaction):
+        if inter.user.id != user_id:
+            await inter.response.send_message('❌ Not your session.', ephemeral=True)
+            return
+        await _finalize_session(inter, user_id)
+    finish_btn.callback = exit_cb
 
-    async def on_timeout(self):
-        active_sessions.pop(self.user_id, None)
+    view.add_item(prev_btn)
+    view.add_item(next_btn)
+    view.add_item(submit_btn)
+    view.add_item(finish_btn)
+    return view
 
 
-# ── submit modal ───────────────────────────────────────────────────────────────
+def _build_engage_embed(session: dict) -> discord.Embed:
+    idx   = session['index']
+    queue = session['queue']
+    sub   = queue[idx]
+    pool  = session['pool']
+    total = len(queue)
+    sels  = session['selections'].get(sub['submission_id'], {})
 
-class SubmitLinkModal(discord.ui.Modal, title="Submit Your Tweet 🔗"):
-    tweet_link = discord.ui.TextInput(
-        label="Tweet Link",
-        placeholder="https://x.com/yourhandle/status/123456789",
-        min_length=20,
-        max_length=300,
-        style=discord.TextStyle.short,
+    color_str = (pool.get('embed_color') or '').strip()
+    try:
+        color = int(color_str.lstrip('#'), 16) if color_str else 0x94730D
+    except ValueError:
+        color = 0x94730D
+
+    tasks_toggled = [t for t in ('like', 'comment', 'retweet') if sels.get(t)]
+    task_str = ', '.join(t.capitalize() for t in tasks_toggled) if tasks_toggled else 'None selected'
+
+    embed = discord.Embed(
+        title=f'Engage — Tweet {idx + 1} / {total}',
+        description=(
+            f'**[Open Tweet]({sub["tweet_url"]})**\n\n'
+            f'Submitted by: @{sub.get("submitter_x_username") or "unknown"}\n\n'
+            f'**Selected:** {task_str}\n\n'
+            f'Use the buttons below to toggle tasks, then click ✅ Done & Next.'
+        ),
+        color=color,
+    )
+    footer = pool.get('embed_footer_text') or 'AmeretaVerse • Engage'
+    embed.set_footer(text=footer)
+    return embed
+
+
+async def _finalize_session(interaction: discord.Interaction, user_id: int) -> None:
+    """Process all selections in the session, run verification, award points."""
+    session = _sessions.get(user_id)
+    if not session:
+        await interaction.response.edit_message(content='❌ Session not found.', embed=None, view=None)
+        return
+
+    guild_id = session['guild_id']
+    pool     = session['pool']
+    pool_id  = pool['pool_id']
+    queue    = session['queue']
+    sels     = session['selections']
+    x_username = session.get('x_username', '')
+
+    # Collect submissions where at least one task was selected
+    claimed_subs = [
+        (sub, sels[sub['submission_id']])
+        for sub in queue
+        if sub['submission_id'] in sels and any(sels[sub['submission_id']].values())
+    ]
+
+    if not claimed_subs:
+        _clear_session(user_id)
+        await interaction.response.edit_message(
+            content='You didn\'t select any tasks. No points earned.',
+            embed=None, view=None,
+        )
+        return
+
+    # Signal processing
+    await interaction.response.edit_message(
+        content=f'⏳ Processing {len(claimed_subs)} tweet(s)…',
+        embed=None, view=None,
     )
 
-    def __init__(self, ctx: PoolCtx):
-        super().__init__(title="Submit Your Tweet 🔗")
-        self.ctx = ctx
+    use_live = guild_id in LIVE_VERIFICATION_GUILD_IDS
+    total_earned = 0
+    result_lines = []
 
-    async def on_submit(self, interaction: discord.Interaction):
-        ctx = self.ctx
-        url = self.tweet_link.value.strip()
-        guild_id = interaction.guild_id
+    allowed_tasks = {
+        'like':    bool(pool.get('allow_like',    1)),
+        'comment': bool(pool.get('allow_comment', 1)),
+        'retweet': bool(pool.get('allow_retweet', 1)),
+    }
+    ratios = {
+        'like':    int(pool.get('point_ratio_like',    12)),
+        'comment': int(pool.get('point_ratio_comment', 40)),
+        'retweet': int(pool.get('point_ratio_retweet', 48)),
+    }
+    total_pts = int(pool.get('total_points_per_engage', 10))
 
-        if not validate_tweet_link(url):
-            await interaction.response.send_message(
-                "❌ Invalid tweet link. Use format: `https://x.com/user/status/123456`",
-                ephemeral=True,
-            )
-            return
+    for sub, sel in claimed_subs:
+        sub_id   = sub['submission_id']
+        tweet_id = sub.get('tweet_id', '')
 
-        cost = get_cfg_int(guild_id, f"{ctx.cfg_prefix}_submit_cost", 0)
-        if cost > 0:
-            with get_connection() as conn:
-                user = conn.execute(
-                    f"SELECT {ctx.points_col} FROM users WHERE user_id=?",
-                    (interaction.user.id,)
-                ).fetchone()
-            current_pts = user[ctx.points_col] if user else 0
-            if current_pts < cost:
-                await interaction.response.send_message(
-                    f"❌ Need **{cost} engage points** to submit. You have **{current_pts}**.\n"
-                    f"Use `/engage` to earn more first.",
-                    ephemeral=True,
-                )
-                return
+        # Effective claimed per task (only if pool allows it)
+        effective = {t: bool(sel.get(t)) and allowed_tasks[t] for t in ('like', 'comment', 'retweet')}
 
-        now = datetime.now(timezone.utc).isoformat()
-        with get_connection() as conn:
-            dup = conn.execute(
-                f"SELECT link_id FROM {ctx.links_table} WHERE tweet_link=? AND active=1 AND expires_at>?",
-                (url, now),
-            ).fetchone()
+        if use_live:
+            # Live verification
+            ver_results = {}
+            if effective.get('comment') and tweet_id:
+                ver_results['comment'] = await check_comment(tweet_id, x_username)
+            if effective.get('retweet') and tweet_id:
+                ver_results['retweet'] = await check_retweet(tweet_id, x_username)
+            if effective.get('like'):
+                companion_results = [ver_results[t] for t in ('comment', 'retweet') if t in ver_results]
+                if not companion_results:
+                    ver_results['like'] = {'verified': True, 'reason': 'like_only_trusted'}
+                elif any(r.get('verified') is False for r in companion_results):
+                    ver_results['like'] = {'verified': False, 'reason': 'like_companion_failed'}
+                elif any(r.get('verified') is None for r in companion_results):
+                    ver_results['like'] = {'verified': None, 'reason': 'like_companion_inconclusive'}
+                else:
+                    ver_results['like'] = {'verified': True, 'reason': 'like_companions_passed'}
 
-        if dup:
-            await interaction.response.send_message(
-                "⚠️ This tweet is already in the engage pool.", ephemeral=True
-            )
-            return
+            # Award per-task for partial passes
+            earned = 0
+            verified_tasks = {}
+            source = 'live'
+            for task in ('like', 'comment', 'retweet'):
+                if not effective.get(task):
+                    verified_tasks[task] = None
+                    continue
+                v = ver_results.get(task, {}).get('verified')
+                verified_tasks[task] = v
+                if v is True:
+                    task_pts = total_pts * ratios[task] // 100
+                    earned  += task_pts
+                    add_engage_verification_log(str(guild_id), pool_id, sub_id, str(user_id), task, 1, 1, 'live')
+                elif v is False:
+                    add_engage_verification_log(str(guild_id), pool_id, sub_id, str(user_id), task, 1, 0, 'live',
+                                               error_text=ver_results[task].get('reason'))
+                else:
+                    source = 'live_provisional'
+                    add_engage_verification_log(str(guild_id), pool_id, sub_id, str(user_id), task, 1, -1, 'live_provisional',
+                                               error_text=ver_results.get(task, {}).get('reason', 'inconclusive'))
 
-        lifetime = get_cfg_int(guild_id, f"{ctx.cfg_prefix}_link_lifetime_hours", 24)
-        expires = datetime.now(timezone.utc) + timedelta(hours=lifetime)
-
-        upsert_user(interaction.user.id, str(interaction.user))
-        with get_connection() as conn:
-            conn.execute(
-                f"INSERT INTO {ctx.links_table} (user_id, tweet_link, source, expires_at) VALUES (?,?,?,?)",
-                (interaction.user.id, url, "submit", expires.isoformat()),
-            )
-            if cost > 0:
-                conn.execute(
-                    f"UPDATE users SET {ctx.points_col} = {ctx.points_col} - ? WHERE user_id=?",
-                    (cost, interaction.user.id),
-                )
-
-        embed = discord.Embed(
-            title="tweet submitted. 🔗",
-            description=(
-                f"Your tweet is now in the engage pool.\n\n"
-                f"**Link:** {url}\n"
-                f"**Expires in:** {lifetime}h\n"
-                + (f"**Cost:** -{cost} engage pts\n" if cost > 0 else "")
-                + "\nothers will engage with it. let's grow together. 🔥"
-            ),
-            color=0x94730D,
-        )
-        embed.set_thumbnail(url=LOGO_URL)
-        embed.set_footer(text=f"AmeretaVerse • {ctx.label}")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ── cog ────────────────────────────────────────────────────────────────────────
-
-class EngageCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.cleanup_expired.start()
-
-    def cog_unload(self):
-        self.cleanup_expired.cancel()
-
-    @app_commands.command(name="engage", description="Get tweets to engage with and earn points")
-    async def engage(self, interaction: discord.Interaction):
-        pool = get_pool(interaction)
-        guild_id = interaction.guild_id
-
-        if (
-            not isinstance(interaction.channel, discord.TextChannel)
-            or interaction.channel.name != pool.channel_name
-        ):
-            await interaction.response.send_message(
-                f"❌ Use `/engage` in the **#{pool.channel_name}** channel only.",
-                ephemeral=True,
-            )
-            return
-
-        with get_connection() as conn:
-            user_row = conn.execute(
-                "SELECT x_username FROM users WHERE user_id=?", (interaction.user.id,)
-            ).fetchone()
-        if not user_row or not user_row["x_username"]:
-            await interaction.response.send_message(
-                "⚠️ you need to link your X account first, habibi. use /setx to set your username.",
-                ephemeral=True,
-            )
-            return
-
-        daily_limit = get_cfg_int(guild_id, f"{pool.cfg_prefix}_daily_limit", 0)
-        if daily_limit > 0:
-            today_start = datetime.now(timezone.utc).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).isoformat()
-            with get_connection() as conn:
-                today_count = conn.execute(
-                    f"SELECT COUNT(*) as c FROM {pool.part_table} "
-                    f"WHERE user_id=? AND confirmed_at>=?",
-                    (interaction.user.id, today_start),
-                ).fetchone()
-            if today_count and today_count["c"] >= daily_limit:
-                await interaction.response.send_message(
-                    f"⏳ You've hit your daily limit (**{daily_limit}** today). "
-                    f"Come back tomorrow, habibi.",
-                    ephemeral=True,
-                )
-                return
-
-        limit = get_cfg_int(guild_id, f"{pool.cfg_prefix}_links_per_request", 10)
-        links = get_available_links(interaction.user.id, limit, pool)
-
-        if not links:
-            embed = discord.Embed(
-                title="no tweets available right now. 😴",
-                description=(
-                    "The engage pool is empty.\n\n"
-                    "Submit your own tweet with `/submit` to get the ball rolling. 🔗"
-                ),
-                color=0x94730D,
-            )
-            embed.set_thumbnail(url=LOGO_URL)
-            embed.set_footer(text=f"AmeretaVerse • {pool.label}")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        session = EngageSession(
-            links=[dict(lnk) for lnk in links],
-            ctx=pool,
-            guild_id=guild_id,
-        )
-        active_sessions[interaction.user.id] = session
-
-        lines = []
-        for i, lnk in enumerate(links, 1):
-            handle = extract_twitter_handle(lnk["tweet_link"])
-            source_tag = "📌" if lnk["source"] == "raid" else "🔗"
-            lines.append(f"**{i}.** {source_tag} `@{handle}`\n{lnk['tweet_link']}")
-
-        footer_legend = "📌 raid  •  🔗 user submitted" if not pool.is_creator else "🔗 creator submitted"
-        embed = discord.Embed(
-            title=f"engage time. ⚡ — {len(links)} tweets ready",
-            description="\n\n".join(lines),
-            color=0x94730D,
-        )
-        embed.set_thumbnail(url=LOGO_URL)
-        embed.set_footer(text=f"AmeretaVerse • {pool.label} | {footer_legend}")
-
-        view = EngageListView(interaction.user.id, session)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @app_commands.command(name="submit", description="Submit your tweet for others to engage with")
-    async def submit(self, interaction: discord.Interaction):
-        pool = get_pool(interaction)
-
-        if (
-            not isinstance(interaction.channel, discord.TextChannel)
-            or interaction.channel.name != pool.channel_name
-        ):
-            await interaction.response.send_message(
-                f"❌ Use `/submit` in the **#{pool.channel_name}** channel only.",
-                ephemeral=True,
-            )
-            return
-
-        modal = SubmitLinkModal(pool)
-        await interaction.response.send_modal(modal)
-
-    @app_commands.command(name="engage-stats", description="View your engage points and stats")
-    @app_commands.describe(member="Member to look up (defaults to yourself)")
-    async def engage_stats(
-        self, interaction: discord.Interaction, member: discord.Member = None
-    ):
-        pool = get_pool(interaction)
-        target = member or interaction.user
-
-        with get_connection() as conn:
-            user = conn.execute(
-                f"SELECT {pool.points_col} FROM users WHERE user_id=?", (target.id,)
-            ).fetchone()
-            done_count = conn.execute(
-                f"SELECT COUNT(*) as c FROM {pool.part_table} WHERE user_id=?", (target.id,)
-            ).fetchone()
-            sub_count = conn.execute(
-                f"SELECT COUNT(*) as c FROM {pool.links_table} WHERE user_id=?", (target.id,)
-            ).fetchone()
-
-        points = user[pool.points_col] if user else 0
-        name = "your" if target == interaction.user else f"{target.display_name}'s"
-        embed = discord.Embed(title=f"{name} engage stats ⚡", color=0x94730D)
-        embed.add_field(name="Engage Points",   value=f"`{points} pts`",                          inline=True)
-        embed.add_field(name="Tweets Engaged",  value=f"`{done_count['c'] if done_count else 0}`", inline=True)
-        embed.add_field(name="Links Submitted", value=f"`{sub_count['c'] if sub_count else 0}`",   inline=True)
-        embed.set_thumbnail(url=target.display_avatar.url)
-        embed.set_footer(text=f"AmeretaVerse • {pool.label}")
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="engage-leaderboard", description="Top 10 users by engage points")
-    async def engage_leaderboard(self, interaction: discord.Interaction):
-        pool = get_pool(interaction)
-
-        with get_connection() as conn:
-            rows = conn.execute(
-                f"SELECT username, {pool.points_col} AS pts FROM users "
-                f"WHERE {pool.points_col} > 0 ORDER BY {pool.points_col} DESC LIMIT 10"
-            ).fetchall()
-
-        if not rows:
-            await interaction.response.send_message(
-                "No engage activity yet. Be the first — use `/engage`. ⚡"
-            )
-            return
-
-        medals = ["🥇", "🥈", "🥉"]
-        lines = [
-            f"{medals[i] if i < 3 else f'`{i+1}.`'} **{r['username']}** — `{r['pts']} pts`"
-            for i, r in enumerate(rows)
-        ]
-        embed = discord.Embed(
-            title=f"⚡ {pool.label} Leaderboard",
-            description="\n".join(lines),
-            color=0x94730D,
-        )
-        embed.set_thumbnail(url=LOGO_URL)
-        embed.set_footer(text=f"AmeretaVerse • {pool.label}")
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="engage-config", description="View or change engage settings (admin)")
-    @app_commands.describe(setting="Which setting to change", value="New value")
-    @app_commands.choices(setting=[
-        app_commands.Choice(name="Link lifetime (hours)",          value="engage_link_lifetime_hours"),
-        app_commands.Choice(name="Links per /engage",              value="engage_links_per_request"),
-        app_commands.Choice(name="Daily limit (0=unlimited)",      value="engage_daily_limit"),
-        app_commands.Choice(name="Submit cost (points)",           value="engage_submit_cost"),
-        app_commands.Choice(name="Points per link",                value="engage_points_per_link"),
-        app_commands.Choice(name="Weight: Like %",                 value="engage_weight_like"),
-        app_commands.Choice(name="Weight: Comment %",              value="engage_weight_comment"),
-        app_commands.Choice(name="Weight: Retweet %",              value="engage_weight_retweet"),
-        app_commands.Choice(name="[Creator] Link lifetime (hours)",value="creator_engage_link_lifetime_hours"),
-        app_commands.Choice(name="[Creator] Links per /engage",    value="creator_engage_links_per_request"),
-        app_commands.Choice(name="[Creator] Points per link",      value="creator_engage_points_per_link"),
-        app_commands.Choice(name="[Creator] Weight: Like %",       value="creator_engage_weight_like"),
-        app_commands.Choice(name="[Creator] Weight: Comment %",    value="creator_engage_weight_comment"),
-        app_commands.Choice(name="[Creator] Weight: Retweet %",    value="creator_engage_weight_retweet"),
-    ])
-    @app_commands.default_permissions(administrator=True)
-    async def engage_config(
-        self,
-        interaction: discord.Interaction,
-        setting: app_commands.Choice[str] = None,
-        value: str = None,
-    ):
-        guild_id = interaction.guild_id
-
-        if setting and value:
-            _db_set_config(guild_id, setting.value, value)
-            await interaction.response.send_message(
-                f"✅ **{setting.name}** set to `{value}`.", ephemeral=True
+            upsert_engage_action(
+                str(guild_id), pool_id, sub_id, str(user_id), x_username,
+                int(effective.get('like', False)), int(effective.get('comment', False)), int(effective.get('retweet', False)),
+                verified_tasks.get('like'), verified_tasks.get('comment'), verified_tasks.get('retweet'),
+                earned, source,
             )
         else:
-            cfg = _db_get_all_config(guild_id)
-            lines = [
-                f"`{k}` = **{v}**"
-                for k, v in sorted(cfg.items())
-                if k.startswith("engage_") or k.startswith("creator_engage_")
-            ]
-            embed = discord.Embed(
-                title="⚙️ Engage Config",
-                description="\n".join(lines) or "No settings found.",
-                color=0x94730D,
+            # Instant award (adaptive daily check verifies later)
+            earned = sum(
+                total_pts * ratios[task] // 100
+                for task in ('like', 'comment', 'retweet')
+                if effective.get(task)
             )
-            embed.set_footer(text="AmeretaVerse • Engage Config | Use /engage-config to change")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            upsert_engage_action(
+                str(guild_id), pool_id, sub_id, str(user_id), x_username,
+                int(effective.get('like', False)), int(effective.get('comment', False)), int(effective.get('retweet', False)),
+                None, None, None,
+                earned, None,  # verification_source=None means pending daily check
+            )
+
+        total_earned += earned
+        task_emojis = {'like': '❤️', 'comment': '💬', 'retweet': '🔁'}
+        claimed_str = ' '.join(task_emojis[t] for t in ('like', 'comment', 'retweet') if effective.get(t))
+        result_lines.append(f'Tweet #{sub.get("display_number", sub_id)} — {claimed_str} — {earned} pts')
+
+    # Bulk award points
+    if total_earned > 0:
+        upsert_engage_user_points(str(guild_id), pool_id, str(user_id), total_earned,
+                                  delta_engaged=len(claimed_subs))
+        with get_connection() as conn:
+            conn.execute("UPDATE users SET engage_points=engage_points+? WHERE user_id=?",
+                         (total_earned, user_id))
+
+    _clear_session(user_id)
+
+    pts_row = get_engage_user_points(pool_id, str(user_id))
+    embed = discord.Embed(
+        title=f'✅ Done — {total_earned} engage pts earned',
+        description=(
+            '**Results:**\n' + '\n'.join(result_lines) +
+            f'\n\n**Your balance:** {pts_row["points"]} engage pts'
+        ),
+        color=0x94730D,
+    )
+    pool_display = pool.get('display_name') or pool.get('name', 'Engage')
+    embed.set_footer(text=f'{pool_display} Pool')
+    await interaction.edit_original_response(content=None, embed=embed)
+
+
+class EngageCog(commands.Cog, name='Engage'):
+    def __init__(self, bot):
+        self.bot = bot
+        self.expire_task.start()
+
+    def cog_unload(self):
+        self.expire_task.cancel()
+
+    # ── Helper ──────────────────────────────────────────────────────────────
+
+    def _resolve_pool(self, interaction: discord.Interaction) -> dict | None:
+        """Find pool by interaction channel. Returns pool dict or None."""
+        guild_id   = str(interaction.guild_id or 0)
+        channel_id = str(interaction.channel_id or 0)
+        return get_engage_pool_by_channel(guild_id, channel_id)
+
+    # ── /engage ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(name='engage', description='Browse active tweets and engage to earn engage points.')
+    async def engage_cmd(self, interaction: discord.Interaction):
+        pool = self._resolve_pool(interaction)
+        if not pool:
+            await interaction.response.send_message(
+                '❌ No engage pool is configured for this channel. Use the correct engage channel.',
+                ephemeral=True,
+            )
+            return
+        if not pool.get('enabled'):
+            await interaction.response.send_message('❌ This engage pool is currently disabled.', ephemeral=True)
+            return
+
+        user_id    = interaction.user.id
+        guild_id   = interaction.guild_id or 0
+        x_username = get_user_x_username(user_id)
+        if not x_username:
+            await interaction.response.send_message(
+                '⚠️ Link your X account first: `/setx your_username`', ephemeral=True
+            )
+            return
+
+        pool_id = pool['pool_id']
+        queue   = list_active_submissions(pool_id, limit=10, exclude_user_id=str(user_id))
+        if not queue:
+            await interaction.response.send_message(
+                '📭 No active tweets in this pool right now. Check back later or submit your own!',
+                ephemeral=True,
+            )
+            return
+
+        # Start session
+        _set_session(user_id, {
+            'pool_id':     pool_id,
+            'guild_id':    guild_id,
+            'pool':        pool,
+            'queue':       queue,
+            'index':       0,
+            'selections':  {},
+            'x_username':  x_username,
+        })
+
+        view  = _build_engage_panel_view(user_id, _sessions[user_id])
+        embed = _build_engage_embed(_sessions[user_id])
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    # ── /submit ──────────────────────────────────────────────────────────────
+
+    @app_commands.command(name='submit', description='Submit your tweet to the engage pool (costs engage points).')
+    @app_commands.describe(tweet_url='Full tweet URL: https://x.com/.../status/...')
+    async def submit_cmd(self, interaction: discord.Interaction, tweet_url: str):
+        pool = self._resolve_pool(interaction)
+        if not pool:
+            await interaction.response.send_message(
+                '❌ No engage pool is configured for this channel.', ephemeral=True
+            )
+            return
+        if not pool.get('enabled'):
+            await interaction.response.send_message('❌ This engage pool is currently disabled.', ephemeral=True)
+            return
+
+        user_id  = interaction.user.id
+        guild_id = interaction.guild_id or 0
+
+        x_username = get_user_x_username(user_id)
+        if not x_username:
+            await interaction.response.send_message(
+                '⚠️ Link your X account first: `/setx your_username`', ephemeral=True
+            )
+            return
+
+        tweet_id = extract_tweet_id(tweet_url)
+        if not tweet_id:
+            await interaction.response.send_message(
+                '❌ Invalid tweet URL. Must be an x.com or twitter.com status link.', ephemeral=True
+            )
+            return
+
+        pool_id = pool['pool_id']
+        await interaction.response.defer(ephemeral=True)
+
+        # Verify tweet author
+        tweet_info = await lookup_twitter_user_by_login(x_username)
+        if not tweet_info:
+            await interaction.followup.send(
+                '❌ Could not look up your X account. Make sure your /setx username is correct.',
+                ephemeral=True,
+            )
+            return
+
+        # Check daily limit
+        daily_count = get_user_daily_submission_count(pool_id, str(user_id))
+        daily_limit = int(pool.get('daily_submission_limit', 3))
+        if daily_count >= daily_limit:
+            await interaction.followup.send(
+                f'❌ Daily submission limit reached ({daily_limit}/day). Try again tomorrow.',
+                ephemeral=True,
+            )
+            return
+
+        # Check points balance
+        cost        = int(pool.get('submit_cost', 50))
+        pts_row     = get_engage_user_points(pool_id, str(user_id))
+        balance     = pts_row.get('points', 0)
+        if balance < cost:
+            await interaction.followup.send(
+                f'❌ Not enough engage points. Need {cost}, have {balance}. Engage with more tweets to earn points.',
+                ephemeral=True,
+            )
+            return
+
+        # Deduct cost and create submission
+        upsert_engage_user_points(str(guild_id), pool_id, str(user_id),
+                                  delta_points=-cost, delta_submitted=1)
+        try:
+            sub = create_engage_submission(
+                str(guild_id), pool_id, str(user_id),
+                tweet_url.strip(), tweet_id, x_username,
+                cost, int(pool.get('ttl_hours', 24)),
+            )
+        except Exception as e:
+            # Refund on failure
+            upsert_engage_user_points(str(guild_id), pool_id, str(user_id), delta_points=cost, delta_submitted=-1)
+            print(f'[engage] submit error: {type(e).__name__}: {e}')
+            await interaction.followup.send('❌ Failed to submit. Please try again.', ephemeral=True)
+            return
+
+        display_num = sub.get('display_number', sub['submission_id'])
+        new_balance = balance - cost
+        await interaction.followup.send(
+            f'✅ Tweet **#{display_num:04d}** submitted to the pool.\n'
+            f'Cost: **{cost}** engage pts | New balance: **{new_balance}** engage pts',
+            ephemeral=True,
+        )
+
+    # ── /engage-stats ────────────────────────────────────────────────────────
+
+    @app_commands.command(name='engage-stats', description='Your engage points and activity in this pool.')
+    async def engage_stats_cmd(self, interaction: discord.Interaction):
+        pool = self._resolve_pool(interaction)
+        if not pool:
+            await interaction.response.send_message(
+                '❌ No engage pool is configured for this channel.', ephemeral=True
+            )
+            return
+
+        pts_row = get_engage_user_points(pool['pool_id'], str(interaction.user.id))
+        pool_display = pool.get('display_name') or pool.get('name', 'Engage')
+        embed = discord.Embed(
+            title=f'Your {pool_display} Stats',
+            color=0x94730D,
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name='Engage Points', value=f'`{pts_row.get("points", 0)}`', inline=True)
+        embed.add_field(name='Tweets Engaged', value=f'`{pts_row.get("total_engaged", 0)}`', inline=True)
+        embed.add_field(name='Tweets Submitted', value=f'`{pts_row.get("total_submitted", 0)}`', inline=True)
+        embed.set_footer(text=f'{pool_display} Pool')
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── /engage-leaderboard ──────────────────────────────────────────────────
+
+    @app_commands.command(name='engage-leaderboard', description='Top engage point earners in this pool.')
+    async def engage_leaderboard_cmd(self, interaction: discord.Interaction):
+        pool = self._resolve_pool(interaction)
+        if not pool:
+            await interaction.response.send_message(
+                '❌ No engage pool is configured for this channel.', ephemeral=True
+            )
+            return
+
+        rows = get_engage_leaderboard(pool['pool_id'], limit=10)
+        if not rows:
+            await interaction.response.send_message('No data yet. Be the first to engage!', ephemeral=True)
+            return
+
+        medals = ['🥇', '🥈', '🥉']
+        lines  = []
+        for i, r in enumerate(rows):
+            rank = medals[i] if i < 3 else f'`{i+1}.`'
+            name = r.get('username') or f'<@{r["user_id"]}>'
+            lines.append(f'{rank} **{name}** — `{r["points"]} pts`')
+
+        pool_display = pool.get('display_name') or pool.get('name', 'Engage')
+        embed = discord.Embed(
+            title=f'⚡ {pool_display} Leaderboard',
+            description='\n'.join(lines),
+            color=0x94730D,
+        )
+        embed.set_footer(text=f'{pool_display} Pool')
+        await interaction.response.send_message(embed=embed)
+
+    # ── Background tasks ──────────────────────────────────────────────────────
 
     @tasks.loop(hours=1)
-    async def cleanup_expired(self):
-        now = datetime.now(timezone.utc).isoformat()
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE engage_links SET active=0 WHERE active=1 AND expires_at<=?", (now,)
-            )
-            conn.execute(
-                "UPDATE creator_engage_links SET active=0 WHERE active=1 AND expires_at<=?", (now,)
-            )
+    async def expire_task(self):
+        count = expire_old_submissions()
+        if count:
+            print(f'[engage] expired {count} old submissions')
 
-    @cleanup_expired.before_loop
-    async def before_cleanup(self):
+    @expire_task.before_loop
+    async def before_expire_task(self):
         await self.bot.wait_until_ready()
 
 

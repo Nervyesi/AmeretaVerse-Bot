@@ -707,6 +707,131 @@ def init_db():
             )
         """)
 
+    # ── Engage module: rename legacy tables then create new schema ────────────
+    def _safe_rename(conn, old, new):
+        if conn.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name=?", (old,)).fetchone():
+            if not conn.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name=?", (new,)).fetchone():
+                conn.execute(f"ALTER TABLE {old} RENAME TO {new}")
+                print(f'[db] renamed legacy table {old} -> {new}')
+
+    with get_connection() as conn:
+        _safe_rename(conn, 'engage_links', 'engage_links_legacy')
+        _safe_rename(conn, 'engage_participation', 'engage_participation_legacy')
+        _safe_rename(conn, 'creator_engage_links', 'creator_engage_links_legacy')
+        _safe_rename(conn, 'creator_engage_participation', 'creator_engage_participation_legacy')
+
+    with get_connection() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS engage_pools (
+                pool_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                display_name TEXT,
+                pool_type TEXT NOT NULL DEFAULT 'default',
+                enabled INTEGER NOT NULL DEFAULT 0,
+                channel_id TEXT,
+                submit_cost INTEGER NOT NULL DEFAULT 50,
+                ttl_hours INTEGER NOT NULL DEFAULT 24,
+                min_followers INTEGER NOT NULL DEFAULT 100,
+                daily_submission_limit INTEGER NOT NULL DEFAULT 3,
+                point_ratio_like INTEGER NOT NULL DEFAULT 12,
+                point_ratio_comment INTEGER NOT NULL DEFAULT 40,
+                point_ratio_retweet INTEGER NOT NULL DEFAULT 48,
+                total_points_per_engage INTEGER NOT NULL DEFAULT 10,
+                allow_like INTEGER NOT NULL DEFAULT 1,
+                allow_comment INTEGER NOT NULL DEFAULT 1,
+                allow_retweet INTEGER NOT NULL DEFAULT 1,
+                embed_color TEXT,
+                embed_thumbnail_url TEXT,
+                embed_footer_text TEXT,
+                embed_footer_icon_url TEXT,
+                guide_title TEXT,
+                guide_description TEXT,
+                guide_image_url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS engage_submissions (
+                submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                pool_id INTEGER NOT NULL,
+                submitter_user_id TEXT NOT NULL,
+                tweet_url TEXT NOT NULL,
+                tweet_id TEXT NOT NULL,
+                submitter_x_username TEXT,
+                cost_paid INTEGER NOT NULL DEFAULT 0,
+                submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                status TEXT NOT NULL DEFAULT 'active',
+                display_number INTEGER,
+                FOREIGN KEY (pool_id) REFERENCES engage_pools(pool_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_engage_sub_pool_status ON engage_submissions(pool_id, status);
+
+            CREATE TABLE IF NOT EXISTS engage_actions (
+                action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                pool_id INTEGER NOT NULL,
+                submission_id INTEGER NOT NULL,
+                engager_user_id TEXT NOT NULL,
+                engager_x_username TEXT,
+                like_claimed INTEGER NOT NULL DEFAULT 0,
+                comment_claimed INTEGER NOT NULL DEFAULT 0,
+                retweet_claimed INTEGER NOT NULL DEFAULT 0,
+                like_verified INTEGER,
+                comment_verified INTEGER,
+                retweet_verified INTEGER,
+                points_earned INTEGER NOT NULL DEFAULT 0,
+                verification_source TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                flagged INTEGER NOT NULL DEFAULT 0,
+                flag_reason TEXT,
+                UNIQUE(submission_id, engager_user_id),
+                FOREIGN KEY (submission_id) REFERENCES engage_submissions(submission_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_engage_actions_pool ON engage_actions(pool_id);
+            CREATE INDEX IF NOT EXISTS idx_engage_actions_engager ON engage_actions(engager_user_id);
+
+            CREATE TABLE IF NOT EXISTS engage_user_points (
+                guild_id TEXT NOT NULL,
+                pool_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                points INTEGER NOT NULL DEFAULT 0,
+                total_engaged INTEGER NOT NULL DEFAULT 0,
+                total_submitted INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (pool_id, user_id),
+                FOREIGN KEY (pool_id) REFERENCES engage_pools(pool_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS engage_verification_log (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                pool_id INTEGER NOT NULL,
+                submission_id INTEGER NOT NULL,
+                engager_user_id TEXT NOT NULL,
+                task TEXT NOT NULL,
+                claimed INTEGER NOT NULL,
+                verified INTEGER NOT NULL,
+                source TEXT,
+                error_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_engage_log ON engage_verification_log(submission_id, engager_user_id);
+        """)
+
+    # Seed AmeretaVerse pools
+    AMERETAVERSE_GUILD_ID = '1199707792706117642'
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO engage_pools (guild_id, name, display_name, pool_type, min_followers)
+            VALUES (?, 'community', 'Community Engage', 'community', 500)
+        """, (AMERETAVERSE_GUILD_ID,))
+        conn.execute("""
+            INSERT OR IGNORE INTO engage_pools (guild_id, name, display_name, pool_type, min_followers)
+            VALUES (?, 'creator', 'Creator Engage', 'creator', 500)
+        """, (AMERETAVERSE_GUILD_ID,))
+
     # One-time cleanup: close orphaned tickets (NULL/0 guild_id or stub channel_id=0
     # left behind by interrupted ticket creation before the channel was made).
     with get_connection() as conn:
@@ -1447,6 +1572,236 @@ def check_reset_manual_count(guild_id: int) -> dict:
         settings['manual_check_count_today'] = 0
         settings['manual_check_date'] = today
     return settings
+
+
+# ── Engage helpers ──────────────────────────────────────────────────────────
+
+def get_engage_pool_by_id(pool_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM engage_pools WHERE pool_id=?", (pool_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_engage_pool_by_channel(guild_id: str, channel_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM engage_pools WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_engage_pools(guild_id: str) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM engage_pools WHERE guild_id=? ORDER BY pool_id",
+            (guild_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_engage_pool(pool_id: int, **kwargs) -> bool:
+    allowed = {
+        'enabled', 'channel_id', 'submit_cost', 'ttl_hours', 'min_followers',
+        'daily_submission_limit', 'point_ratio_like', 'point_ratio_comment',
+        'point_ratio_retweet', 'total_points_per_engage',
+        'allow_like', 'allow_comment', 'allow_retweet',
+        'embed_color', 'embed_thumbnail_url', 'embed_footer_text',
+        'guide_title', 'guide_description', 'guide_image_url', 'display_name',
+    }
+    sets = {k: v for k, v in kwargs.items() if k in allowed}
+    if not sets:
+        return False
+    cols = ', '.join(f'{k}=?' for k in sets)
+    with get_connection() as conn:
+        c = conn.execute(f"UPDATE engage_pools SET {cols} WHERE pool_id=?",
+                         list(sets.values()) + [pool_id])
+    return c.rowcount > 0
+
+
+def create_engage_submission(
+    guild_id: str, pool_id: int, submitter_user_id: str,
+    tweet_url: str, tweet_id: str, submitter_x_username: str,
+    cost_paid: int, ttl_hours: int,
+) -> dict:
+    import datetime as _dt
+    expires_at = (_dt.datetime.utcnow() + _dt.timedelta(hours=ttl_hours)).isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO engage_submissions
+               (guild_id, pool_id, submitter_user_id, tweet_url, tweet_id,
+                submitter_x_username, cost_paid, expires_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (str(guild_id), pool_id, str(submitter_user_id), tweet_url, tweet_id,
+             submitter_x_username, cost_paid, expires_at),
+        )
+        submission_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        row = conn.execute(
+            "SELECT COALESCE(MAX(display_number), 0) + 1 FROM engage_submissions WHERE pool_id=?",
+            (pool_id,)
+        ).fetchone()
+        conn.execute("UPDATE engage_submissions SET display_number=? WHERE submission_id=?",
+                     (row[0], submission_id))
+        result = conn.execute("SELECT * FROM engage_submissions WHERE submission_id=?",
+                              (submission_id,)).fetchone()
+    return dict(result)
+
+
+def list_active_submissions(pool_id: int, limit: int = 10, exclude_user_id: str = None) -> list:
+    params = [pool_id]
+    exclude_clause = ''
+    if exclude_user_id is not None:
+        exclude_clause = "AND submitter_user_id != ?"
+        params.append(str(exclude_user_id))
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""SELECT * FROM engage_submissions
+                WHERE pool_id=? AND status='active'
+                AND (expires_at IS NULL OR expires_at > datetime('now'))
+                {exclude_clause}
+                ORDER BY RANDOM() LIMIT ?""",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def expire_old_submissions() -> int:
+    with get_connection() as conn:
+        c = conn.execute(
+            """UPDATE engage_submissions SET status='expired'
+               WHERE status='active' AND expires_at IS NOT NULL
+               AND expires_at < datetime('now')"""
+        )
+    return c.rowcount
+
+
+def get_user_daily_submission_count(pool_id: int, user_id: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) FROM engage_submissions
+               WHERE pool_id=? AND submitter_user_id=?
+               AND submitted_at > datetime('now', '-24 hours')""",
+            (pool_id, str(user_id))
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def get_engage_action(submission_id: int, engager_user_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM engage_actions WHERE submission_id=? AND engager_user_id=?",
+            (submission_id, str(engager_user_id))
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_engage_action(
+    guild_id: str, pool_id: int, submission_id: int, engager_user_id: str,
+    engager_x_username: str,
+    like_claimed: int, comment_claimed: int, retweet_claimed: int,
+    like_verified, comment_verified, retweet_verified,
+    points_earned: int, verification_source: str,
+    flagged: int = 0, flag_reason: str = None,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO engage_actions
+               (guild_id, pool_id, submission_id, engager_user_id, engager_x_username,
+                like_claimed, comment_claimed, retweet_claimed,
+                like_verified, comment_verified, retweet_verified,
+                points_earned, verification_source, flagged, flag_reason)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(submission_id, engager_user_id) DO UPDATE SET
+                 like_claimed=excluded.like_claimed,
+                 comment_claimed=excluded.comment_claimed,
+                 retweet_claimed=excluded.retweet_claimed,
+                 like_verified=excluded.like_verified,
+                 comment_verified=excluded.comment_verified,
+                 retweet_verified=excluded.retweet_verified,
+                 points_earned=excluded.points_earned,
+                 verification_source=excluded.verification_source,
+                 flagged=excluded.flagged,
+                 flag_reason=excluded.flag_reason""",
+            (str(guild_id), pool_id, submission_id, str(engager_user_id), engager_x_username,
+             like_claimed, comment_claimed, retweet_claimed,
+             like_verified, comment_verified, retweet_verified,
+             points_earned, verification_source, flagged, flag_reason),
+        )
+
+
+def add_engage_verification_log(
+    guild_id: str, pool_id: int, submission_id: int, engager_user_id: str,
+    task: str, claimed: int, verified: int, source: str, error_text: str = None,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO engage_verification_log
+               (guild_id, pool_id, submission_id, engager_user_id, task, claimed, verified, source, error_text)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (str(guild_id), pool_id, submission_id, str(engager_user_id),
+             task, claimed, verified, source, error_text),
+        )
+
+
+def upsert_engage_user_points(
+    guild_id: str, pool_id: int, user_id: str,
+    delta_points: int, delta_engaged: int = 0, delta_submitted: int = 0,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO engage_user_points (guild_id, pool_id, user_id, points, total_engaged, total_submitted)
+               VALUES (?,?,?,MAX(0,?),MAX(0,?),MAX(0,?))
+               ON CONFLICT(pool_id, user_id) DO UPDATE SET
+                 points=MAX(0, points + ?),
+                 total_engaged=total_engaged + ?,
+                 total_submitted=total_submitted + ?""",
+            (str(guild_id), pool_id, str(user_id),
+             max(0, delta_points), max(0, delta_engaged), max(0, delta_submitted),
+             delta_points, delta_engaged, delta_submitted),
+        )
+
+
+def get_engage_user_points(pool_id: int, user_id: str) -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM engage_user_points WHERE pool_id=? AND user_id=?",
+            (pool_id, str(user_id))
+        ).fetchone()
+    return dict(row) if row else {'points': 0, 'total_engaged': 0, 'total_submitted': 0}
+
+
+def get_engage_leaderboard(pool_id: int, limit: int = 10) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT eup.user_id, u.username, eup.points, eup.total_engaged, eup.total_submitted
+               FROM engage_user_points eup
+               LEFT JOIN users u ON u.user_id = eup.user_id
+               WHERE eup.pool_id=? ORDER BY eup.points DESC LIMIT ?""",
+            (pool_id, limit)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def sample_pending_engage_actions(pool_id: int, limit: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT ea.*, es.tweet_id FROM engage_actions ea
+               JOIN engage_submissions es ON es.submission_id = ea.submission_id
+               WHERE ea.pool_id=? AND ea.verification_source IS NULL
+               ORDER BY RANDOM() LIMIT ?""",
+            (pool_id, limit)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_pending_engage_actions(pool_id: int) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM engage_actions WHERE pool_id=? AND verification_source IS NULL",
+            (pool_id,)
+        ).fetchone()
+    return row[0] if row else 0
 
 
 if __name__ == '__main__':
