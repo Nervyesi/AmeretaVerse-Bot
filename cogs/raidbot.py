@@ -927,7 +927,7 @@ class RaidsCog(commands.Cog, name='Raids'):
 
         await interaction.response.defer(ephemeral=True)
 
-        csv_rows = _build_raiders_csv_rows(guild_id, raid_id)
+        fieldnames, csv_rows = _build_raiders_csv_rows(guild_id, raid_id, resolved)
         if not csv_rows:
             await interaction.followup.send(
                 f'📭 No participants found for Raid #{display_num}.', ephemeral=True
@@ -935,12 +935,7 @@ class RaidsCog(commands.Cog, name='Raids'):
             return
 
         buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=[
-            'discord_id', 'discord_username', 'x_handle',
-            'like_claimed', 'comment_claimed', 'retweet_claimed',
-            'like_verified', 'comment_verified', 'retweet_verified',
-            'points_earned', 'verification_status', 'flagged', 'submitted_at',
-        ])
+        writer = csv.DictWriter(buf, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(csv_rows)
 
@@ -1483,77 +1478,91 @@ class RaidsCog(commands.Cog, name='Raids'):
         return 'verified'
 
 
-def _build_raiders_csv_rows(guild_id: int, raid_id: int) -> list:
-    """Return list of dicts for CSV export: one row per raid participant."""
+def _build_raiders_csv_rows(guild_id: int, raid_id: int, raid: dict) -> tuple:
+    """Returns (fieldnames: list[str], rows: list[dict]) for CSV export."""
+    # Determine which tasks were enabled for this raid
+    try:
+        allowed = json.loads(raid.get('tasks_json') or '{}')
+    except Exception:
+        allowed = {'like': True, 'comment': True, 'retweet': True}
+    if not any(allowed.values()):
+        allowed = {'like': True, 'comment': True, 'retweet': True}
+
+    task_cols = []
+    if allowed.get('like'):    task_cols.append(('like',    'Like'))
+    if allowed.get('comment'): task_cols.append(('comment', 'Comment'))
+    if allowed.get('retweet'): task_cols.append(('retweet', 'Retweet'))
+
+    fieldnames = ['Discord Username', 'X Handle']
+    fieldnames += [label for _, label in task_cols]
+    fieldnames += ['Points Earned', 'Status', 'Flagged', 'Submitted At']
+
     rows = []
     with get_connection() as conn:
-        parts = conn.execute(
-            """SELECT p.*, u.username, u.x_username
-               FROM raid_participation p
-               LEFT JOIN users u ON u.user_id = p.user_id
-               WHERE p.guild_id=? AND p.raid_id=?
-               ORDER BY p.created_at ASC""",
-            (guild_id, raid_id),
-        ).fetchall()
+        parts = conn.execute("""
+            SELECT p.*, u.username, u.x_username
+            FROM raid_participation p
+            LEFT JOIN users u ON CAST(u.user_id AS TEXT) = CAST(p.user_id AS TEXT)
+            WHERE p.guild_id=? AND p.raid_id=?
+            ORDER BY p.created_at ASC
+        """, (str(guild_id), raid_id)).fetchall()
 
         for p in parts:
             p = dict(p)
             try:
                 claimed = json.loads(p.get('tasks_claimed') or '{}')
+                if isinstance(claimed, list):
+                    claimed = {t: True for t in claimed}
             except Exception:
                 claimed = {}
-            if not isinstance(claimed, dict):
-                claimed = {}
 
-            verif_rows = conn.execute(
-                """SELECT task, verified FROM raid_verification_log
-                   WHERE guild_id=? AND raid_id=? AND user_id=?
-                   ORDER BY checked_at DESC""",
-                (guild_id, raid_id, p['user_id']),
-            ).fetchall()
-
-            verif_map: dict = {}
+            verif_rows = conn.execute("""
+                SELECT task, verified FROM raid_verification_log
+                WHERE guild_id=? AND raid_id=? AND user_id=?
+                ORDER BY checked_at DESC
+            """, (str(guild_id), raid_id, p['user_id'])).fetchall()
+            verif_map = {}
             for v in verif_rows:
                 if v['task'] not in verif_map:
                     verif_map[v['task']] = v['verified']
 
-            def _verdict(task: str) -> str:
-                if not claimed.get(task):
+            def cell(task_key: str) -> str:
+                if not claimed.get(task_key):
                     return ''
-                val = verif_map.get(task)
-                if val == 1:  return 'verified'
-                if val == 0:  return 'failed'
-                if val == -1: return 'inconclusive'
-                return 'pending'
+                v = verif_map.get(task_key)
+                if v == 1:  return '✓'
+                if v == 0:  return '✗'
+                if v == -1: return '?'
+                return '⏳'
 
-            verdicts = [_verdict(t) for t in ('like', 'comment', 'retweet') if claimed.get(t)]
-            if not verdicts:
-                overall = 'pending'
-            elif all(v == 'verified' for v in verdicts):
-                overall = 'verified'
-            elif any(v == 'failed' for v in verdicts):
-                overall = 'partial' if any(v == 'verified' for v in verdicts) else 'failed'
-            elif any(v == 'inconclusive' for v in verdicts):
-                overall = 'inconclusive'
+            claimed_tasks = [t for t in ('like', 'comment', 'retweet') if claimed.get(t)]
+            verdicts = [verif_map.get(t) for t in claimed_tasks]
+            if not claimed_tasks or all(v is None for v in verdicts):
+                status = 'pending'
+            elif all(v == 1 for v in verdicts if v is not None) and not any(v is None for v in verdicts):
+                status = 'verified'
+            elif all(v == 0 for v in verdicts if v is not None) and not any(v is None for v in verdicts):
+                status = 'failed'
+            elif any(v == 0 for v in verdicts) and any(v == 1 for v in verdicts):
+                status = 'partial'
+            elif any(v == -1 for v in verdicts):
+                status = 'inconclusive'
             else:
-                overall = 'pending'
+                status = 'pending'
 
-            rows.append({
-                'discord_id':          p['user_id'],
-                'discord_username':    p.get('username') or '',
-                'x_handle':            p.get('x_username') or '',
-                'like_claimed':        'yes' if claimed.get('like')    else '',
-                'comment_claimed':     'yes' if claimed.get('comment') else '',
-                'retweet_claimed':     'yes' if claimed.get('retweet') else '',
-                'like_verified':       _verdict('like'),
-                'comment_verified':    _verdict('comment'),
-                'retweet_verified':    _verdict('retweet'),
-                'points_earned':       p.get('points_earned') or 0,
-                'verification_status': overall,
-                'flagged':             'yes' if p.get('verification_status') == 'flagged' else '',
-                'submitted_at':        p.get('created_at') or '',
-            })
-    return rows
+            row = {
+                'Discord Username': p.get('username') or '',
+                'X Handle':         p.get('x_username') or '',
+            }
+            for task_key, task_label in task_cols:
+                row[task_label] = cell(task_key)
+            row['Points Earned'] = p.get('points_earned') or 0
+            row['Status']        = status
+            row['Flagged']       = 'yes' if p.get('verification_status') == 'flagged' else ''
+            row['Submitted At']  = (p.get('created_at') or '')[:16]
+            rows.append(row)
+
+    return fieldnames, rows
 
 
 async def setup(bot):

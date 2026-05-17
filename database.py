@@ -404,6 +404,9 @@ def init_db():
             "ALTER TABLE engage_pools ADD COLUMN allowed_role_ids TEXT DEFAULT '[]'",
             "ALTER TABLE engage_pools ADD COLUMN auto_reset_daily INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE engage_pools ADD COLUMN embed_footer_icon_url TEXT",
+            # bot profile columns
+            "ALTER TABLE guild_settings ADD COLUMN bot_display_name TEXT",
+            "ALTER TABLE guild_settings ADD COLUMN bot_avatar_url TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -1911,7 +1914,8 @@ def get_guild_settings(guild_id) -> dict:
 
 def update_guild_settings(guild_id, **kwargs) -> dict:
     allowed = {'default_embed_color', 'default_thumbnail_url',
-               'default_footer_text', 'default_footer_icon_url'}
+               'default_footer_text', 'default_footer_icon_url',
+               'bot_display_name', 'bot_avatar_url'}
     payload = {k: v for k, v in kwargs.items() if k in allowed}
     if payload:
         get_guild_settings(guild_id)  # ensure row exists

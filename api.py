@@ -2392,6 +2392,68 @@ async def settings_access_update(server_id: int, body: dict, user: dict = Depend
     return {'ok': True}
 
 
+# ── Public overview endpoint ──────────────────────────────────────────────────
+
+@app.get('/api/public/ameretaverse-overview')
+async def public_ameretaverse_overview():
+    """Public read-only endpoint: 4 headline stats for AmeretaVerse main guild."""
+    AMERETAVERSE_GID = 1199707792706117642
+    try:
+        bot_instance = _get_bot_instance()
+        guild = bot_instance.get_guild(AMERETAVERSE_GID) if bot_instance and bot_instance.is_ready() else None
+    except Exception:
+        guild = None
+    total_members = guild.member_count if guild else 0
+
+    active = 0
+    total_messages = 0
+    growth = 0
+    try:
+        with get_connection() as conn:
+            # Try analytics_snapshots table (may exist from analytics module)
+            snap_latest = conn.execute(
+                "SELECT member_count FROM analytics_snapshots "
+                "WHERE guild_id=? ORDER BY snapshot_date DESC LIMIT 1",
+                (str(AMERETAVERSE_GID),)
+            ).fetchone()
+            snap_old = conn.execute(
+                "SELECT member_count FROM analytics_snapshots "
+                "WHERE guild_id=? AND snapshot_date <= date('now','-30 days') "
+                "ORDER BY snapshot_date DESC LIMIT 1",
+                (str(AMERETAVERSE_GID),)
+            ).fetchone()
+            if snap_latest:
+                m_latest = snap_latest['member_count'] or total_members
+            else:
+                m_latest = total_members
+            m_old = snap_old['member_count'] if snap_old else m_latest
+            growth = m_latest - m_old
+
+            # message_counters table
+            msgs = conn.execute(
+                "SELECT SUM(message_count) as total FROM message_counters WHERE guild_id=?",
+                (str(AMERETAVERSE_GID),)
+            ).fetchone()
+            total_messages = int(msgs['total'] or 0) if msgs else 0
+
+            # Active: distinct days with messages in last 30 days
+            active_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM message_counters "
+                "WHERE guild_id=? AND date >= date('now','-30 days')",
+                (str(AMERETAVERSE_GID),)
+            ).fetchone()
+            active = int(active_row['cnt'] or 0) if active_row else 0
+    except Exception as e:
+        print(f'[public-overview] DB query error: {e}')
+
+    return {
+        'total_members':     total_members,
+        'active_members':    active,
+        'member_growth_30d': growth,
+        'total_messages':    total_messages,
+    }
+
+
 # ── Health check ───────────────────────────────────────────────────────────────
 
 @app.get('/health')
