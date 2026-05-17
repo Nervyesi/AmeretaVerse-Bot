@@ -2377,7 +2377,11 @@ async def settings_get(server_id: int, user: dict = Depends(get_current_user)):
 @app.put('/api/servers/{server_id}/settings/brand')
 async def settings_brand_update(server_id: int, body: dict, user: dict = Depends(get_current_user)):
     require_module_access(user, server_id, 'settings')
-    return update_guild_settings(server_id, **body)
+    # Strip server-owned or read-only fields that must not be passed as kwargs
+    for _strip in ('guild_id', 'updated_at'):
+        body.pop(_strip, None)
+    update_guild_settings(server_id, **body)
+    return get_guild_settings(server_id)
 
 
 @app.put('/api/servers/{server_id}/settings/access')
@@ -2390,6 +2394,16 @@ async def settings_access_update(server_id: int, body: dict, user: dict = Depend
         raise HTTPException(status_code=400, detail=f'Invalid role_id or module')
     set_module_access(server_id, role_id, module, granted)
     return {'ok': True}
+
+
+@app.get('/api/public/bot-info')
+async def public_bot_info():
+    """Public endpoint: bot client ID + OAuth invite URL for Add to Server button."""
+    cid = CLIENT_ID or ''
+    return {
+        'client_id':  cid,
+        'invite_url': f'https://discord.com/oauth2/authorize?client_id={cid}&permissions=8&scope=bot%20applications.commands',
+    }
 
 
 # ── Public overview endpoint ──────────────────────────────────────────────────
