@@ -357,6 +357,24 @@ def init_db():
                 FOREIGN KEY (panel_id) REFERENCES roleselect_panels(panel_id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_rs_buttons_panel ON roleselect_buttons(panel_id);
+
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id TEXT PRIMARY KEY,
+                default_embed_color TEXT DEFAULT '#94730D',
+                default_thumbnail_url TEXT,
+                default_footer_text TEXT,
+                default_footer_icon_url TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS guild_module_access (
+                guild_id TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                module TEXT NOT NULL,
+                granted INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (guild_id, role_id, module)
+            );
+            CREATE INDEX IF NOT EXISTS idx_gma_guild ON guild_module_access(guild_id, role_id);
         """)
 
         for migration in [
@@ -1867,6 +1885,88 @@ def reset_engage_pool_daily(pool_id: int) -> int:
             (pool_id,),
         )
     return c.rowcount
+
+
+# ── Guild settings + module access ──────────────────────────────────────────
+
+MODULES = ('verify', 'roleselect', 'forms', 'tickets', 'raid', 'engage',
+           'protection', 'flagged', 'mod_log', 'audit_log', 'analytics', 'settings')
+
+
+def get_guild_settings(guild_id) -> dict:
+    gid = str(guild_id)
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM guild_settings WHERE guild_id=?", (gid,)).fetchone()
+        if row:
+            return dict(row)
+        conn.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (gid,))
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM guild_settings WHERE guild_id=?", (gid,)).fetchone()
+        return dict(row) if row else {
+            'guild_id': gid, 'default_embed_color': '#94730D',
+            'default_thumbnail_url': None, 'default_footer_text': None,
+            'default_footer_icon_url': None,
+        }
+
+
+def update_guild_settings(guild_id, **kwargs) -> dict:
+    allowed = {'default_embed_color', 'default_thumbnail_url',
+               'default_footer_text', 'default_footer_icon_url'}
+    payload = {k: v for k, v in kwargs.items() if k in allowed}
+    if payload:
+        get_guild_settings(guild_id)  # ensure row exists
+        set_clause = ', '.join(f'{k}=?' for k in payload) + ', updated_at=CURRENT_TIMESTAMP'
+        with get_connection() as conn:
+            conn.execute(f"UPDATE guild_settings SET {set_clause} WHERE guild_id=?",
+                         list(payload.values()) + [str(guild_id)])
+    return get_guild_settings(guild_id)
+
+
+def list_module_access(guild_id) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT role_id, module, granted FROM guild_module_access WHERE guild_id=?",
+            (str(guild_id),)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_module_access(guild_id, role_id: str, module: str, granted: bool) -> None:
+    gid, rid = str(guild_id), str(role_id)
+    with get_connection() as conn:
+        if granted:
+            conn.execute(
+                "INSERT INTO guild_module_access (guild_id, role_id, module, granted) VALUES (?,?,?,1) "
+                "ON CONFLICT(guild_id, role_id, module) DO UPDATE SET granted=1",
+                (gid, rid, module),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM guild_module_access WHERE guild_id=? AND role_id=? AND module=?",
+                (gid, rid, module),
+            )
+
+
+def user_can_access_module(guild_id, user_id, module: str, bot) -> bool:
+    """Owner → always. Admin → yes if no restrictions, else needs a granted role."""
+    guild = bot.get_guild(int(guild_id))
+    if not guild:
+        return False
+    if str(guild.owner_id) == str(user_id):
+        return True
+    member = guild.get_member(int(user_id))
+    if not member or not member.guild_permissions.administrator:
+        return False
+    user_role_ids = {str(r.id) for r in member.roles}
+    with get_connection() as conn:
+        grants = conn.execute(
+            "SELECT role_id FROM guild_module_access WHERE guild_id=? AND module=? AND granted=1",
+            (str(guild_id), module)
+        ).fetchall()
+    granted_ids = {str(g['role_id']) for g in grants}
+    if not granted_ids:
+        return True  # no restrictions → all admins can access
+    return bool(user_role_ids & granted_ids)
 
 
 if __name__ == '__main__':

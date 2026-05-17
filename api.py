@@ -70,6 +70,12 @@ from database import (
     check_reset_manual_count as db_check_reset_manual_count,
     upsert_raid_settings,
     get_user_x_username as db_get_user_x_username,
+    get_guild_settings,
+    update_guild_settings,
+    list_module_access,
+    set_module_access,
+    user_can_access_module,
+    MODULES,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
@@ -237,6 +243,18 @@ def require_guild_admin(user: dict, server_id: int) -> dict:
 
     return {'is_owner': is_owner, 'is_admin': is_admin, 'has_access': True}
 
+
+def require_module_access(user: dict, server_id: int, module: str) -> dict:
+    """Guild admin check + module-level role grant check."""
+    perm = require_guild_admin(user, server_id)
+    user_id = int(user.get('user_id') or user.get('id') or 0)
+    bot = _get_bot_instance()
+    if not user_can_access_module(server_id, user_id, module, bot):
+        print(f'[security] DENIED: user_id={user_id} module={module} guild={server_id} — role not granted')
+        raise HTTPException(status_code=403,
+            detail=f'You do not have access to the {module} module in this server.')
+    return perm
+
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 #  AUTH ENDPOINTS
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
@@ -377,7 +395,7 @@ async def server_analytics(
     Multi-timeframe analytics. Returns all four timeframe arrays at once.
     Reads from analytics_snapshots + message_counters (populated by cogs/analytics.py).
     """
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'analytics')
 
     today = date.today()
 
@@ -641,7 +659,12 @@ async def server_analytics(
 async def get_server_config(server_id: int, user: dict = Depends(get_current_user)):
     """Return all config key/value pairs for this guild (defaults merged with overrides)."""
     require_guild_admin(user, server_id)
-    return db_get_all_config(server_id)
+    result = db_get_all_config(server_id)
+    user_id = int(user.get('user_id') or user.get('id') or 0)
+    bot_instance = _get_bot_instance()
+    accessible = [m for m in MODULES if user_can_access_module(server_id, user_id, m, bot_instance)]
+    result['user_accessible_modules'] = accessible
+    return result
 
 
 @app.post('/api/servers/{server_id}/config')
@@ -658,7 +681,7 @@ async def set_server_config(server_id: int, body: dict, user: dict = Depends(get
 
 @app.get('/api/servers/{server_id}/protection/stats')
 async def protection_stats(server_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'protection')
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT action_type, COUNT(*) as count
@@ -712,7 +735,7 @@ async def protection_stats(server_id: int, user: dict = Depends(get_current_user
 @app.post('/api/servers/{server_id}/protection/send-message')
 async def protection_send_message(server_id: int, user: dict = Depends(get_current_user)):
     """Send the configured protection embed to the configured channel."""
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'protection')
 
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready yet')
@@ -763,7 +786,7 @@ async def protection_log(
     limit: int = 50,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'protection')
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT id, action_type, user_id, detail, created_at
@@ -777,7 +800,7 @@ async def protection_log(
 @app.get('/api/servers/{server_id}/flagged')
 async def flagged_users(server_id: int, user: dict = Depends(get_current_user)):
     """Flagged raid participants for this guild."""
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'flagged')
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT u.user_id, u.username, u.x_username,
@@ -826,7 +849,7 @@ async def audit_log(
     Normalized view of protection_actions — field names match what the frontend expects.
     Does NOT replace /protection/log; that endpoint remains unchanged.
     """
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'audit_log')
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT id, action_type, user_id, detail, created_at
@@ -935,7 +958,7 @@ async def leaderboard(
 @app.post('/api/servers/{server_id}/tickets/send-panel')
 async def tickets_send_panel(server_id: int, user: dict = Depends(get_current_user)):
     """Post the Open Ticket panel embed to the configured panel channel."""
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'tickets')
 
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready yet')
@@ -997,7 +1020,7 @@ async def list_tickets(
     user: dict = Depends(get_current_user),
 ):
     """Return tickets for this guild, filtered by status."""
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'tickets')
     limit = min(limit, 200)
     with get_connection() as conn:
         if status == 'all':
@@ -1016,7 +1039,7 @@ async def list_tickets(
 @app.get('/api/servers/{server_id}/tickets/stats')
 async def tickets_stats(server_id: int, user: dict = Depends(get_current_user)):
     """Aggregate ticket metrics for this guild."""
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'tickets')
     with get_connection() as conn:
         open_count = conn.execute(
             "SELECT COUNT(*) FROM tickets WHERE guild_id=? AND status='open'",
@@ -1071,7 +1094,7 @@ async def verify_send_message(
     user: dict = Depends(get_current_user),
 ):
     """Post the verification embed with Verify button to the specified channel."""
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'verify')
 
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready yet')
@@ -1191,7 +1214,7 @@ def _get_rs_panel(panel_id: int, server_id: int) -> dict:
 
 @app.get('/api/servers/{server_id}/roleselect/panels')
 async def rs_list_panels(server_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     panels = db_get_panels(server_id)
     for panel in panels:
         panel['buttons'] = db_get_buttons(panel['panel_id'])
@@ -1204,7 +1227,7 @@ async def rs_create_panel(
     body: _PanelCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     if body.style not in ('buttons', 'dropdown'):
         raise HTTPException(status_code=400, detail="style must be 'buttons' or 'dropdown'")
     panel_id = db_create_panel(server_id, body.title, body.description, body.style)
@@ -1220,7 +1243,7 @@ async def rs_update_panel(
     body: _PanelUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     _get_rs_panel(panel_id, server_id)
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if 'style' in updates and updates['style'] not in ('buttons', 'dropdown'):
@@ -1246,7 +1269,7 @@ async def rs_delete_panel(
     panel_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     panel = _get_rs_panel(panel_id, server_id)
 
     if panel.get('message_id') and panel.get('channel_id') and bot.is_ready():
@@ -1271,7 +1294,7 @@ async def rs_create_button(
     body: _ButtonCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     _get_rs_panel(panel_id, server_id)
     if body.mode not in ('give', 'take', 'toggle'):
         raise HTTPException(status_code=400, detail="mode must be 'give', 'take', or 'toggle'")
@@ -1290,7 +1313,7 @@ async def rs_update_button(
     body: _ButtonUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     _get_rs_panel(panel_id, server_id)
     btn = db_get_button(button_id)
     if btn is None or btn['panel_id'] != panel_id:
@@ -1310,7 +1333,7 @@ async def rs_delete_button(
     button_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     _get_rs_panel(panel_id, server_id)
     btn = db_get_button(button_id)
     if btn is None or btn['panel_id'] != panel_id:
@@ -1326,7 +1349,7 @@ async def rs_send_panel(
     body: _SendPanelBody,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     panel = _get_rs_panel(panel_id, server_id)
 
     if not bot.is_ready():
@@ -1400,7 +1423,7 @@ async def rs_refresh_panel(
     panel_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'roleselect')
     panel = _get_rs_panel(panel_id, server_id)
 
     if not panel.get('message_id') or not panel.get('channel_id'):
@@ -1532,7 +1555,7 @@ def _check_form_owner(form_id: int, server_id: int) -> dict:
 
 @app.get('/api/servers/{server_id}/forms')
 async def forms_list(server_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     forms = db_list_forms(server_id)
     for f in forms:
         f['fields'] = db_list_form_fields(f['form_id'])
@@ -1545,7 +1568,7 @@ async def forms_create(
     body: _FormCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     if not body.name.strip():
         raise HTTPException(status_code=400, detail='name is required')
     form_id = db_create_form(server_id, body.name.strip())
@@ -1560,7 +1583,7 @@ async def forms_get(
     form_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     form = _check_form_owner(form_id, server_id)
     form['fields'] = db_list_form_fields(form_id)
     return form
@@ -1573,7 +1596,7 @@ async def forms_update(
     body: _FormUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if updates:
@@ -1589,7 +1612,7 @@ async def forms_delete(
     form_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     db_delete_form(form_id, server_id)
     return {'ok': True}
@@ -1602,7 +1625,7 @@ async def forms_add_field(
     body: _FieldCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     _validate_field_type(body.field_type)
     if not body.label.strip():
@@ -1634,7 +1657,7 @@ async def forms_update_field(
     body: _FieldUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if 'field_type' in updates:
@@ -1660,7 +1683,7 @@ async def forms_delete_field(
     field_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     db_delete_form_field(field_id, form_id)
     form = db_get_form(form_id, server_id)
@@ -1675,7 +1698,7 @@ async def forms_send(
     body: _FormSendBody,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'forms')
     form = _check_form_owner(form_id, server_id)
 
     if not bot.is_ready():
@@ -1787,7 +1810,7 @@ class _RaidManualCheck(BaseModel):
 
 @app.get('/api/servers/{server_id}/raid/settings')
 async def raid_get_settings(server_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     from cogs.raidbot import LIVE_VERIFICATION_GUILD_IDS as _LIVE_VER_GUILDS
     s = db_get_raid_settings(server_id)
     return {
@@ -1801,7 +1824,7 @@ async def raid_get_settings(server_id: int, user: dict = Depends(get_current_use
 async def raid_update_settings(
     server_id: int, body: _RaidSettingsUpdate, user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
 
     ratio_keys = {'point_ratio_like', 'point_ratio_comment', 'point_ratio_retweet'}
@@ -1830,7 +1853,7 @@ async def raid_list(
     limit: int = 50,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     raids = db_list_guild_raids(server_id, status=status, limit=min(limit, 200))
     for r in raids:
         with get_connection() as conn:
@@ -1846,7 +1869,7 @@ async def raid_list(
 async def raid_create(
     server_id: int, body: _RaidCreate, user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     _validate_tweet_url(body.tweet_url)
 
     if body.total_points < 1:
@@ -1919,7 +1942,7 @@ async def raid_create(
 async def raid_end(
     server_id: int, raid_id: int, user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     raid = db_get_guild_raid(raid_id, server_id)
     if not raid:
         raise HTTPException(status_code=404, detail='Raid not found')
@@ -1931,7 +1954,7 @@ async def raid_end(
 async def raid_leaderboard_api(
     server_id: int, limit: int = 10, user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     return {'leaderboard': db_get_raid_leaderboard(server_id, min(limit, 100))}
 
 
@@ -1943,7 +1966,7 @@ async def raid_verification_log(
     user: dict = Depends(get_current_user),
 ):
     """Return aggregated verification flags — one row per (user, raid) with task details."""
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     guild = bot.get_guild(server_id) if bot.is_ready() else None
 
     having_clause = (
@@ -1996,7 +2019,7 @@ async def raid_verification_log(
 async def raid_manual_check(
     server_id: int, body: _RaidManualCheck, user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     print(f'[raid] manual-check endpoint: server={server_id} raid_id={body.raid_id} identifier={body.identifier!r}')
 
     is_unlimited = server_id in _UNLIMITED_MC_GUILDS
@@ -2030,7 +2053,7 @@ async def raid_manual_check(
 
 @app.get('/api/servers/{server_id}/raid/scraping-health')
 async def raid_scraping_health(server_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     try:
         from cogs._twitter import get_scraping_health
         return get_scraping_health()
@@ -2040,7 +2063,7 @@ async def raid_scraping_health(server_id: int, user: dict = Depends(get_current_
 
 @app.post('/api/servers/{server_id}/raid/send-guide')
 async def raid_send_guide(server_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'raid')
     settings = db_get_raid_settings(server_id)
 
     if not bot.is_ready():
@@ -2252,7 +2275,7 @@ _AMERETAVERSE_GID = 1199707792706117642
 
 @app.get('/api/servers/{server_id}/engage/pools')
 async def engage_pools_get(server_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'engage')
     import json as _json
     from database import list_engage_pools, ensure_default_pool
     pools = list_engage_pools(server_id)
@@ -2276,7 +2299,7 @@ async def engage_pool_update(
     server_id: int, pool_id: int, body: dict,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'engage')
     import json as _json
     from database import get_engage_pool_by_id, update_engage_pool
     pool = get_engage_pool_by_id(pool_id)
@@ -2315,6 +2338,58 @@ async def engage_pool_update(
     except Exception:
         updated['allowed_role_ids'] = []
     return updated
+
+
+# ── Settings module ──────────────────────────────────────────────────────────
+
+@app.get('/api/servers/{server_id}/settings')
+async def settings_get(server_id: int, user: dict = Depends(get_current_user)):
+    require_module_access(user, server_id, 'settings')
+    bot_instance = _get_bot_instance()
+    guild = bot_instance.get_guild(server_id)
+    brand  = get_guild_settings(server_id)
+    access = list_module_access(server_id)
+    by_role: dict = {}
+    for a in access:
+        if a['granted']:
+            by_role.setdefault(a['role_id'], []).append(a['module'])
+    roles_info = []
+    if guild:
+        for r in guild.roles:
+            if r.is_default():
+                continue
+            roles_info.append({
+                'id':       str(r.id),
+                'name':     r.name,
+                'color':    f'#{r.color.value:06x}' if r.color.value else None,
+                'position': r.position,
+                'modules':  by_role.get(str(r.id), []),
+            })
+        roles_info.sort(key=lambda x: x['position'], reverse=True)
+    return {
+        'guild_id': str(server_id),
+        'brand':    brand,
+        'modules':  list(MODULES),
+        'roles':    roles_info,
+    }
+
+
+@app.put('/api/servers/{server_id}/settings/brand')
+async def settings_brand_update(server_id: int, body: dict, user: dict = Depends(get_current_user)):
+    require_module_access(user, server_id, 'settings')
+    return update_guild_settings(server_id, **body)
+
+
+@app.put('/api/servers/{server_id}/settings/access')
+async def settings_access_update(server_id: int, body: dict, user: dict = Depends(get_current_user)):
+    require_module_access(user, server_id, 'settings')
+    role_id = str(body.get('role_id', '')).strip()
+    module  = str(body.get('module',  '')).strip()
+    granted = bool(body.get('granted', False))
+    if not role_id or module not in MODULES:
+        raise HTTPException(status_code=400, detail=f'Invalid role_id or module')
+    set_module_access(server_id, role_id, module, granted)
+    return {'ok': True}
 
 
 # ── Health check ───────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ When monetization launches, we just change the plan-detection logic and
 existing cogs need NO code changes.
 """
 import discord
-from database import get_config
+from database import get_config, get_guild_settings as _gs
 
 # AmeretaVerse main server — always treated as premium for branding purposes.
 # This lets us test customization features on the main server while everyone
@@ -93,6 +93,28 @@ def get_brand_value(guild_id: int, key: str, cog_override_key: str = None):
                     pass
             elif key != 'color':
                 return global_val
+
+    # Guild-level settings fallback (guild_settings table)
+    brand_defs = _gs(guild_id)
+    if key == 'color':
+        gs_color = brand_defs.get('default_embed_color') or ''
+        if gs_color.startswith('#'):
+            try:
+                return int(gs_color.lstrip('#'), 16)
+            except ValueError:
+                pass
+    elif key == 'thumbnail_url':
+        gs_val = brand_defs.get('default_thumbnail_url') or ''
+        if gs_val:
+            return gs_val
+    elif key == 'footer_text':
+        gs_val = brand_defs.get('default_footer_text') or ''
+        if gs_val:
+            return gs_val
+    elif key == 'footer_icon_url':
+        gs_val = brand_defs.get('default_footer_icon_url') or ''
+        if gs_val:
+            return gs_val
 
     return BRAND_DEFAULTS.get(key, '')
 
