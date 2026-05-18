@@ -407,7 +407,7 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
             )
 
     total_earned = 0
-    result_lines = []
+    processed: list[dict] = []  # {sub, claims, earned, results | None}
 
     for sub, claims in to_process:
         sub_id    = sub['submission_id']
@@ -455,6 +455,7 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
                 earned, source,
             )
         else:
+            results = None
             earned = 0
             for task in ('like', 'comment', 'retweet'):
                 if claims.get(task):
@@ -472,25 +473,76 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
 
         print(f'[engage] sub={sub_id} earned_total={earned}')
         total_earned += earned
-        if earned > 0:
-            result_lines.append(f'@{submitter} — earned {earned} pts')
-        else:
-            result_lines.append(f'@{submitter} — not verified')
+        processed.append({'sub': sub, 'claims': claims, 'earned': earned, 'results': results})
 
     print(f'[engage] finalize total_earned={total_earned} user={user_id} pool={pool_id}')
     if total_earned > 0:
         upsert_engage_user_points(str(guild_id), pool_id, str(user_id),
                                   delta_points=total_earned, delta_engaged=len(to_process))
 
-    pts = get_engage_user_points(pool_id, str(user_id))
-    pool_name = pool.get('display_name') or pool.get('name', 'Engage')
-    embed = discord.Embed(
-        title       = f'✅ Engage complete — {total_earned} pts earned',
-        description = f'Engaged with **{len(to_process)}** tweet(s).\n\n' +
-                      '\n'.join(result_lines) +
-                      f'\n\n**Balance:** {pts["points"]} engage pts',
-        color       = 0x94730D,
+    # Build per-tweet detail lines
+    icon  = {'like': '❤️', 'comment': '💬', 'retweet': '🔁'}
+    label = {'like': 'Like', 'comment': 'Comment', 'retweet': 'Retweet'}
+
+    result_lines: list[str] = []
+    claimed_count  = 0
+    verified_true  = 0
+    verified_false = 0
+
+    for p in processed:
+        sub        = p['sub']
+        claims     = p['claims']
+        sub_earned = p['earned']
+        results    = p['results']
+        submitter  = sub.get('submitter_x_username') or 'unknown'
+
+        task_marks: list[str] = []
+        for task in ('like', 'comment', 'retweet'):
+            if not claims.get(task):
+                continue
+            claimed_count += 1
+            if results is None:
+                mark = '⏳'
+            else:
+                v = results.get(task, {}).get('verified')
+                if v is True:
+                    mark = '✅'
+                    verified_true += 1
+                elif v is False:
+                    mark = '❌'
+                    verified_false += 1
+                else:
+                    mark = '⚠️'
+            task_marks.append(f'{icon[task]} {label[task]} {mark}')
+
+        line = f'**@{submitter}** — {sub_earned} pts'
+        if task_marks:
+            line += '\n' + '  '.join(task_marks)
+        result_lines.append(line)
+
+    pts        = get_engage_user_points(pool_id, str(user_id))
+    new_balance = pts.get('points', 0)
+    pool_name  = pool.get('display_name') or pool.get('name', 'Engage')
+
+    if not use_live:
+        # Adaptive mode — points awarded pending later verification
+        title = f'✅ Engage complete — {total_earned} pts earned'
+    elif claimed_count == 0:
+        title = f'✅ Engage complete — {total_earned} pts earned'
+    elif verified_true == 0:
+        title = '❌ Engage complete — 0 pts earned'
+    elif verified_false > 0:
+        title = f'⚠️ Engage complete — {total_earned} pts earned'
+    else:
+        title = f'✅ Engage complete — {total_earned} pts earned'
+
+    description = (
+        f'Engaged with **{len(processed)}** tweet(s):\n\n' +
+        '\n\n'.join(result_lines) +
+        f'\n\n────────────\n**Balance:** {new_balance} engage pts\n{pool_name} Pool'
     )
+
+    embed = discord.Embed(title=title, description=description, color=0x94730D)
     embed.set_footer(text=f'{pool_name} Pool')
 
     if use_live:
