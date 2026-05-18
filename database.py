@@ -1892,7 +1892,12 @@ def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_i
                 LIMIT ?""",
             params,
         ).fetchall()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    print(
+        f'[engage] list_active: pool={pool_id} exclude_user={exclude_user_id!r} '
+        f'returned {len(result)} submissions, ids={[r["submission_id"] for r in result]}'
+    )
+    return result
 
 
 def expire_old_engage_submissions() -> int:

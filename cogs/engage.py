@@ -277,6 +277,8 @@ class _EngageView(discord.ui.View):
             sub_id = s['queue'][s['index']]['submission_id']
             sels   = s['selections'].setdefault(sub_id, {'like': False, 'comment': False, 'retweet': False})
             sels[task] = not sels[task]
+            print(f'[engage] toggle: user={self.user_id} sub={sub_id} task={task} new_state={sels[task]}')
+            print(f'[engage] session.selections after toggle: {s["selections"]}')
             pool  = get_engage_pool_by_id(s['pool_id'])
             embed = _session_embed(s, pool)
             view  = _EngageView(self.user_id, s, pool)
@@ -341,10 +343,14 @@ class _EngageView(discord.ui.View):
 async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
     """Process all session selections, verify, award points, show summary."""
     session = _sessions.pop(user_id, None)
+    print(f'[engage] finalize entry: user={user_id} session_keys={list(session.keys()) if session else None}')
     if not session:
         if not interaction.response.is_done():
             await interaction.response.edit_message(content='Session not found — run /engage again.', embed=None, view=None)
         return
+
+    print(f'[engage] finalize selections: {session.get("selections")}')
+    print(f'[engage] finalize queue size: {len(session.get("queue", []))}')
 
     guild_id   = session['guild_id']
     pool_id    = session['pool_id']
@@ -357,6 +363,7 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
         if sub['submission_id'] in session['selections']
         and any(session['selections'][sub['submission_id']].values())
     ]
+    print(f'[engage] finalize to_process count={len(to_process)} sub_ids={[s[0]["submission_id"] for s in to_process]}')
 
     if not to_process:
         embed = discord.Embed(
@@ -373,6 +380,16 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
     ratios = _pool_ratios(pool)
     total  = int(pool.get('total_points_per_engage', 10))
     use_live = guild_id in LIVE_VERIFICATION_GUILD_IDS
+    print(
+        f'[engage] finalize pool={pool_id} '
+        f'raw_ratios=(like={pool.get("point_ratio_like")} '
+        f'comment={pool.get("point_ratio_comment")} '
+        f'retweet={pool.get("point_ratio_retweet")}) '
+        f'total_points={pool.get("total_points_per_engage")} '
+        f'normalized={ratios} '
+        f'use_live={use_live} '
+        f'allow=(like={pool.get("allow_like")} comment={pool.get("allow_comment")} retweet={pool.get("allow_retweet")})'
+    )
 
     if use_live:
         # Signal we are verifying
@@ -393,13 +410,22 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
     result_lines = []
 
     for sub, claims in to_process:
-        sub_id   = sub['submission_id']
-        tweet_id = sub.get('tweet_id', '')
-        dn       = sub.get('display_number', sub_id)
+        sub_id    = sub['submission_id']
+        tweet_id  = sub.get('tweet_id', '')
+        submitter = sub.get('submitter_x_username') or 'unknown'
+        print(f'[engage] processing sub={sub_id} submitter=@{submitter} tweet_id={tweet_id} claims={claims}')
 
         if use_live:
             results = await _verify_tasks(tweet_id, x_username, claims)
-            earned  = _compute_earned(results, claims, ratios, total)
+            print(f'[engage] sub={sub_id} verification_results={results}')
+            earned  = 0
+            for task in ('like', 'comment', 'retweet'):
+                if claims.get(task) and results.get(task, {}).get('verified') is True:
+                    pts = total * ratios[task] // 100
+                    earned += pts
+                    print(f'[engage] sub={sub_id} task={task} claimed=True verified=True ratio={ratios[task]} pts={pts}')
+                elif claims.get(task):
+                    print(f'[engage] sub={sub_id} task={task} claimed=True verified={results.get(task, {}).get("verified")} pts=0')
             source  = 'live'
 
             for task in ('like', 'comment', 'retweet'):
@@ -432,7 +458,9 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
             earned = 0
             for task in ('like', 'comment', 'retweet'):
                 if claims.get(task):
-                    earned += total * ratios[task] // 100
+                    pts = total * ratios[task] // 100
+                    earned += pts
+                    print(f'[engage] sub={sub_id} task={task} claimed=True (no live) ratio={ratios[task]} pts={pts}')
             upsert_engage_action(
                 str(guild_id), pool_id, sub_id, str(user_id), x_username,
                 int(bool(claims.get('like'))),
@@ -442,9 +470,14 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
                 earned, None,  # verification_source=None → pending daily check
             )
 
+        print(f'[engage] sub={sub_id} earned_total={earned}')
         total_earned += earned
-        result_lines.append(f'Tweet #{dn:04d} — {earned} pts earned')
+        if earned > 0:
+            result_lines.append(f'@{submitter} — earned {earned} pts')
+        else:
+            result_lines.append(f'@{submitter} — not verified')
 
+    print(f'[engage] finalize total_earned={total_earned} user={user_id} pool={pool_id}')
     if total_earned > 0:
         upsert_engage_user_points(str(guild_id), pool_id, str(user_id),
                                   delta_points=total_earned, delta_engaged=len(to_process))
@@ -552,10 +585,16 @@ class EngageCog(commands.Cog, name='Engage'):
         if not url_author:
             await interaction.response.send_message('❌ Invalid tweet URL.', ephemeral=True)
             return
-        if url_author != user_handle:
+
+        is_admin = bool(
+            getattr(interaction.user, 'guild_permissions', None)
+            and interaction.user.guild_permissions.administrator
+        )
+        if url_author != user_handle and not is_admin:
             await interaction.response.send_message(
-                f'⚠️ You can only submit your own tweets.\n'
-                f'This tweet is by **@{url_author}** but your linked X account is **@{user_handle}**.',
+                f'⚠️ You can only submit your own tweets. This tweet is by **@{url_author}**, '
+                f'but your linked X account is **@{user_handle}**.\n\n'
+                f'Only admins can submit third-party tweets.',
                 ephemeral=True,
             )
             return
@@ -610,14 +649,13 @@ class EngageCog(commands.Cog, name='Engage'):
             await interaction.followup.send('❌ Failed to submit. Try again.', ephemeral=True)
             return
 
-        dn = sub.get('display_number', sub['submission_id'])
         pool_name = pool.get('display_name') or pool.get('name', 'Engage')
         ttl_val = pool.get('ttl_hours')
         ttl_note = f'Expires in {ttl_val}h.' if ttl_val else 'No expiry (stays until removed).'
         new_balance = pts_row['points'] - cost
         await interaction.followup.send(
-            f'✅ Tweet **#{dn:04d}** submitted to **{pool_name}**.\n'
-            f'Cost: **{cost}** pts | New balance: **{new_balance}** pts | {ttl_note}',
+            f'✅ Your tweet is now in the **{pool_name}** pool.\n'
+            f'Cost: **{cost}** engage pts | New balance: **{new_balance}** pts | {ttl_note}',
             ephemeral=True,
         )
 

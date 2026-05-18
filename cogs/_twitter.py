@@ -223,13 +223,32 @@ async def lookup_twitter_user_by_login(username: str) -> Optional[dict]:
 
     user = data.get('user') or data.get('data') or data
     if not isinstance(user, dict):
+        print(f'[twitter] lookup_by_login: unexpected user shape type={type(user).__name__}')
         return None
+
+    print(f'[twitter] user_info raw keys: {list(user.keys())}')
+    follower_fields = {k: v for k, v in user.items() if 'follow' in k.lower()}
+    print(
+        f'[twitter] user_info sample: '
+        f'id={user.get("id")} userName={user.get("userName")} '
+        f'follower_fields={follower_fields}'
+    )
+
+    public_metrics = user.get('public_metrics') if isinstance(user.get('public_metrics'), dict) else {}
+    followers_count = int(
+        user.get('followers')
+        or user.get('followers_count')
+        or user.get('followersCount')
+        or user.get('followerCount')
+        or public_metrics.get('followers_count')
+        or 0
+    )
 
     return {
         'id':                str(user.get('id') or user.get('userId') or ''),
         'username':          user.get('userName') or user.get('username') or user.get('screen_name') or target,
         'display_name':      user.get('name') or user.get('displayName') or '',
-        'followers_count':   int(user.get('followers') or user.get('followers_count') or user.get('followersCount') or 0),
+        'followers_count':   followers_count,
         'profile_image_url': (user.get('profilePicture') or user.get('profile_image_url') or user.get('profileImageUrl') or ''),
     }
 
