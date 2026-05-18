@@ -2470,6 +2470,96 @@ async def public_ameretaverse_overview():
 
 # ── Health check ───────────────────────────────────────────────────────────────
 
+@app.get('/api/servers/{server_id}/admin/points/user/{target_user_id}')
+async def admin_get_user_points(server_id: int, target_user_id: int, user: dict = Depends(get_current_user)):
+    require_guild_admin(user, server_id)
+    from database import get_raid_user_points, get_engage_user_points, list_engage_pools
+    community = get_raid_user_points(server_id, target_user_id) or {'total_points': 0}
+    pools = list_engage_pools(server_id)
+    engage_pools = [
+        {
+            'pool_id':      p['pool_id'],
+            'name':         p['name'],
+            'display_name': p.get('display_name') or p['name'],
+            'points':       get_engage_user_points(p['pool_id'], target_user_id).get('points', 0),
+        }
+        for p in pools
+    ]
+    return {
+        'user_id':          str(target_user_id),
+        'community_points': community.get('total_points', 0),
+        'engage_pools':     engage_pools,
+    }
+
+
+@app.post('/api/servers/{server_id}/admin/points/adjust')
+async def admin_adjust_points(server_id: int, body: dict, user: dict = Depends(get_current_user)):
+    require_guild_admin(user, server_id)
+    from database import (
+        upsert_raid_user_points, get_raid_user_points,
+        upsert_engage_user_points, get_engage_user_points,
+        reset_raid_user_points, reset_engage_user_points,
+        reset_all_raid_points, reset_all_engage_points_in_pool,
+        list_engage_pools, ensure_default_pool, get_engage_pool_by_id,
+    )
+
+    action      = str(body.get('action', '')).strip()
+    point_type  = str(body.get('type', '')).strip()
+    target_uid  = body.get('user_id')
+    amount      = int(body.get('amount') or 0)
+    pool_id_req = body.get('pool_id')
+
+    if action not in ('add', 'remove', 'reset', 'reset-all'):
+        raise HTTPException(status_code=400, detail='action must be add|remove|reset|reset-all')
+    if point_type not in ('community', 'engage'):
+        raise HTTPException(status_code=400, detail='type must be community|engage')
+    if action in ('add', 'remove') and amount < 1:
+        raise HTTPException(status_code=400, detail='amount must be positive')
+    if action == 'reset-all' and body.get('confirm') != 'CONFIRM':
+        raise HTTPException(status_code=400, detail='reset-all requires confirm=CONFIRM')
+    if action != 'reset-all' and not target_uid:
+        raise HTTPException(status_code=400, detail='user_id required for this action')
+
+    if point_type == 'community':
+        if action == 'add':
+            upsert_raid_user_points(server_id, int(target_uid), +amount)
+        elif action == 'remove':
+            upsert_raid_user_points(server_id, int(target_uid), -amount)
+        elif action == 'reset':
+            reset_raid_user_points(server_id, int(target_uid))
+        elif action == 'reset-all':
+            reset_all_raid_points(server_id)
+        new_pts = (get_raid_user_points(server_id, int(target_uid)) or {}).get('total_points', 0) if target_uid else None
+        return {'ok': True, 'new_points': new_pts}
+
+    AMERETAVERSE = 1199707792706117642
+    pools = list_engage_pools(server_id)
+    if not pools and server_id != AMERETAVERSE:
+        pool_row = ensure_default_pool(server_id)
+        pools = [pool_row]
+    if pool_id_req:
+        pool_obj = get_engage_pool_by_id(int(pool_id_req))
+        if not pool_obj or pool_obj['guild_id'] != str(server_id):
+            raise HTTPException(status_code=404, detail='Pool not found in this guild')
+        pool = pool_obj
+    elif len(pools) == 1:
+        pool = pools[0]
+    else:
+        raise HTTPException(status_code=400, detail='Multiple pools — specify pool_id')
+
+    pid = pool['pool_id']
+    if action == 'add':
+        upsert_engage_user_points(str(server_id), pid, str(int(target_uid)), delta_points=+amount)
+    elif action == 'remove':
+        upsert_engage_user_points(str(server_id), pid, str(int(target_uid)), delta_points=-amount)
+    elif action == 'reset':
+        reset_engage_user_points(pid, int(target_uid))
+    elif action == 'reset-all':
+        reset_all_engage_points_in_pool(pid)
+    new_pts = get_engage_user_points(pid, str(int(target_uid))).get('points', 0) if target_uid else None
+    return {'ok': True, 'pool_id': pid, 'new_points': new_pts}
+
+
 @app.get('/health')
 async def health():
     return {

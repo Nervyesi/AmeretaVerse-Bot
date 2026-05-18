@@ -1865,8 +1865,34 @@ def ensure_default_pool(guild_id) -> dict:
 # Alias names used in cogs/engage.py (spec-required names)
 
 def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_id=None) -> list:
-    """Alias for list_active_submissions with spec-required name."""
-    return list_active_submissions(pool_id, limit=limit, exclude_user_id=exclude_user_id)
+    """Random sample of active subs, excluding user's own and any they already claimed tasks on."""
+    params = [pool_id]
+    already_engaged_clause = ''
+    if exclude_user_id is not None:
+        uid = str(exclude_user_id)
+        already_engaged_clause = """
+            AND s.submitter_user_id != ?
+            AND NOT EXISTS (
+                SELECT 1 FROM engage_actions a
+                WHERE a.submission_id = s.submission_id
+                  AND a.engager_user_id = ?
+                  AND (a.like_claimed = 1 OR a.comment_claimed = 1 OR a.retweet_claimed = 1)
+            )
+        """
+        params.extend([uid, uid])
+    params.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""SELECT s.* FROM engage_submissions s
+                WHERE s.pool_id = ?
+                  AND s.status = 'active'
+                  AND (s.expires_at IS NULL OR s.expires_at > datetime('now'))
+                  {already_engaged_clause}
+                ORDER BY RANDOM()
+                LIMIT ?""",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def expire_old_engage_submissions() -> int:
@@ -1890,10 +1916,57 @@ def reset_engage_pool_daily(pool_id: int) -> int:
     return c.rowcount
 
 
+# ── Point reset helpers ────────────────────────────────────────────────────────
+
+def reset_raid_user_points(guild_id: int, user_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE raid_user_points SET total_points=0 WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+
+
+def reset_engage_user_points(pool_id: int, user_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE engage_user_points SET points=0 WHERE pool_id=? AND user_id=?",
+            (pool_id, str(user_id)),
+        )
+
+
+def reset_all_raid_points(guild_id: int) -> int:
+    with get_connection() as conn:
+        c = conn.execute(
+            "UPDATE raid_user_points SET total_points=0 WHERE guild_id=?",
+            (guild_id,),
+        )
+    return c.rowcount
+
+
+def reset_all_engage_points_in_pool(pool_id: int) -> int:
+    with get_connection() as conn:
+        c = conn.execute(
+            "UPDATE engage_user_points SET points=0 WHERE pool_id=?",
+            (pool_id,),
+        )
+    return c.rowcount
+
+
+def reset_all_engage_points_in_guild(guild_id: int) -> int:
+    with get_connection() as conn:
+        c = conn.execute(
+            """UPDATE engage_user_points SET points=0
+               WHERE pool_id IN (SELECT pool_id FROM engage_pools WHERE guild_id=?)""",
+            (str(guild_id),),
+        )
+    return c.rowcount
+
+
 # ── Guild settings + module access ──────────────────────────────────────────
 
 MODULES = ('verify', 'roleselect', 'forms', 'tickets', 'raid', 'engage',
-           'protection', 'flagged', 'mod_log', 'audit_log', 'analytics', 'settings')
+           'protection', 'flagged', 'mod_log', 'audit_log', 'analytics', 'settings',
+           'points_admin')
 
 
 def get_guild_settings(guild_id) -> dict:

@@ -49,6 +49,7 @@ from cogs._twitter import (
     check_comment,
     check_retweet,
     extract_tweet_id,
+    extract_author_from_tweet_url,
     normalize_username,
     lookup_twitter_user_by_login,
 )
@@ -542,6 +543,19 @@ class EngageCog(commands.Cog, name='Engage'):
         if not tweet_id:
             await interaction.response.send_message(
                 '❌ Invalid tweet URL. Please use the full https://x.com/.../status/... link.',
+                ephemeral=True,
+            )
+            return
+
+        url_author  = extract_author_from_tweet_url(tweet_url)
+        user_handle = normalize_username(x_username)
+        if not url_author:
+            await interaction.response.send_message('❌ Invalid tweet URL.', ephemeral=True)
+            return
+        if url_author != user_handle:
+            await interaction.response.send_message(
+                f'⚠️ You can only submit your own tweets.\n'
+                f'This tweet is by **@{url_author}** but your linked X account is **@{user_handle}**.',
                 ephemeral=True,
             )
             return

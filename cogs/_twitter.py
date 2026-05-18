@@ -58,6 +58,14 @@ def extract_tweet_id(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def extract_author_from_tweet_url(url: str) -> Optional[str]:
+    """Extract the author handle from https://x.com/Author/status/123"""
+    if not url:
+        return None
+    m = re.search(r'(?:twitter|x)\.com/([^/?#]+)/status/\d+', url, re.IGNORECASE)
+    return m.group(1).lower() if m else None
+
+
 async def _api_get(path: str, params: dict, timeout: float = 30.0) -> Optional[dict]:
     """GET a TwitterAPI.io endpoint. Returns parsed JSON dict or None on any failure."""
     if not API_KEY:
@@ -218,9 +226,11 @@ async def lookup_twitter_user_by_login(username: str) -> Optional[dict]:
         return None
 
     return {
-        'id':           str(user.get('id') or user.get('userId') or ''),
-        'username':     user.get('userName') or user.get('username') or user.get('screen_name') or target,
-        'display_name': user.get('name') or user.get('displayName') or '',
+        'id':                str(user.get('id') or user.get('userId') or ''),
+        'username':          user.get('userName') or user.get('username') or user.get('screen_name') or target,
+        'display_name':      user.get('name') or user.get('displayName') or '',
+        'followers_count':   int(user.get('followers') or user.get('followers_count') or user.get('followersCount') or 0),
+        'profile_image_url': (user.get('profilePicture') or user.get('profile_image_url') or user.get('profileImageUrl') or ''),
     }
 
 

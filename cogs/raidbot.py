@@ -835,6 +835,112 @@ class RaidPostModal(discord.ui.Modal, title='Post New Raid'):
         )
 
 
+# ── Admin point management helper ─────────────────────────────────────────────
+
+async def _admin_adjust_points(
+    interaction: discord.Interaction,
+    guild_id: int,
+    target_user,   # discord.User or None for reset-all
+    delta: int,    # +N for add, -N for remove, None for reset
+    point_type: str,
+    pool_name: str,
+    action: str,   # 'add' | 'remove' | 'reset' | 'reset-all'
+) -> None:
+    from database import (
+        list_engage_pools, ensure_default_pool,
+        upsert_engage_user_points, get_engage_user_points,
+        reset_engage_user_points, reset_all_engage_points_in_pool,
+        reset_all_raid_points, reset_raid_user_points,
+    )
+
+    if point_type == 'community':
+        if action == 'add':
+            upsert_raid_user_points(guild_id, target_user.id, delta)
+            pts = (get_raid_user_points(guild_id, target_user.id) or {}).get('total_points', 0)
+            await interaction.response.send_message(
+                f'✅ Added **{delta}** community points to <@{target_user.id}>. Balance: **{pts} pts**.',
+                ephemeral=True,
+            )
+        elif action == 'remove':
+            upsert_raid_user_points(guild_id, target_user.id, delta)
+            pts = (get_raid_user_points(guild_id, target_user.id) or {}).get('total_points', 0)
+            await interaction.response.send_message(
+                f'✅ Removed **{abs(delta)}** community points from <@{target_user.id}>. Balance: **{pts} pts**.',
+                ephemeral=True,
+            )
+        elif action == 'reset':
+            reset_raid_user_points(guild_id, target_user.id)
+            await interaction.response.send_message(
+                f'✅ Reset community points for <@{target_user.id}> to 0.', ephemeral=True,
+            )
+        elif action == 'reset-all':
+            count = reset_all_raid_points(guild_id)
+            await interaction.response.send_message(
+                f'✅ Reset community points for all **{count}** users in this guild.', ephemeral=True,
+            )
+        return
+
+    # engage type — resolve pool
+    AMERETAVERSE = 1199707792706117642
+    pools = list_engage_pools(guild_id)
+    if not pools and guild_id != AMERETAVERSE:
+        pool_row = ensure_default_pool(guild_id)
+        pools = [pool_row]
+
+    if not pools:
+        await interaction.response.send_message('⚠️ No engage pools in this guild.', ephemeral=True)
+        return
+
+    target_pool = None
+    if len(pools) == 1:
+        target_pool = pools[0]
+    elif pool_name:
+        for p in pools:
+            if p['name'].lower() == pool_name.lower() or (p.get('display_name') or '').lower() == pool_name.lower():
+                target_pool = p
+                break
+        if not target_pool:
+            names = ', '.join(p['name'] for p in pools)
+            await interaction.response.send_message(
+                f'⚠️ Pool "{pool_name}" not found. Available: {names}.', ephemeral=True,
+            )
+            return
+    else:
+        names = ', '.join(p['name'] for p in pools)
+        await interaction.response.send_message(
+            f'⚠️ This guild has multiple pools. Specify which one: {names}.', ephemeral=True,
+        )
+        return
+
+    pool_id   = target_pool['pool_id']
+    pool_disp = target_pool.get('display_name') or target_pool['name']
+
+    if action == 'add':
+        upsert_engage_user_points(str(guild_id), pool_id, str(target_user.id), delta_points=delta)
+        pts = get_engage_user_points(pool_id, str(target_user.id)).get('points', 0)
+        await interaction.response.send_message(
+            f'✅ Added **{delta}** engage pts to <@{target_user.id}> in **{pool_disp}**. Balance: **{pts} pts**.',
+            ephemeral=True,
+        )
+    elif action == 'remove':
+        upsert_engage_user_points(str(guild_id), pool_id, str(target_user.id), delta_points=delta)
+        pts = get_engage_user_points(pool_id, str(target_user.id)).get('points', 0)
+        await interaction.response.send_message(
+            f'✅ Removed **{abs(delta)}** engage pts from <@{target_user.id}> in **{pool_disp}**. Balance: **{pts} pts**.',
+            ephemeral=True,
+        )
+    elif action == 'reset':
+        reset_engage_user_points(pool_id, target_user.id)
+        await interaction.response.send_message(
+            f'✅ Reset engage points for <@{target_user.id}> in **{pool_disp}** to 0.', ephemeral=True,
+        )
+    elif action == 'reset-all':
+        count = reset_all_engage_points_in_pool(pool_id)
+        await interaction.response.send_message(
+            f'✅ Reset engage points for all **{count}** users in **{pool_disp}**.', ephemeral=True,
+        )
+
+
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class RaidsCog(commands.Cog, name='Raids'):
@@ -1044,6 +1150,72 @@ class RaidsCog(commands.Cog, name='Raids'):
             'The bot will check your Twitter activity against this username when you join raids or engage.',
             ephemeral=True,
         )
+
+    # ── Admin point management ────────────────────────────────────────────────
+
+    @app_commands.command(name='add-points', description='Admin: Add points to a user.')
+    @app_commands.describe(user='Target Discord user', amount='Points to add', type='Point type: community or engage', pool='Engage pool name (only needed for multi-pool guilds)')
+    @app_commands.choices(type=[
+        app_commands.Choice(name='Community (Raid)', value='community'),
+        app_commands.Choice(name='Engage', value='engage'),
+    ])
+    async def add_points_cmd(self, interaction: discord.Interaction, user: discord.User, amount: int, type: str, pool: str = None):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message('⚠️ Admin only.', ephemeral=True)
+            return
+        if amount < 1:
+            await interaction.response.send_message('⚠️ Amount must be a positive number.', ephemeral=True)
+            return
+        guild_id = interaction.guild_id or 0
+        await _admin_adjust_points(interaction, guild_id, user, +amount, type, pool, action='add')
+
+    @app_commands.command(name='remove-points', description='Admin: Remove points from a user.')
+    @app_commands.describe(user='Target Discord user', amount='Points to remove', type='Point type: community or engage', pool='Engage pool name (only for multi-pool guilds)')
+    @app_commands.choices(type=[
+        app_commands.Choice(name='Community (Raid)', value='community'),
+        app_commands.Choice(name='Engage', value='engage'),
+    ])
+    async def remove_points_cmd(self, interaction: discord.Interaction, user: discord.User, amount: int, type: str, pool: str = None):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message('⚠️ Admin only.', ephemeral=True)
+            return
+        if amount < 1:
+            await interaction.response.send_message('⚠️ Amount must be a positive number.', ephemeral=True)
+            return
+        guild_id = interaction.guild_id or 0
+        await _admin_adjust_points(interaction, guild_id, user, -amount, type, pool, action='remove')
+
+    @app_commands.command(name='reset-points', description="Admin: Reset a user's points to 0.")
+    @app_commands.describe(user='Target Discord user', type='Point type: community or engage', pool='Engage pool name (only for multi-pool guilds)')
+    @app_commands.choices(type=[
+        app_commands.Choice(name='Community (Raid)', value='community'),
+        app_commands.Choice(name='Engage', value='engage'),
+    ])
+    async def reset_points_cmd(self, interaction: discord.Interaction, user: discord.User, type: str, pool: str = None):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message('⚠️ Admin only.', ephemeral=True)
+            return
+        guild_id = interaction.guild_id or 0
+        await _admin_adjust_points(interaction, guild_id, user, None, type, pool, action='reset')
+
+    @app_commands.command(name='reset-points-all', description="Admin: Reset ALL users' points in this guild. DESTRUCTIVE — requires confirmation.")
+    @app_commands.describe(type='Point type: community or engage', pool='Engage pool name (only for multi-pool guilds)', confirm='Type CONFIRM (all caps) to execute')
+    @app_commands.choices(type=[
+        app_commands.Choice(name='Community (Raid)', value='community'),
+        app_commands.Choice(name='Engage', value='engage'),
+    ])
+    async def reset_points_all_cmd(self, interaction: discord.Interaction, type: str, confirm: str, pool: str = None):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message('⚠️ Admin only.', ephemeral=True)
+            return
+        if confirm != 'CONFIRM':
+            await interaction.response.send_message(
+                '⚠️ This will reset points for ALL users. To proceed, run the command again with `confirm:CONFIRM` (exact uppercase).',
+                ephemeral=True,
+            )
+            return
+        guild_id = interaction.guild_id or 0
+        await _admin_adjust_points(interaction, guild_id, None, None, type, pool, action='reset-all')
 
     # ── Target resolution for manual check ───────────────────────────────────
 
