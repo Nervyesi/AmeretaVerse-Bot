@@ -1124,54 +1124,77 @@ class RaidsCog(commands.Cog, name='Raids'):
                 pass
             pools = list_engage_pools(str(guild_id))
 
-        engage_lines: list[str] = []
-        total_engages = 0
+        total_engages    = 0
+        total_engage_pts = 0
+        engage_breakdown: list[tuple[str, int, int]] = []  # (label, pts, engages)
         for p in pools:
             stats   = get_engage_user_points(p['pool_id'], str(user_id)) or {}
             pts     = int(stats.get('points') or 0)
             engaged = int(stats.get('total_engaged') or 0)
-            total_engages += engaged
+            total_engages    += engaged
+            total_engage_pts += pts
             label = p.get('display_name') or p.get('name') or 'Engage'
-            if len(pools) > 1:
-                engage_lines.append(f'**{label}:** `{pts} pts` ({engaged} engages)')
-            else:
-                engage_lines.append(f'**Engage Points:** `{pts} pts`')
+            engage_breakdown.append((label, pts, engaged))
 
-        level_data    = get_user_level(guild_id, user_id) or {}
-        level         = int(level_data.get('level') or 0)
-        xp            = int(level_data.get('xp') or 0)
-        next_xp       = xp_required_for_level(level + 1)
-        cur_xp_floor  = xp_required_for_level(level)
-        progress_xp   = max(0, xp - cur_xp_floor)
-        needed_xp     = max(1, next_xp - cur_xp_floor)
-
-        x_line = (
-            f'[@{x_username}](https://x.com/{x_username})'
-            if x_username else '*not linked* — use `/setx` to link'
-        )
-
-        description_lines = [
-            f'**Community Points:** `{raid_points}`',
-            f'**Raids Joined:** `{raids_joined}`',
-            '',
-            *engage_lines,
-            f'**Total Engages:** `{total_engages}`',
-            '',
-            f'**Level:** `{level}`',
-            f'**XP:** `{xp}` ({progress_xp} / {needed_xp} to next)',
-            '',
-            f'**X Account:** {x_line}',
-        ]
+        level_data   = get_user_level(guild_id, user_id) or {}
+        level        = int(level_data.get('level') or 0)
+        xp           = int(level_data.get('xp') or 0)
+        next_xp      = xp_required_for_level(level + 1)
+        cur_xp_floor = xp_required_for_level(level)
+        progress     = max(0, xp - cur_xp_floor)
+        needed       = max(1, next_xp - cur_xp_floor)
+        progress_pct = min(100, int(progress * 100 / needed)) if needed > 0 else 0
+        bar_filled   = max(0, min(10, progress_pct // 10))
+        bar          = '█' * bar_filled + '░' * (10 - bar_filled)
+        remaining    = max(0, needed - progress)
 
         embed = build_branded_embed(
             guild_id,
-            title=f'{target.display_name}\'s Profile',
-            description='\n'.join(description_lines),
             cog_prefix='profile',
             use_thumbnail=False, use_footer=True,
         )
+        embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
         embed.set_thumbnail(url=target.display_avatar.url)
-        embed.set_author(name=str(target), icon_url=target.display_avatar.url)
+
+        embed.add_field(
+            name=f'🎯 Level {level}',
+            value=f'`{bar}` **{progress_pct}%**\n{xp:,} XP · {remaining:,} XP to level {level + 1}',
+            inline=False,
+        )
+
+        embed.add_field(
+            name='⚔️ Community Points',
+            value=f'**{raid_points:,}** pts\n{raids_joined} raid(s) joined',
+            inline=True,
+        )
+
+        if len(pools) <= 1:
+            embed.add_field(
+                name='🔁 Engage Points',
+                value=f'**{total_engage_pts:,}** pts\n{total_engages} engage(s)',
+                inline=True,
+            )
+        else:
+            breakdown_text = '\n'.join(f'**{name}:** {pts:,} pts' for name, pts, _ in engage_breakdown)
+            breakdown_text += f'\n*{total_engages} total engage(s)*'
+            embed.add_field(
+                name='🔁 Engage Points',
+                value=breakdown_text,
+                inline=True,
+            )
+
+        # Spacer so the inline pair stays on its own row (Discord packs 3-per-row)
+        embed.add_field(name='​', value='​', inline=True)
+
+        if x_username:
+            x_value = f'[@{x_username}](https://x.com/{x_username})'
+        else:
+            x_value = '*not linked* — use `/setx <username>` to link'
+        embed.add_field(
+            name='🐦 X Account',
+            value=x_value,
+            inline=False,
+        )
 
         await interaction.response.send_message(embed=embed)
 
