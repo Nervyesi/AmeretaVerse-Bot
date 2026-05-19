@@ -1,6 +1,8 @@
 import sqlite3
 import os
 import shutil
+import json
+from typing import Optional
 
 DB_PATH = os.getenv("DB_PATH", "ameretaverse.db")
 
@@ -385,6 +387,45 @@ def init_db():
                 PRIMARY KEY (guild_id, user_id)
             );
             CREATE INDEX IF NOT EXISTS idx_user_levels_guild ON user_levels(guild_id, xp DESC);
+
+            CREATE TABLE IF NOT EXISTS bot_events (
+                event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id        TEXT NOT NULL,
+                category        TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                actor_user_id   TEXT,
+                actor_username  TEXT,
+                target_user_id  TEXT,
+                target_username TEXT,
+                module          TEXT,
+                severity        TEXT NOT NULL DEFAULT 'info',
+                summary         TEXT NOT NULL,
+                details_json    TEXT,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_bot_events_guild_created ON bot_events(guild_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_bot_events_category ON bot_events(guild_id, category);
+            CREATE INDEX IF NOT EXISTS idx_bot_events_module ON bot_events(guild_id, module);
+            CREATE INDEX IF NOT EXISTS idx_bot_events_target ON bot_events(target_user_id);
+
+            CREATE TABLE IF NOT EXISTS flagged_users (
+                flag_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id         TEXT NOT NULL,
+                user_id          TEXT NOT NULL,
+                username         TEXT,
+                source_module    TEXT NOT NULL,
+                source_ref_id    TEXT,
+                reason           TEXT,
+                flagged_by_actor TEXT,
+                severity         TEXT NOT NULL DEFAULT 'medium',
+                status           TEXT NOT NULL DEFAULT 'active',
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolved_at      TIMESTAMP,
+                resolved_by      TEXT,
+                resolved_note    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_flagged_guild_status ON flagged_users(guild_id, status);
+            CREATE INDEX IF NOT EXISTS idx_flagged_user ON flagged_users(user_id);
         """)
 
         for migration in [
@@ -1987,7 +2028,7 @@ def reset_all_engage_points_in_guild(guild_id: int) -> int:
 
 MODULES = ('verify', 'roleselect', 'forms', 'tickets', 'raid', 'engage',
            'protection', 'flagged', 'mod_log', 'audit_log', 'analytics', 'settings',
-           'points_admin')
+           'points_admin', 'logs')
 
 
 def get_guild_settings(guild_id) -> dict:
@@ -2160,6 +2201,246 @@ def count_user_raid_participations(guild_id: int, user_id: int) -> int:
             (int(guild_id), int(user_id))
         ).fetchone()
     return int(row['cnt']) if row else 0
+
+
+# ── Unified logging + flags ────────────────────────────────────────────────────
+
+_VALID_LOG_CATEGORIES = {'bot_activity', 'admin_action', 'protection', 'settings', 'flag'}
+_VALID_LOG_SEVERITIES = {'info', 'warning', 'error', 'critical'}
+
+
+def log_event(
+    guild_id,
+    category: str,
+    event_type: str,
+    summary: str,
+    *,
+    actor_user_id=None,
+    actor_username: Optional[str] = None,
+    target_user_id=None,
+    target_username: Optional[str] = None,
+    module: Optional[str] = None,
+    severity: str = 'info',
+    details: Optional[dict] = None,
+) -> Optional[int]:
+    """Fire-and-forget event log. Never raises — failures are printed."""
+    try:
+        if category not in _VALID_LOG_CATEGORIES:
+            print(f'[log_event] unknown category={category!r}, coercing to bot_activity')
+            category = 'bot_activity'
+        if severity not in _VALID_LOG_SEVERITIES:
+            severity = 'info'
+
+        details_json = json.dumps(details, default=str) if details else None
+
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """INSERT INTO bot_events (
+                       guild_id, category, event_type,
+                       actor_user_id, actor_username,
+                       target_user_id, target_username,
+                       module, severity, summary, details_json
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(guild_id), category, event_type,
+                    str(actor_user_id) if actor_user_id is not None else None,
+                    actor_username,
+                    str(target_user_id) if target_user_id is not None else None,
+                    target_username,
+                    module, severity, summary, details_json,
+                ),
+            )
+            return cursor.lastrowid
+    except Exception as e:
+        print(f'[log_event] FAILED ({type(e).__name__}: {e}) — event={event_type} guild={guild_id}')
+        return None
+
+
+def _build_event_where(
+    guild_id, *, category=None, module=None, actor_user_id=None,
+    target_user_id=None, severity=None, search=None,
+    since_iso=None, until_iso=None,
+):
+    where = ['guild_id = ?']
+    args: list = [str(guild_id)]
+    if category:
+        where.append('category = ?'); args.append(category)
+    if module:
+        where.append('module = ?'); args.append(module)
+    if actor_user_id is not None:
+        where.append('actor_user_id = ?'); args.append(str(actor_user_id))
+    if target_user_id is not None:
+        where.append('target_user_id = ?'); args.append(str(target_user_id))
+    if severity:
+        where.append('severity = ?'); args.append(severity)
+    if since_iso:
+        where.append('created_at >= ?'); args.append(since_iso)
+    if until_iso:
+        where.append('created_at <= ?'); args.append(until_iso)
+    if search:
+        where.append('(summary LIKE ? OR target_username LIKE ? OR actor_username LIKE ?)')
+        wild = f'%{search}%'
+        args.extend([wild, wild, wild])
+    return ' AND '.join(where), args
+
+
+def list_events(
+    guild_id,
+    *,
+    category: Optional[str] = None,
+    module: Optional[str] = None,
+    actor_user_id=None,
+    target_user_id=None,
+    severity: Optional[str] = None,
+    search: Optional[str] = None,
+    since_iso: Optional[str] = None,
+    until_iso: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list:
+    where_sql, args = _build_event_where(
+        guild_id, category=category, module=module,
+        actor_user_id=actor_user_id, target_user_id=target_user_id,
+        severity=severity, search=search,
+        since_iso=since_iso, until_iso=until_iso,
+    )
+    sql = (
+        f"SELECT * FROM bot_events WHERE {where_sql} "
+        "ORDER BY created_at DESC, event_id DESC LIMIT ? OFFSET ?"
+    )
+    args = list(args) + [int(limit), int(offset)]
+    with get_connection() as conn:
+        rows = conn.execute(sql, args).fetchall()
+
+    out = []
+    for r in rows:
+        d = dict(r)
+        raw = d.pop('details_json', None)
+        try:
+            d['details'] = json.loads(raw) if raw else {}
+        except Exception:
+            d['details'] = {}
+        out.append(d)
+    return out
+
+
+def count_events(
+    guild_id,
+    *,
+    category: Optional[str] = None,
+    module: Optional[str] = None,
+    actor_user_id=None,
+    target_user_id=None,
+    severity: Optional[str] = None,
+    search: Optional[str] = None,
+    since_iso: Optional[str] = None,
+    until_iso: Optional[str] = None,
+) -> int:
+    where_sql, args = _build_event_where(
+        guild_id, category=category, module=module,
+        actor_user_id=actor_user_id, target_user_id=target_user_id,
+        severity=severity, search=search,
+        since_iso=since_iso, until_iso=until_iso,
+    )
+    with get_connection() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM bot_events WHERE {where_sql}", args,
+        ).fetchone()
+    return int(row['cnt']) if row else 0
+
+
+def create_flag(
+    guild_id,
+    user_id,
+    source_module: str,
+    *,
+    username: Optional[str] = None,
+    source_ref_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    flagged_by_actor: str = 'system',
+    severity: str = 'medium',
+) -> Optional[int]:
+    """Create a flag entry AND emit a 'flag' event. Never raises."""
+    try:
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """INSERT INTO flagged_users
+                   (guild_id, user_id, username, source_module, source_ref_id,
+                    reason, flagged_by_actor, severity)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (str(guild_id), str(user_id), username, source_module,
+                 source_ref_id, reason, flagged_by_actor, severity),
+            )
+            flag_id = cursor.lastrowid
+    except Exception as e:
+        print(f'[create_flag] FAILED ({type(e).__name__}: {e})')
+        return None
+
+    log_event(
+        guild_id, 'flag', f'{source_module}_flag',
+        f'User flagged in {source_module}: {reason or "no reason given"}',
+        target_user_id=user_id, target_username=username,
+        module=source_module, severity='warning',
+        details={'flag_id': flag_id, 'reason': reason, 'source_ref_id': source_ref_id},
+    )
+    return flag_id
+
+
+def list_flags(
+    guild_id,
+    *,
+    status: str = 'active',
+    module: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list:
+    where = ['guild_id = ?', 'status = ?']
+    args: list = [str(guild_id), status]
+    if module:
+        where.append('source_module = ?'); args.append(module)
+    sql = (
+        f"SELECT * FROM flagged_users WHERE {' AND '.join(where)} "
+        "ORDER BY created_at DESC, flag_id DESC LIMIT ? OFFSET ?"
+    )
+    args.extend([int(limit), int(offset)])
+    with get_connection() as conn:
+        rows = conn.execute(sql, args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def resolve_flag(flag_id: int, resolved_by, note: Optional[str] = None) -> bool:
+    import datetime as _dt
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM flagged_users WHERE flag_id = ?", (int(flag_id),),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                """UPDATE flagged_users
+                   SET status='resolved', resolved_at=?, resolved_by=?, resolved_note=?
+                   WHERE flag_id=?""",
+                (
+                    _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                    str(resolved_by), note, int(flag_id),
+                ),
+            )
+    except Exception as e:
+        print(f'[resolve_flag] FAILED ({type(e).__name__}: {e})')
+        return False
+
+    log_event(
+        row['guild_id'], 'flag', 'flag_resolved',
+        f'Flag #{flag_id} resolved' + (f': {note}' if note else ''),
+        actor_user_id=resolved_by,
+        target_user_id=row['user_id'],
+        target_username=row['username'],
+        module=row['source_module'],
+        severity='info',
+        details={'flag_id': int(flag_id), 'note': note},
+    )
+    return True
 
 
 if __name__ == '__main__':

@@ -76,6 +76,11 @@ from database import (
     set_module_access,
     user_can_access_module,
     MODULES,
+    log_event,
+    list_events,
+    count_events,
+    list_flags,
+    resolve_flag,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
@@ -293,11 +298,16 @@ async def auth_callback(code: str):
         if int(g.get('permissions', 0)) & 0x8
     ]
 
+    avatar_hash = user_data.get('avatar')
+    avatar_full = avatar_url(user_data['id'], avatar_hash, user_data.get('discriminator', '0'))
+
     jwt_payload = {
-        'user_id':  user_id,
-        'username': user_data.get('global_name') or user_data['username'],
-        'avatar':   avatar_url(user_data['id'], user_data.get('avatar'), user_data.get('discriminator', '0')),
-        'guilds':   admin_guilds,
+        'user_id':     user_id,
+        'username':    user_data.get('global_name') or user_data['username'],
+        'avatar':      avatar_full,  # legacy field: full URL (kept for compat)
+        'avatar_hash': avatar_hash,
+        'avatar_url':  avatar_full,
+        'guilds':      admin_guilds,
     }
     token = create_jwt(jwt_payload)
     return RedirectResponse(f'{FRONTEND_URL}/dashboard?token={token}')
@@ -306,11 +316,16 @@ async def auth_callback(code: str):
 @app.get('/auth/me')
 async def auth_me(user: dict = Depends(get_current_user)):
     """Return current user info decoded from JWT."""
+    # Defensive: older JWTs may only carry `avatar` (the full URL); synthesize avatar_url.
+    avatar_full = user.get('avatar_url') or user.get('avatar')
     return {
-        'user_id':  user['user_id'],
-        'username': user['username'],
-        'avatar':   user['avatar'],
-        'guilds':   user.get('guilds', []),
+        'user_id':     user['user_id'],
+        'id':          str(user['user_id']),
+        'username':    user['username'],
+        'avatar':      avatar_full,
+        'avatar_hash': user.get('avatar_hash'),
+        'avatar_url':  avatar_full,
+        'guilds':      user.get('guilds', []),
     }
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
@@ -796,6 +811,111 @@ async def protection_log(
             LIMIT ?
         """, (server_id, min(limit, 200))).fetchall()
     return [dict(r) for r in rows]
+
+# ── Unified logs + flags ──────────────────────────────────────────────────────
+
+@app.get('/api/servers/{server_id}/logs')
+async def logs_list(
+    server_id: int,
+    category: Optional[str] = None,
+    module: Optional[str] = None,
+    severity: Optional[str] = None,
+    search: Optional[str] = None,
+    target_user_id: Optional[str] = None,
+    actor_user_id: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'logs')
+    limit  = max(1, min(int(limit or 50), 500))
+    offset = max(0, int(offset or 0))
+    events = list_events(
+        server_id,
+        category=category, module=module, severity=severity,
+        search=search,
+        target_user_id=target_user_id or None,
+        actor_user_id=actor_user_id or None,
+        since_iso=since, until_iso=until,
+        limit=limit, offset=offset,
+    )
+    total = count_events(
+        server_id,
+        category=category, module=module, severity=severity,
+        search=search,
+        target_user_id=target_user_id or None,
+        actor_user_id=actor_user_id or None,
+        since_iso=since, until_iso=until,
+    )
+    return {'events': events, 'total': total, 'limit': limit, 'offset': offset}
+
+
+@app.get('/api/servers/{server_id}/logs/export')
+async def logs_export(
+    server_id: int,
+    category: Optional[str] = None,
+    module: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'logs')
+    import io as _io
+    import csv as _csv
+    from fastapi.responses import Response as _Response
+
+    events = list_events(server_id, category=category, module=module, limit=1000)
+    buf = _io.StringIO()
+    writer = _csv.DictWriter(buf, fieldnames=[
+        'created_at', 'category', 'event_type', 'module', 'severity',
+        'actor_username', 'target_username', 'summary',
+    ])
+    writer.writeheader()
+    for e in events:
+        writer.writerow({
+            'created_at':      e.get('created_at') or '',
+            'category':        e.get('category') or '',
+            'event_type':      e.get('event_type') or '',
+            'module':          e.get('module') or '',
+            'severity':        e.get('severity') or '',
+            'actor_username':  e.get('actor_username') or '',
+            'target_username': e.get('target_username') or '',
+            'summary':         e.get('summary') or '',
+        })
+
+    return _Response(
+        content='﻿' + buf.getvalue(),  # BOM so Excel reads UTF-8 cleanly
+        media_type='text/csv',
+        headers={'Content-Disposition': f'attachment; filename="logs_{server_id}.csv"'},
+    )
+
+
+@app.get('/api/servers/{server_id}/flags')
+async def flags_list(
+    server_id: int,
+    status: str = 'active',
+    module: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'logs')
+    return list_flags(server_id, status=status, module=module)
+
+
+@app.post('/api/servers/{server_id}/flags/{flag_id}/resolve')
+async def flag_resolve(
+    server_id: int,
+    flag_id: int,
+    body: dict,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'logs')
+    note = (body.get('note') or '').strip() or None
+    actor_id = user.get('user_id') or user.get('id') or 0
+    ok = resolve_flag(flag_id, actor_id, note)
+    if not ok:
+        raise HTTPException(status_code=404, detail='Flag not found')
+    return {'ok': True}
+
 
 @app.get('/api/servers/{server_id}/flagged')
 async def flagged_users(server_id: int, user: dict = Depends(get_current_user)):
@@ -2385,6 +2505,18 @@ async def settings_brand_update(server_id: int, body: dict, user: dict = Depends
     update_guild_settings(server_id, **body)
     new = get_guild_settings(server_id) or {}
 
+    log_event(
+        server_id, 'settings', 'settings_updated',
+        f'Brand settings updated by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='brand', severity='info',
+        details={'changes': {k: body[k] for k in body if k in {
+            'default_embed_color', 'default_thumbnail_url', 'default_footer_text',
+            'default_footer_icon_url', 'bot_display_name', 'bot_avatar_url',
+        }}},
+    )
+
     # Best-effort apply to Discord — failures are logged but never break the save.
     AMERETAVERSE_GUILD_ID = 1199707792706117642
     is_amereta = (int(server_id) == AMERETAVERSE_GUILD_ID)
@@ -2458,6 +2590,14 @@ async def settings_levels_update(server_id: int, body: dict, user: dict = Depend
             s = str(v or '').lstrip('#').strip()
             payload[k] = s or None
     update_guild_settings(server_id, **payload)
+    log_event(
+        server_id, 'settings', 'settings_updated',
+        f'Level settings updated by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='levels', severity='info',
+        details={'changes': payload},
+    )
     return get_guild_settings(server_id)
 
 
@@ -2470,6 +2610,14 @@ async def settings_access_update(server_id: int, body: dict, user: dict = Depend
     if not role_id or module not in MODULES:
         raise HTTPException(status_code=400, detail=f'Invalid role_id or module')
     set_module_access(server_id, role_id, module, granted)
+    log_event(
+        server_id, 'settings', 'settings_updated',
+        f'Access {"granted" if granted else "revoked"}: role {role_id} → {module}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='access_control', severity='info',
+        details={'role_id': role_id, 'module': module, 'granted': granted},
+    )
     return {'ok': True}
 
 

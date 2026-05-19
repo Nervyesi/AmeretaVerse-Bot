@@ -15,8 +15,23 @@ from database import (
     get_connection,
     get_config as _db_get_config,
     set_config as _db_set_config,
+    log_event,
 )
 from config import DEFAULT_BOT_THUMBNAIL_URL
+
+# Severity by protection action type — anything missing falls back to 'warning'.
+_PROTECTION_SEVERITY = {
+    'spam_mute':         'warning',
+    'phishing_delete':   'error',
+    'link_delete':       'warning',
+    'banned_word':       'warning',
+    'suspicious_flag':   'warning',
+    'suspicious_kick':   'error',
+    'suspicious_ban':    'critical',
+    'raid_lockdown':     'critical',
+    'raid_kick_new':     'critical',
+    'raid_ban_new':      'critical',
+}
 
 URL_RE = re.compile(
     r"(https?://|www\.)\S+|"
@@ -79,7 +94,7 @@ def resolve_role(guild: discord.Guild, value: str) -> discord.Role | None:
 
 # ── DB: log protection actions ────────────────────────────────────────────────
 
-def log_action(guild_id: int, action_type: str, user_id: int, detail: str):
+def log_action(guild_id: int, action_type: str, user_id: int, detail: str, *, username: str = None):
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO protection_actions
@@ -87,6 +102,15 @@ def log_action(guild_id: int, action_type: str, user_id: int, detail: str):
                VALUES (?,?,?,?)""",
             (guild_id, action_type, user_id, detail),
         )
+
+    log_event(
+        guild_id, 'protection', action_type,
+        f'Protection: {action_type} — {detail}',
+        target_user_id=user_id, target_username=username,
+        module='protection',
+        severity=_PROTECTION_SEVERITY.get(action_type, 'warning'),
+        details={'action': action_type, 'detail': detail},
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

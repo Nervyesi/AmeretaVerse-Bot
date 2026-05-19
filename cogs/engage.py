@@ -44,6 +44,7 @@ from database import (
     get_engage_user_points,
     get_engage_leaderboard,
     sample_pending_engage_actions,
+    log_event,
 )
 from cogs._twitter import (
     check_comment,
@@ -564,6 +565,22 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
         upsert_engage_user_points(str(guild_id), pool_id, str(user_id),
                                   delta_points=total_earned, delta_engaged=len(to_process))
 
+    pool_name_log = pool.get('display_name') or pool.get('name', 'Engage')
+    log_event(
+        guild_id, 'bot_activity', 'engage_completed',
+        f'Engaged with {len(processed)} tweet(s), earned {total_earned} pts in {pool_name_log}',
+        actor_user_id=user_id,
+        actor_username=x_username or None,
+        module='engage', severity='info',
+        details={
+            'pool_id': pool_id,
+            'pool_name': pool.get('name'),
+            'tweets_engaged': len(processed),
+            'points_earned': total_earned,
+            'mode': 'live' if use_live else 'adaptive',
+        },
+    )
+
     # Build per-tweet detail lines
     icon  = {'like': '❤️', 'comment': '💬', 'retweet': '🔁'}
     label = {'like': 'Like', 'comment': 'Comment', 'retweet': 'Retweet'}
@@ -793,6 +810,22 @@ class EngageCog(commands.Cog, name='Engage'):
             f'✅ Your tweet is now in the **{pool_name}** pool.\n'
             f'Cost: **{cost}** engage pts | New balance: **{new_balance}** pts | {ttl_note}',
             ephemeral=True,
+        )
+
+        log_event(
+            guild_id, 'bot_activity', 'engage_submitted',
+            f'Tweet submitted to {pool_name}: {tweet_url}',
+            actor_user_id=interaction.user.id,
+            actor_username=str(interaction.user),
+            module='engage', severity='info',
+            details={
+                'pool_id': pool['pool_id'],
+                'pool_name': pool.get('name'),
+                'tweet_url': tweet_url,
+                'cost': cost,
+                'submission_id': sub.get('submission_id'),
+                'third_party': url_author != user_handle,
+            },
         )
 
     # ── /engage-stats ──────────────────────────────────────────────────────

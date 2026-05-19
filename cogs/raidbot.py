@@ -48,6 +48,8 @@ from database import (
     get_engage_user_points,
     get_user_level,
     xp_required_for_level,
+    log_event,
+    create_flag,
 )
 from cogs._utils import resolve_channel, resolve_role
 from cogs._branding import build_branded_embed, PREMIUM_GUILD_IDS
@@ -822,6 +824,20 @@ class RaidPostModal(discord.ui.Modal, title='Post New Raid'):
             interaction.user.id,
         )
         raid = get_guild_raid(raid_id, guild_id)
+        log_event(
+            guild_id, 'bot_activity', 'raid_created',
+            f'Raid #{raid.get("display_number") or raid_id} created: {tweet_url_val}',
+            actor_user_id=interaction.user.id,
+            actor_username=str(interaction.user),
+            module='raid', severity='info',
+            details={
+                'raid_id': raid_id,
+                'display_number': raid.get('display_number'),
+                'tweet_url': tweet_url_val,
+                'mode': mode_val,
+                'points': pts,
+            },
+        )
 
         embed = _build_raid_embed(guild_id, raid, tweet_data, settings)
         view  = build_raid_panel_view(raid_id)
@@ -859,6 +875,10 @@ async def _admin_adjust_points(
         reset_all_raid_points, reset_raid_user_points,
     )
 
+    actor_id   = interaction.user.id
+    actor_name = str(interaction.user)
+    target_name = str(target_user) if target_user else None
+
     if point_type == 'community':
         if action == 'add':
             upsert_raid_user_points(guild_id, target_user.id, delta)
@@ -867,6 +887,14 @@ async def _admin_adjust_points(
                 f'✅ Added **{delta}** community points to <@{target_user.id}>. Balance: **{pts} pts**.',
                 ephemeral=True,
             )
+            log_event(
+                guild_id, 'admin_action', 'points_added',
+                f'Admin added {delta} community pts to {target_name}',
+                actor_user_id=actor_id, actor_username=actor_name,
+                target_user_id=target_user.id, target_username=target_name,
+                module='raid', severity='warning',
+                details={'amount': delta, 'type': 'community', 'new_balance': pts},
+            )
         elif action == 'remove':
             upsert_raid_user_points(guild_id, target_user.id, delta)
             pts = (get_raid_user_points(guild_id, target_user.id) or {}).get('total_points', 0)
@@ -874,15 +902,38 @@ async def _admin_adjust_points(
                 f'✅ Removed **{abs(delta)}** community points from <@{target_user.id}>. Balance: **{pts} pts**.',
                 ephemeral=True,
             )
+            log_event(
+                guild_id, 'admin_action', 'points_removed',
+                f'Admin removed {abs(delta)} community pts from {target_name}',
+                actor_user_id=actor_id, actor_username=actor_name,
+                target_user_id=target_user.id, target_username=target_name,
+                module='raid', severity='warning',
+                details={'amount': abs(delta), 'type': 'community', 'new_balance': pts},
+            )
         elif action == 'reset':
             reset_raid_user_points(guild_id, target_user.id)
             await interaction.response.send_message(
                 f'✅ Reset community points for <@{target_user.id}> to 0.', ephemeral=True,
             )
+            log_event(
+                guild_id, 'admin_action', 'points_reset',
+                f'Admin reset community pts for {target_name}',
+                actor_user_id=actor_id, actor_username=actor_name,
+                target_user_id=target_user.id, target_username=target_name,
+                module='raid', severity='warning',
+                details={'type': 'community'},
+            )
         elif action == 'reset-all':
             count = reset_all_raid_points(guild_id)
             await interaction.response.send_message(
                 f'✅ Reset community points for all **{count}** users in this guild.', ephemeral=True,
+            )
+            log_event(
+                guild_id, 'admin_action', 'points_reset_all',
+                f'Admin reset community pts for ALL ({count}) users',
+                actor_user_id=actor_id, actor_username=actor_name,
+                module='raid', severity='critical',
+                details={'type': 'community', 'affected_count': count},
             )
         return
 
@@ -928,6 +979,15 @@ async def _admin_adjust_points(
             f'✅ Added **{delta}** engage pts to <@{target_user.id}> in **{pool_disp}**. Balance: **{pts} pts**.',
             ephemeral=True,
         )
+        log_event(
+            guild_id, 'admin_action', 'points_added',
+            f'Admin added {delta} engage pts to {target_name} in {pool_disp}',
+            actor_user_id=actor_id, actor_username=actor_name,
+            target_user_id=target_user.id, target_username=target_name,
+            module='engage', severity='warning',
+            details={'amount': delta, 'type': 'engage', 'pool_id': pool_id,
+                     'pool_name': pool_disp, 'new_balance': pts},
+        )
     elif action == 'remove':
         upsert_engage_user_points(str(guild_id), pool_id, str(target_user.id), delta_points=delta)
         pts = get_engage_user_points(pool_id, str(target_user.id)).get('points', 0)
@@ -935,15 +995,40 @@ async def _admin_adjust_points(
             f'✅ Removed **{abs(delta)}** engage pts from <@{target_user.id}> in **{pool_disp}**. Balance: **{pts} pts**.',
             ephemeral=True,
         )
+        log_event(
+            guild_id, 'admin_action', 'points_removed',
+            f'Admin removed {abs(delta)} engage pts from {target_name} in {pool_disp}',
+            actor_user_id=actor_id, actor_username=actor_name,
+            target_user_id=target_user.id, target_username=target_name,
+            module='engage', severity='warning',
+            details={'amount': abs(delta), 'type': 'engage', 'pool_id': pool_id,
+                     'pool_name': pool_disp, 'new_balance': pts},
+        )
     elif action == 'reset':
         reset_engage_user_points(pool_id, target_user.id)
         await interaction.response.send_message(
             f'✅ Reset engage points for <@{target_user.id}> in **{pool_disp}** to 0.', ephemeral=True,
         )
+        log_event(
+            guild_id, 'admin_action', 'points_reset',
+            f'Admin reset engage pts for {target_name} in {pool_disp}',
+            actor_user_id=actor_id, actor_username=actor_name,
+            target_user_id=target_user.id, target_username=target_name,
+            module='engage', severity='warning',
+            details={'type': 'engage', 'pool_id': pool_id, 'pool_name': pool_disp},
+        )
     elif action == 'reset-all':
         count = reset_all_engage_points_in_pool(pool_id)
         await interaction.response.send_message(
             f'✅ Reset engage points for all **{count}** users in **{pool_disp}**.', ephemeral=True,
+        )
+        log_event(
+            guild_id, 'admin_action', 'points_reset_all',
+            f'Admin reset engage pts for ALL ({count}) users in {pool_disp}',
+            actor_user_id=actor_id, actor_username=actor_name,
+            module='engage', severity='critical',
+            details={'type': 'engage', 'pool_id': pool_id, 'pool_name': pool_disp,
+                     'affected_count': count},
         )
 
 
@@ -1531,6 +1616,14 @@ class RaidsCog(commands.Cog, name='Raids'):
                         (deducted, discord_user_id),
                     )
             print(f'[raid] manual_check FLAGGED {discord_username} tasks={sorted(flagged_tasks)} deducted={deducted}')
+            create_flag(
+                guild_id, discord_user_id, 'raid',
+                username=discord_username,
+                source_ref_id=str(raid.get('raid_id') or ''),
+                reason=f'Manual check failed tasks: {", ".join(sorted(flagged_tasks))} ({deducted} pts deducted)',
+                flagged_by_actor='system',
+                severity='high' if deducted > 0 else 'medium',
+            )
         elif not any_inconclusive:
             # All checks conclusive and passed — mark verified
             with get_connection() as conn:
@@ -1597,6 +1690,12 @@ class RaidsCog(commands.Cog, name='Raids'):
     async def hourly_auto_end_task(self):
         """Sweep for raids older than 48h and mark them ended. Keeps Active Raids list clean."""
         with get_connection() as conn:
+            doomed = conn.execute(
+                "SELECT guild_id, COUNT(*) AS c FROM raids "
+                "WHERE status='active' AND posted_at IS NOT NULL "
+                "AND datetime(posted_at) < datetime('now', '-48 hours') "
+                "GROUP BY guild_id"
+            ).fetchall()
             result = conn.execute(
                 "UPDATE raids SET status='ended', ended_reason='auto_48h' "
                 "WHERE status='active' AND posted_at IS NOT NULL "
@@ -1605,6 +1704,16 @@ class RaidsCog(commands.Cog, name='Raids'):
             count = result.rowcount
         if count:
             print(f'[raid] hourly_auto_end: closed {count} raid(s) older than 48h')
+            for row in doomed:
+                gid = row['guild_id']
+                n = int(row['c'])
+                if gid and n > 0:
+                    log_event(
+                        gid, 'bot_activity', 'raid_auto_ended',
+                        f'{n} raid(s) auto-ended after 48h',
+                        module='raid', severity='info',
+                        details={'count': n, 'reason': 'auto_48h'},
+                    )
 
     @hourly_auto_end_task.before_loop
     async def before_hourly_auto_end(self):
@@ -1717,6 +1826,14 @@ class RaidsCog(commands.Cog, name='Raids'):
                         (deduct, row['user_id']),
                     )
             print(f'[raid] FLAGGED user {row["user_id"]} tasks={flag_reason} deducted={deduct}pts')
+            create_flag(
+                guild_id, row['user_id'], 'raid',
+                username=str(row.get('user_id')),
+                source_ref_id=str(row.get('raid_id') or ''),
+                reason=f'Daily check failed tasks: {flag_reason} ({deduct} pts deducted)',
+                flagged_by_actor='system',
+                severity='high' if deduct > 0 else 'medium',
+            )
             return 'flagged'
 
         if any_inconclusive:
