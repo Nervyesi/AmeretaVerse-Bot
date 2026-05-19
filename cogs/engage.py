@@ -340,6 +340,90 @@ class _EngageView(discord.ui.View):
         await _finalize(inter, self.user_id)
 
 
+class _StartEngageView(discord.ui.View):
+    """List screen with a Start Engage button; clicking launches the slideshow."""
+
+    def __init__(self, user_id: int, pool_id: int):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.pool_id = pool_id
+
+        btn = discord.ui.Button(
+            style     = discord.ButtonStyle.success,
+            label     = '✅ Start Engage',
+            row       = 0,
+            custom_id = f'eng:start:{user_id}',
+        )
+        btn.callback = self._start_cb
+        self.add_item(btn)
+
+        cancel = discord.ui.Button(
+            style     = discord.ButtonStyle.danger,
+            label     = 'Cancel',
+            row       = 0,
+            custom_id = f'eng:cancel:{user_id}',
+        )
+        cancel.callback = self._cancel_cb
+        self.add_item(cancel)
+
+    async def _start_cb(self, inter: discord.Interaction):
+        if inter.user.id != self.user_id:
+            await inter.response.send_message('❌ Not your session.', ephemeral=True)
+            return
+        s = _sessions.get(self.user_id)
+        if not s:
+            await inter.response.edit_message(
+                content='Session expired — run /engage again.', embed=None, view=None,
+            )
+            return
+        pool  = get_engage_pool_by_id(s['pool_id'])
+        embed = _session_embed(s, pool)
+        view  = _EngageView(self.user_id, s, pool)
+        await inter.response.edit_message(content=None, embed=embed, view=view)
+
+    async def _cancel_cb(self, inter: discord.Interaction):
+        if inter.user.id != self.user_id:
+            await inter.response.send_message('❌ Not your session.', ephemeral=True)
+            return
+        _sessions.pop(self.user_id, None)
+        await inter.response.edit_message(
+            content='Engage cancelled.', embed=None, view=None,
+        )
+
+
+def _session_intro_embed(session: dict, pool: dict) -> discord.Embed:
+    """Pre-slideshow list of tweets the user is about to engage with."""
+    queue = session['queue']
+    pool_name = pool.get('display_name') or pool.get('name', 'Engage')
+
+    color_str = (pool.get('embed_color') or '').strip()
+    try:
+        color = int(color_str.lstrip('#'), 16) if color_str else 0x94730D
+    except ValueError:
+        color = 0x94730D
+
+    list_lines = []
+    for i, sub in enumerate(queue, 1):
+        submitter = sub.get('submitter_x_username') or 'unknown'
+        url       = sub.get('tweet_url') or ''
+        list_lines.append(f'**{i}.** [@{submitter}]({url})')
+
+    description = (
+        f'Found **{len(queue)}** tweet(s) in **{pool_name}**.\n'
+        'Open them in tabs to prepare, then click **✅ Start Engage** to begin.\n\n'
+        + '\n'.join(list_lines)
+    )
+
+    embed = discord.Embed(
+        title       = f'Engage Pool — {pool_name}',
+        description = description,
+        color       = color,
+    )
+    footer = pool.get('embed_footer_text') or 'AmeretaVerse • Engage'
+    embed.set_footer(text=footer)
+    return embed
+
+
 async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
     """Process all session selections, verify, award points, show summary."""
     session = _sessions.pop(user_id, None)
@@ -601,8 +685,8 @@ class EngageCog(commands.Cog, name='Engage'):
             'x_username': x_username,
         }
 
-        embed = _session_embed(_sessions[user_id], pool)
-        view  = _EngageView(user_id, _sessions[user_id], pool)
+        embed = _session_intro_embed(_sessions[user_id], pool)
+        view  = _StartEngageView(user_id, pool['pool_id'])
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     # ── /submit ────────────────────────────────────────────────────────────

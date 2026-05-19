@@ -375,6 +375,16 @@ def init_db():
                 PRIMARY KEY (guild_id, role_id, module)
             );
             CREATE INDEX IF NOT EXISTS idx_gma_guild ON guild_module_access(guild_id, role_id);
+
+            CREATE TABLE IF NOT EXISTS user_levels (
+                guild_id   TEXT NOT NULL,
+                user_id    TEXT NOT NULL,
+                xp         INTEGER NOT NULL DEFAULT 0,
+                level      INTEGER NOT NULL DEFAULT 0,
+                last_xp_at TIMESTAMP,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_levels_guild ON user_levels(guild_id, xp DESC);
         """)
 
         for migration in [
@@ -407,6 +417,12 @@ def init_db():
             # bot profile columns
             "ALTER TABLE guild_settings ADD COLUMN bot_display_name TEXT",
             "ALTER TABLE guild_settings ADD COLUMN bot_avatar_url TEXT",
+            # leveling columns
+            "ALTER TABLE guild_settings ADD COLUMN level_enabled INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE guild_settings ADD COLUMN xp_per_message INTEGER NOT NULL DEFAULT 15",
+            "ALTER TABLE guild_settings ADD COLUMN xp_cooldown_seconds INTEGER NOT NULL DEFAULT 60",
+            "ALTER TABLE guild_settings ADD COLUMN level_up_message_enabled INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE guild_settings ADD COLUMN level_up_channel_id TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -1993,7 +2009,9 @@ def get_guild_settings(guild_id) -> dict:
 def update_guild_settings(guild_id, **kwargs) -> dict:
     allowed = {'default_embed_color', 'default_thumbnail_url',
                'default_footer_text', 'default_footer_icon_url',
-               'bot_display_name', 'bot_avatar_url'}
+               'bot_display_name', 'bot_avatar_url',
+               'level_enabled', 'xp_per_message', 'xp_cooldown_seconds',
+               'level_up_message_enabled', 'level_up_channel_id'}
     payload = {k: v for k, v in kwargs.items() if k in allowed}
     if payload:
         get_guild_settings(guild_id)  # ensure row exists
@@ -2049,6 +2067,99 @@ def user_can_access_module(guild_id, user_id, module: str, bot) -> bool:
     if not granted_ids:
         return True  # no restrictions → all admins can access
     return bool(user_role_ids & granted_ids)
+
+
+# ── Activity-based leveling ────────────────────────────────────────────────────
+
+def xp_required_for_level(level: int) -> int:
+    """Total XP needed to reach the start of `level`. Level 0 = 0 XP.
+
+    Curve: cumulative sum of 5*k^2 + 50*k + 100 for k in 1..level.
+    Tuned so early levels (1–3) come fast, then grow.
+    """
+    if level <= 0:
+        return 0
+    total = 0
+    for k in range(1, level + 1):
+        total += 5 * k * k + 50 * k + 100
+    return total
+
+
+def level_from_xp(xp: int) -> int:
+    """Inverse of xp_required_for_level — current level for a given total XP."""
+    if xp <= 0:
+        return 0
+    level = 0
+    while xp >= xp_required_for_level(level + 1):
+        level += 1
+        if level > 1000:  # safety cap
+            break
+    return level
+
+
+def get_user_level(guild_id, user_id) -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_levels WHERE guild_id=? AND user_id=?",
+            (str(guild_id), str(user_id))
+        ).fetchone()
+    if not row:
+        return {'guild_id': str(guild_id), 'user_id': str(user_id),
+                'xp': 0, 'level': 0, 'last_xp_at': None}
+    return dict(row)
+
+
+def grant_xp(guild_id, user_id, amount: int) -> tuple:
+    """Grant XP. Returns (new_xp, new_level, leveled_up)."""
+    import datetime as _dt
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT xp, level FROM user_levels WHERE guild_id=? AND user_id=?",
+            (str(guild_id), str(user_id))
+        ).fetchone()
+        old_xp    = row['xp']    if row else 0
+        old_level = row['level'] if row else 0
+        new_xp    = max(0, old_xp + int(amount))
+        new_level = level_from_xp(new_xp)
+        leveled_up = new_level > old_level
+
+        if row:
+            conn.execute(
+                "UPDATE user_levels SET xp=?, level=?, last_xp_at=? "
+                "WHERE guild_id=? AND user_id=?",
+                (new_xp, new_level, now_iso, str(guild_id), str(user_id))
+            )
+        else:
+            conn.execute(
+                "INSERT INTO user_levels (guild_id, user_id, xp, level, last_xp_at) "
+                "VALUES (?,?,?,?,?)",
+                (str(guild_id), str(user_id), new_xp, new_level, now_iso)
+            )
+    return new_xp, new_level, leveled_up
+
+
+def get_xp_leaderboard(guild_id, limit: int = 10) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT user_id, xp, level FROM user_levels "
+            "WHERE guild_id=? ORDER BY xp DESC LIMIT ?",
+            (str(guild_id), int(limit))
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Raid participation count helper ────────────────────────────────────────────
+
+def count_user_raid_participations(guild_id: int, user_id: int) -> int:
+    """Distinct raids this user has participated in (any status) for the guild."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT raid_id) AS cnt FROM raid_participation "
+            "WHERE guild_id=? AND user_id=?",
+            (int(guild_id), int(user_id))
+        ).fetchone()
+    return int(row['cnt']) if row else 0
 
 
 if __name__ == '__main__':

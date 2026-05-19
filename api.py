@@ -2436,6 +2436,31 @@ async def settings_brand_update(server_id: int, body: dict, user: dict = Depends
     return new
 
 
+@app.put('/api/servers/{server_id}/settings/levels')
+async def settings_levels_update(server_id: int, body: dict, user: dict = Depends(get_current_user)):
+    require_module_access(user, server_id, 'settings')
+    allowed = {
+        'level_enabled', 'xp_per_message', 'xp_cooldown_seconds',
+        'level_up_message_enabled', 'level_up_channel_id',
+    }
+    payload: dict = {}
+    for k, v in body.items():
+        if k not in allowed:
+            continue
+        if k in ('level_enabled', 'level_up_message_enabled'):
+            payload[k] = 1 if v else 0
+        elif k in ('xp_per_message', 'xp_cooldown_seconds'):
+            try:
+                payload[k] = max(0, int(v))
+            except (TypeError, ValueError):
+                continue
+        elif k == 'level_up_channel_id':
+            s = str(v or '').lstrip('#').strip()
+            payload[k] = s or None
+    update_guild_settings(server_id, **payload)
+    return get_guild_settings(server_id)
+
+
 @app.put('/api/servers/{server_id}/settings/access')
 async def settings_access_update(server_id: int, body: dict, user: dict = Depends(get_current_user)):
     require_module_access(user, server_id, 'settings')

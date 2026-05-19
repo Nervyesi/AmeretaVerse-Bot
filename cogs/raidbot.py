@@ -42,6 +42,12 @@ from database import (
     get_user_x_username,
     find_user_by_x_username,
     list_guild_raids,
+    count_user_raid_participations,
+    list_engage_pools,
+    ensure_default_pool,
+    get_engage_user_points,
+    get_user_level,
+    xp_required_for_level,
 )
 from cogs._utils import resolve_channel, resolve_role
 from cogs._branding import build_branded_embed, PREMIUM_GUILD_IDS
@@ -98,7 +104,7 @@ DEFAULT_GUIDE_DESCRIPTION = (
     "**━━━━━━━━━━━━━━━━━━━━━━━**\n\n"
     "**📊 Track your progress**\n\n"
     "- `/raid leaderboard` — see the top raiders in this server\n"
-    "- `/raid profile` — see your own stats\n\n"
+    "- `/profile` — see your own stats\n\n"
     "Happy raiding! 🚀"
 )
 
@@ -1084,34 +1090,89 @@ class RaidsCog(commands.Cog, name='Raids'):
         )
         await interaction.response.send_message(embed=embed)
 
-    @raid_group.command(name='profile', description='View raid stats for yourself or a member')
-    @app_commands.describe(member='Member to look up (defaults to yourself)')
-    async def raid_profile(self, interaction: discord.Interaction, member: discord.Member = None):
+    # ── /profile ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name='profile',
+        description='View your AVbot profile: points, levels, and linked X account.',
+    )
+    @app_commands.describe(user='View someone else\'s profile (admin only)')
+    async def profile_cmd(self, interaction: discord.Interaction, user: discord.User = None):
+        target = user or interaction.user
+        if user is not None and user.id != interaction.user.id:
+            if not getattr(interaction.user, 'guild_permissions', None) or not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message(
+                    '⚠️ Admin only when viewing other users.', ephemeral=True,
+                )
+                return
+
         guild_id = interaction.guild_id or 0
-        settings = get_raid_settings(guild_id)
-        if not settings or not settings.get('enabled'):
-            await interaction.response.send_message('❌ The Raid System is disabled on this server.', ephemeral=True)
-            return
+        user_id  = target.id
 
-        target   = member or interaction.user
-        pts_row  = get_raid_user_points(guild_id, target.id)
-        x_uname  = get_user_x_username(target.id)
-        points   = pts_row['total_points']    if pts_row else 0
-        raids_c  = pts_row['raids_completed'] if pts_row else 0
+        x_username = (get_user_x_username(user_id) or '').strip()
 
-        name = 'Your' if target == interaction.user else f"{target.display_name}'s"
+        pts_row      = get_raid_user_points(guild_id, user_id) or {}
+        raid_points  = int(pts_row.get('total_points') or 0)
+        raids_joined = count_user_raid_participations(guild_id, user_id)
+
+        AMERETAVERSE_GUILD_ID = 1199707792706117642
+        pools = list_engage_pools(str(guild_id))
+        if not pools and guild_id != AMERETAVERSE_GUILD_ID:
+            try:
+                ensure_default_pool(guild_id)
+            except ValueError:
+                pass
+            pools = list_engage_pools(str(guild_id))
+
+        engage_lines: list[str] = []
+        total_engages = 0
+        for p in pools:
+            stats   = get_engage_user_points(p['pool_id'], str(user_id)) or {}
+            pts     = int(stats.get('points') or 0)
+            engaged = int(stats.get('total_engaged') or 0)
+            total_engages += engaged
+            label = p.get('display_name') or p.get('name') or 'Engage'
+            if len(pools) > 1:
+                engage_lines.append(f'**{label}:** `{pts} pts` ({engaged} engages)')
+            else:
+                engage_lines.append(f'**Engage Points:** `{pts} pts`')
+
+        level_data    = get_user_level(guild_id, user_id) or {}
+        level         = int(level_data.get('level') or 0)
+        xp            = int(level_data.get('xp') or 0)
+        next_xp       = xp_required_for_level(level + 1)
+        cur_xp_floor  = xp_required_for_level(level)
+        progress_xp   = max(0, xp - cur_xp_floor)
+        needed_xp     = max(1, next_xp - cur_xp_floor)
+
+        x_line = (
+            f'[@{x_username}](https://x.com/{x_username})'
+            if x_username else '*not linked* — use `/setx` to link'
+        )
+
+        description_lines = [
+            f'**Community Points:** `{raid_points}`',
+            f'**Raids Joined:** `{raids_joined}`',
+            '',
+            *engage_lines,
+            f'**Total Engages:** `{total_engages}`',
+            '',
+            f'**Level:** `{level}`',
+            f'**XP:** `{xp}` ({progress_xp} / {needed_xp} to next)',
+            '',
+            f'**X Account:** {x_line}',
+        ]
+
         embed = build_branded_embed(
-            guild_id, title=f'{name} Raid Profile',
-            cog_prefix='raid', use_thumbnail=False, use_image=False, use_footer=True,
+            guild_id,
+            title=f'{target.display_name}\'s Profile',
+            description='\n'.join(description_lines),
+            cog_prefix='profile',
+            use_thumbnail=False, use_footer=True,
         )
         embed.set_thumbnail(url=target.display_avatar.url)
-        embed.add_field(name='Points',       value=f'`{points} pts`', inline=True)
-        embed.add_field(name='Raids Joined', value=f'`{raids_c}`',    inline=True)
-        embed.add_field(
-            name='X Account',
-            value=f'[@{x_uname}](https://x.com/{x_uname})' if x_uname else '`not set` — use `/setx`',
-            inline=False,
-        )
+        embed.set_author(name=str(target), icon_url=target.display_avatar.url)
+
         await interaction.response.send_message(embed=embed)
 
     # ── /setx ─────────────────────────────────────────────────────────────────
