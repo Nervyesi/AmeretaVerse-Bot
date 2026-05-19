@@ -2380,8 +2380,60 @@ async def settings_brand_update(server_id: int, body: dict, user: dict = Depends
     # Strip server-owned or read-only fields that must not be passed as kwargs
     for _strip in ('guild_id', 'updated_at'):
         body.pop(_strip, None)
+
+    old = get_guild_settings(server_id) or {}
     update_guild_settings(server_id, **body)
-    return get_guild_settings(server_id)
+    new = get_guild_settings(server_id) or {}
+
+    # Best-effort apply to Discord — failures are logged but never break the save.
+    AMERETAVERSE_GUILD_ID = 1199707792706117642
+    is_amereta = (int(server_id) == AMERETAVERSE_GUILD_ID)
+
+    try:
+        bot_instance = _get_bot_instance()
+    except HTTPException:
+        bot_instance = None
+
+    guild = bot_instance.get_guild(int(server_id)) if bot_instance else None
+
+    # Per-guild bot nickname — supported on every guild.
+    if guild is not None and 'bot_display_name' in body:
+        new_name = (body.get('bot_display_name') or '').strip() or None
+        try:
+            me = guild.me
+            if me is not None and me.nick != new_name:
+                await me.edit(nick=new_name)
+                print(f'[settings] applied nick={new_name!r} on guild {server_id}')
+        except discord.Forbidden:
+            print(f'[settings] forbidden: cannot change nick on guild {server_id}')
+        except discord.HTTPException as e:
+            print(f'[settings] HTTP error setting nick on {server_id}: {e}')
+        except Exception as e:
+            print(f'[settings] failed to apply nick on {server_id}: {type(e).__name__}: {e}')
+
+    # Bot avatar — application-wide; only AmeretaVerse main can change it.
+    if (
+        is_amereta and bot_instance is not None
+        and 'bot_avatar_url' in body
+        and new.get('bot_avatar_url') != old.get('bot_avatar_url')
+    ):
+        avatar_url = (body.get('bot_avatar_url') or '').strip()
+        if avatar_url:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(avatar_url) as resp:
+                        if resp.status == 200:
+                            avatar_bytes = await resp.read()
+                            await bot_instance.user.edit(avatar=avatar_bytes)
+                            print(f'[settings] applied avatar from {avatar_url}')
+                        else:
+                            print(f'[settings] avatar fetch HTTP {resp.status} for {avatar_url}')
+            except discord.HTTPException as e:
+                print(f'[settings] HTTP error setting avatar (possibly rate-limited): {e}')
+            except Exception as e:
+                print(f'[settings] failed to apply avatar: {type(e).__name__}: {e}')
+
+    return new
 
 
 @app.put('/api/servers/{server_id}/settings/access')

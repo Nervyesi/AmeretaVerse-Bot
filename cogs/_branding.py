@@ -25,6 +25,11 @@ existing cogs need NO code changes.
 """
 import discord
 from database import get_config, get_guild_settings as _gs
+from config import (
+    DEFAULT_BOT_THUMBNAIL_URL,
+    DEFAULT_BOT_FOOTER_TEXT,
+    DEFAULT_BOT_EMBED_COLOR,
+)
 
 # AmeretaVerse main server — always treated as premium for branding purposes.
 # This lets us test customization features on the main server while everyone
@@ -32,12 +37,12 @@ from database import get_config, get_guild_settings as _gs
 PREMIUM_GUILD_IDS = {1199707792706117642}
 
 # AVbot default brand. These are the values everyone on free plan sees.
-# When you give us official assets later, just update these constants.
+# Sourced from config.py so the same constants are usable outside this module.
 BRAND_DEFAULTS = {
-    'color':            0x94730D,
-    'thumbnail_url':    '',
+    'color':            DEFAULT_BOT_EMBED_COLOR,
+    'thumbnail_url':    DEFAULT_BOT_THUMBNAIL_URL,
     'image_url':        '',
-    'footer_text':      'Powered by AVbot',
+    'footer_text':      DEFAULT_BOT_FOOTER_TEXT,
     'footer_icon_url':  '',
     'author_name':      '',
     'author_icon_url':  '',

@@ -16,8 +16,7 @@ from database import (
     get_config as _db_get_config,
     set_config as _db_set_config,
 )
-
-LOGO_URL = "https://i.imgur.com/KAkfd9v.png"
+from config import DEFAULT_BOT_THUMBNAIL_URL
 
 URL_RE = re.compile(
     r"(https?://|www\.)\S+|"
@@ -120,7 +119,7 @@ async def send_mod_log(guild: discord.Guild, embed: discord.Embed):
 def protection_embed(title: str, description: str, color: int = 0x94730D) -> discord.Embed:
     e = discord.Embed(title=title, description=description, color=color,
                       timestamp=datetime.now(timezone.utc))
-    e.set_thumbnail(url=LOGO_URL)
+    e.set_thumbnail(url=DEFAULT_BOT_THUMBNAIL_URL)
     e.set_footer(text="AmeretaVerse • Protection System")
     return e
 

@@ -11,8 +11,8 @@ from database import (
     set_config as _db_set_config,
     get_all_config as _db_get_all_config,
 )
+from config import DEFAULT_BOT_THUMBNAIL_URL as LOGO_URL
 
-LOGO_URL = "https://i.imgur.com/FNE8Li0.png"
 ENGAGE_CHANNEL_NAME = "engage"
 CREATOR_ENGAGE_CHANNEL_NAME = "creator-engage"
 
