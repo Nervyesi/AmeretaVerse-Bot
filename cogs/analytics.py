@@ -41,6 +41,30 @@ class Analytics(commands.Cog):
                    DO UPDATE SET count = count + 1""",
                 (message.guild.id, today, hour),
             )
+            # Cumulative per-channel counts (messages per channel widget).
+            conn.execute(
+                """INSERT INTO message_channel_counters (guild_id, channel_id, count, last_at)
+                   VALUES (?, ?, 1, datetime('now'))
+                   ON CONFLICT(guild_id, channel_id)
+                   DO UPDATE SET count = count + 1, last_at = datetime('now')""",
+                (message.guild.id, message.channel.id),
+            )
+            # Cumulative per-user counts (top chatters widget).
+            conn.execute(
+                """INSERT INTO message_user_counters (guild_id, user_id, count, last_at)
+                   VALUES (?, ?, 1, datetime('now'))
+                   ON CONFLICT(guild_id, user_id)
+                   DO UPDATE SET count = count + 1, last_at = datetime('now')""",
+                (message.guild.id, message.author.id),
+            )
+            # Cumulative hour-of-day distribution (most active hours widget).
+            conn.execute(
+                """INSERT INTO message_hourly_dist (guild_id, hour, count)
+                   VALUES (?, ?, 1)
+                   ON CONFLICT(guild_id, hour)
+                   DO UPDATE SET count = count + 1""",
+                (message.guild.id, hour),
+            )
 
     @commands.Cog.listener()
     async def on_member_join(self, member):

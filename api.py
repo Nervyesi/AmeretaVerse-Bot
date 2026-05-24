@@ -508,6 +508,31 @@ async def server_stats(server_id: int, user: dict = Depends(get_current_user)):
     }
 
 
+def _build_channel_messages(server_id: int, chan_rows) -> list:
+    """Resolve channel ids to live names; drop channels that no longer exist."""
+    guild = bot.get_guild(server_id) if bot and bot.is_ready() else None
+    out = []
+    for r in chan_rows:
+        cid = int(r['channel_id'])
+        ch = guild.get_channel(cid) if guild else None
+        if ch is None and guild is not None:
+            # Channel deleted — skip it rather than show a dangling id.
+            continue
+        out.append({
+            'channel_id': str(cid),
+            'name': f'#{ch.name}' if ch else f'#{cid}',
+            'count': int(r['count'] or 0),
+        })
+    return out
+
+
+def _build_active_hours(hour_dist_rows) -> list:
+    """Return a full 24-slot hour-of-day distribution (0 for unseen hours)."""
+    by_hour = {int(r['hour']): int(r['count'] or 0) for r in hour_dist_rows}
+    return [{'hour': h, 'label': f'{h:02d}:00', 'count': by_hour.get(h, 0)}
+            for h in range(24)]
+
+
 @app.get('/api/servers/{server_id}/analytics')
 async def server_analytics(
     server_id: int,
@@ -621,6 +646,43 @@ async def server_analytics(
             FROM engage_participation
         """).fetchone()
 
+        e4e_participants = conn.execute("""
+            SELECT COUNT(DISTINCT user_id) as participants FROM engage_participation
+        """).fetchone()
+
+        # ── Messages per channel (cumulative, never pruned) ───────────────
+        chan_rows = conn.execute("""
+            SELECT channel_id, count FROM message_channel_counters
+            WHERE guild_id=? ORDER BY count DESC LIMIT 15
+        """, (server_id,)).fetchall()
+
+        # ── Top chatters (cumulative per-user counts) ─────────────────────
+        chatter_rows = conn.execute("""
+            SELECT muc.user_id, muc.count AS msg_count, u.username
+            FROM message_user_counters muc
+            LEFT JOIN users u ON u.user_id = muc.user_id
+            WHERE muc.guild_id=? ORDER BY muc.count DESC LIMIT 10
+        """, (server_id,)).fetchall()
+
+        # ── Most active hours (cumulative hour-of-day distribution) ───────
+        hour_dist_rows = conn.execute("""
+            SELECT hour, count FROM message_hourly_dist WHERE guild_id=?
+        """, (server_id,)).fetchall()
+
+        # ── Community Points engagement (raids + community points) ────────
+        comm_part = conn.execute("""
+            SELECT COUNT(DISTINCT user_id) AS participants,
+                   COALESCE(SUM(points_earned),0) AS points_awarded,
+                   COUNT(*) AS participations
+            FROM raid_participation WHERE guild_id=?
+        """, (server_id,)).fetchone()
+
+        comm_holders = conn.execute("""
+            SELECT rup.user_id, u.username, rup.total_points, rup.raids_completed
+            FROM raid_user_points rup LEFT JOIN users u ON u.user_id=rup.user_id
+            WHERE rup.guild_id=? ORDER BY rup.total_points DESC LIMIT 10
+        """, (server_id,)).fetchall()
+
     # ── Stat card values ──────────────────────────────────────────────────
     _guild = bot.get_guild(server_id)
     live_count = _guild.member_count if _guild else 0
@@ -702,20 +764,30 @@ async def server_analytics(
 
     def build_year():
         by_ym = {r['ym']: r for r in snaps_12mo}
+        # First snapshot month — do NOT plot phantom zero points for months
+        # before any real data existed (avoids the flat-then-jump artifact).
+        first_ym = None
+        if first_snap and first_snap['first_date']:
+            first_ym = str(first_snap['first_date'])[:7]
         mg, jl, msgs = [], [], []
         for i in range(11, -1, -1):
             y, m = today.year, today.month - i
             while m <= 0:
                 m += 12; y -= 1
             d = date(y, m, 1)
-            snap = by_ym.get(d.strftime('%Y-%m'))
+            ym = d.strftime('%Y-%m')
+            snap = by_ym.get(ym)
+            before_data = bool(first_ym) and ym < first_ym
+            # value=None tells the chart to start the line at the first real
+            # snapshot rather than drawing a phantom 0.
             mg.append({'label': month_label(d),
-                       'value': int(snap['avg_members'] or 0) if snap else 0})
+                       'value': None if (before_data or not snap)
+                                else int(snap['avg_members'] or 0)})
             jl.append({'label': month_label(d),
-                       'joins':  int(snap['total_joins']  or 0) if snap else 0,
-                       'leaves': int(snap['total_leaves'] or 0) if snap else 0})
+                       'joins':  None if before_data else int(snap['total_joins']  or 0) if snap else 0,
+                       'leaves': None if before_data else int(snap['total_leaves'] or 0) if snap else 0})
             msgs.append({'label': month_label(d),
-                         'value': int(snap['total_msgs'] or 0) if snap else 0})
+                         'value': None if before_data else int(snap['total_msgs'] or 0) if snap else 0})
         return mg, jl, msgs
 
     def build_day():
@@ -762,7 +834,55 @@ async def server_analytics(
         'data_started':        first_snap['first_date'] if first_snap else None,
         'first_snapshot_date': first_snap['first_date'] if first_snap else None,
         'has_any_data':        has_data,
-        'voice':               None,
+
+        # ── Messages per channel (real, cumulative) ───────────────────────
+        'messages_per_channel': _build_channel_messages(server_id, chan_rows),
+
+        # ── Top chatters (real, cumulative) ───────────────────────────────
+        'top_chatters': [
+            {'user_id': str(r['user_id']),
+             'username': r['username'] or f"User {r['user_id']}",
+             'count': int(r['msg_count'] or 0)}
+            for r in chatter_rows
+        ],
+
+        # ── Most active hours (real, cumulative 24h distribution) ─────────
+        'active_hours': _build_active_hours(hour_dist_rows),
+
+        # ── Voice: no voice data collected yet. Structured empty state so
+        #    the UI renders cleanly and the aggregation path is correct for
+        #    when data does exist. ───────────────────────────────────────
+        'voice': {
+            'available':     False,
+            'total_minutes': 0,
+            'total_sessions': 0,
+            'top_channels':  [],
+            'top_users':     [],
+        },
+
+        # ── Engagement, split into two independent sections ───────────────
+        'community_points': {
+            'total_raids':     raid_stats['total_raids'] or 0,
+            'active_raids':    raid_stats['active_raids'] or 0,
+            'points_offered':  raid_stats['total_points_offered'] or 0,
+            'participants':    comm_part['participants'] or 0,
+            'points_awarded':  comm_part['points_awarded'] or 0,
+            'participations':  comm_part['participations'] or 0,
+            'top_holders': [
+                {'user_id': str(r['user_id']),
+                 'username': r['username'] or f"User {r['user_id']}",
+                 'points': int(r['total_points'] or 0),
+                 'raids_completed': int(r['raids_completed'] or 0)}
+                for r in comm_holders
+            ],
+        },
+        'engage_engagement': {
+            'total_links':       e4e_stats['total_links'] or 0,
+            'active_links':      e4e_stats['active_links'] or 0,
+            'total_engagements': e4e_part['total'] or 0,
+            'total_points':      e4e_part['points'] or 0,
+            'participants':      e4e_participants['participants'] or 0,
+        },
         'stat_cards': {
             'total_members':      live_count,
             'today_joins':        today_joins,

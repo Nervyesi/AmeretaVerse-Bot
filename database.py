@@ -310,6 +310,37 @@ def init_db():
                 PRIMARY KEY (guild_id, date, hour)
             );
 
+            -- Cumulative (never-pruned) per-channel message counts. Powers the
+            -- "messages per channel" analytics widget. Channel names resolved
+            -- live from the gateway cache at read time.
+            CREATE TABLE IF NOT EXISTS message_channel_counters (
+                guild_id   INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                count      INTEGER DEFAULT 0,
+                last_at    TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, channel_id)
+            );
+
+            -- Cumulative per-user message counts. Powers "top chatters".
+            CREATE TABLE IF NOT EXISTS message_user_counters (
+                guild_id INTEGER NOT NULL,
+                user_id  INTEGER NOT NULL,
+                count    INTEGER DEFAULT 0,
+                last_at  TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_msg_user_top
+                ON message_user_counters(guild_id, count DESC);
+
+            -- Cumulative hour-of-day distribution (never pruned, unlike the
+            -- short-retention message_hourly). Powers "most active hours".
+            CREATE TABLE IF NOT EXISTS message_hourly_dist (
+                guild_id INTEGER NOT NULL,
+                hour     INTEGER NOT NULL,
+                count    INTEGER DEFAULT 0,
+                PRIMARY KEY (guild_id, hour)
+            );
+
             CREATE TABLE IF NOT EXISTS tickets (
                 ticket_id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id         INTEGER NOT NULL,
