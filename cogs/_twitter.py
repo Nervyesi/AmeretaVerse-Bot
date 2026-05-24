@@ -11,12 +11,48 @@ False = conclusively absent (API returned data but task was not done).
 """
 import os
 import re
+import time
 import asyncio
+import collections
 import httpx
 from typing import Optional
 
 API_KEY  = (os.getenv('TWITTER_API_IO_KEY') or '').strip()
 API_BASE = 'https://api.twitterapi.io'
+
+# ── Global budget guard (TwitterAPI.io is paid per call) ─────────────────────
+# A single choke point for ALL outbound Twitter calls regardless of which
+# feature triggered them (raid verify, engage verify, manual checks, lookups).
+# Caps the per-minute and per-day call rate so abuse/spam cannot run up the
+# bill. When the cap is hit we return None (inconclusive) so callers degrade
+# gracefully — no crash, no wrongly-awarded points; the user can retry later.
+_MAX_CALLS_PER_MIN = max(1, int(os.getenv('TWITTER_MAX_CALLS_PER_MIN', '120') or 120))
+_MAX_CALLS_PER_DAY = max(1, int(os.getenv('TWITTER_MAX_CALLS_PER_DAY', '20000') or 20000))
+_call_times: collections.deque = collections.deque()  # monotonic ts within last 60s
+_day_count   = 0
+_day_start   = 0.0
+_budget_lock = asyncio.Lock()
+
+
+async def _budget_allows() -> bool:
+    """Return True if another outbound Twitter call is within budget."""
+    global _day_count, _day_start
+    async with _budget_lock:
+        now = time.monotonic()
+        if _day_start == 0.0 or (now - _day_start) >= 86400:
+            _day_start, _day_count = now, 0
+        if _day_count >= _MAX_CALLS_PER_DAY:
+            print('[twitter] budget guard: DAILY cap reached')
+            return False
+        cutoff = now - 60.0
+        while _call_times and _call_times[0] < cutoff:
+            _call_times.popleft()
+        if len(_call_times) >= _MAX_CALLS_PER_MIN:
+            print('[twitter] budget guard: per-minute cap reached')
+            return False
+        _call_times.append(now)
+        _day_count += 1
+        return True
 
 SCRAPING_HEALTHY      = True
 _consecutive_failures = 0
@@ -70,6 +106,10 @@ async def _api_get(path: str, params: dict, timeout: float = 30.0) -> Optional[d
     """GET a TwitterAPI.io endpoint. Returns parsed JSON dict or None on any failure."""
     if not API_KEY:
         print('[twitter] _api_get: no API key configured')
+        return None
+
+    if not await _budget_allows():
+        # Over budget — degrade to inconclusive rather than spend more money.
         return None
 
     url     = f'{API_BASE}{path}'

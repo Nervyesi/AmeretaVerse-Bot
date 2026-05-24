@@ -37,6 +37,8 @@ from database import (
     get_raid_user_points,
     get_raid_leaderboard,
     add_raid_verification_log,
+    get_credited_tasks,
+    add_credited_tasks,
     count_pending_participations_24h,
     sample_pending_participations,
     get_user_x_username,
@@ -127,6 +129,29 @@ def _get_panel_state(user_id: int, raid_id: int) -> dict:
 
 def _clear_panel_state(user_id: int, raid_id: int):
     _panel_selections.pop((user_id, raid_id), None)
+
+
+# ── Re-verify anti-spam cooldown (live-verification guilds only) ──────────────
+# Every confirm/re-verify on a live guild triggers Twitter/X API calls. To
+# protect the TwitterAPI.io budget and prevent spam, a user may only trigger a
+# verification for a given raid once per REVERIFY_COOLDOWN_SECONDS. In-memory is
+# sufficient: a bot restart simply resets the timers, and the worst case is a
+# few extra allowed calls right after a restart. key = (user_id, raid_id) → ts.
+import time as _time
+REVERIFY_COOLDOWN_SECONDS = 20
+_reverify_last: dict = {}
+
+
+def _reverify_cooldown_remaining(user_id: int, raid_id: int) -> float:
+    """Seconds left before this user may verify this raid again (0 if ready)."""
+    last = _reverify_last.get((user_id, raid_id))
+    if last is None:
+        return 0.0
+    return max(0.0, REVERIFY_COOLDOWN_SECONDS - (_time.monotonic() - last))
+
+
+def _reverify_mark(user_id: int, raid_id: int):
+    _reverify_last[(user_id, raid_id)] = _time.monotonic()
 
 
 # ── Adaptive check percentage ─────────────────────────────────────────────────
@@ -432,149 +457,130 @@ async def _live_verify_and_award(
         else:
             results['like'] = {'verified': True, 'reason': 'like_companions_passed'}
 
-    any_failed      = any(r.get('verified') is False for r in results.values())
-    any_inconclusive = any(r.get('verified') is None  for r in results.values())
-    all_passed      = bool(results) and not any_failed and not any_inconclusive
+    # ── Idempotent, delta-only crediting (live verification / AmeretaVerse) ──
+    #
+    # ROOT CAUSE of the "completed a task but got nothing" bug: the old flow
+    # treated each submit as one-shot. A transient Twitter false-negative or an
+    # inconclusive API result on ANY claimed task could (a) zero out the award
+    # in partial mode, (b) kill a passing "like" via the companion rule, or
+    # (c) create a participation record that then permanently blocked the user
+    # from ever claiming the tasks they really completed. So legitimately
+    # completed tasks could be lost forever.
+    #
+    # FIX: credit per task, idempotently. For each claimed task we record in
+    # raid_credited_tasks (PK guild+raid+user+task, INSERT OR IGNORE = race
+    # safe) whether it has been credited. We award ONLY tasks that pass now and
+    # were not already credited (the delta). A transient failure no longer
+    # denies anything permanently — the user presses Join Raid and verifies
+    # again, and the still-missing tasks get filled in. A task already credited
+    # can never be credited again. This both fixes reliability and powers
+    # re-verify. (Live guilds only; other tenants use _instant_award + daily
+    # sampling and never reach this code.)
+    raid_mode = raid.get('mode', 'partial')
 
-    if all_passed:
-        earned, lines = 0, []
-        for task in ('like', 'comment', 'retweet'):
-            if not claimed.get(task): continue
-            pts = total * nr[task] // 100; earned += pts
-            lines.append(f'{_task_emoji[task]} {_task_label[task]} — {pts} pts ✅')
+    already        = get_credited_tasks(guild_id, raid_id, user_id)   # {task: pts}
+    existing_part  = get_raid_participation(guild_id, raid_id, user_id)
+    is_first_time  = not already and not existing_part
 
-        create_raid_participation(guild_id, raid_id, user_id, json.dumps(claimed), earned)
-        upsert_raid_user_points(guild_id, user_id, earned, delta_raids=1)
+    def _pts(task):
+        return total * nr[task] // 100
+
+    # Tasks verified as TRUE on this attempt.
+    passing_now = {
+        t for t in ('like', 'comment', 'retweet')
+        if claimed.get(t) and results.get(t, {}).get('verified') is True
+    }
+    # Tasks claimed, not yet credited, and not passing now (failed/inconclusive).
+    pending_now = {
+        t for t in ('like', 'comment', 'retweet')
+        if claimed.get(t) and t not in passing_now and t not in already
+    }
+
+    if raid_mode == 'all':
+        # All-or-nothing: only credit once EVERY claimed task is satisfied
+        # (already credited OR passing now). Otherwise credit nothing this
+        # attempt and let the user re-verify once X has synced.
+        claimed_tasks = {t for t in ('like', 'comment', 'retweet') if claimed.get(t)}
+        satisfied = {t for t in claimed_tasks if t in already or t in passing_now}
+        to_credit = ({t: _pts(t) for t in passing_now if t not in already}
+                     if claimed_tasks and satisfied >= claimed_tasks else {})
+    else:
+        # Partial: credit each passing, not-yet-credited task independently.
+        to_credit = {t: _pts(t) for t in passing_now if t not in already}
+
+    newly = add_credited_tasks(guild_id, raid_id, user_id, to_credit)  # race-safe delta
+    newly_pts = sum(newly.values())
+
+    if newly_pts > 0:
+        upsert_raid_user_points(guild_id, user_id, newly_pts,
+                                delta_raids=1 if is_first_time else 0)
         with get_connection() as conn:
             conn.execute("UPDATE users SET total_points=total_points+? WHERE user_id=?",
-                         (earned, user_id))
-        for task, r in results.items():
-            add_raid_verification_log(guild_id, raid_id, user_id, task, True, 1, 'live')
-        _clear_panel_state(user_id, raid_id)
-        print(f'[raid] live_verify PASSED: user={user_id} raid={raid_id} earned={earned}')
+                         (newly_pts, user_id))
 
-        embed = build_branded_embed(guild_id,
-            title=f'✅ Verified — {earned} pts earned',
-            description='**Tasks verified:**\n' + '\n'.join(lines) + f'\n\nRaid #{display_num:04d}',
-            cog_prefix='raid', use_thumbnail=True, use_image=False, use_footer=True,
+    total_credited = dict(already); total_credited.update(newly)
+    cumulative_pts = sum(total_credited.values())
+    if existing_part:
+        update_raid_participation(
+            existing_part['participation_id'],
+            tasks_claimed=json.dumps({t: True for t in total_credited}),
+            points_earned=cumulative_pts,
+            verification_status='verified',
         )
-        await interaction.edit_original_response(content=None, embed=embed)
-        return
-
-    if any_failed:
-        raid_mode = raid.get('mode', 'partial')
-
-        if raid_mode == 'all':
-            # All-or-nothing: any failure means no points, no participation record
-            lines = []
-            for task in ('like', 'comment', 'retweet'):
-                if not claimed.get(task): continue
-                v = results.get(task, {}).get('verified')
-                icon, lbl = _task_emoji[task], _task_label[task]
-                if v is True:    lines.append(f'{icon} {lbl} — ✅ verified')
-                elif v is False: lines.append(f'{icon} {lbl} — ❌ not found on X')
-                else:            lines.append(f'{icon} {lbl} — ⚠️ inconclusive')
-
-            for task, r in results.items():
-                v = r.get('verified')
-                db_v = 1 if v is True else (0 if v is False else -1)
-                add_raid_verification_log(guild_id, raid_id, user_id, task,
-                                          True, db_v, 'live', error_text=r.get('reason'))
-            _clear_panel_state(user_id, raid_id)
-            print(f'[raid] live_verify FAILED (mode=all): user={user_id} raid={raid_id}')
-
-            embed = build_branded_embed(guild_id,
-                title='❌ Verification failed — no points awarded',
-                description=(
-                    'This raid requires ALL tasks to be verified. No points were credited.\n\n'
-                    '**Results:**\n' + '\n'.join(lines) +
-                    '\n\nCompleted the tasks but seeing this? X can take a few minutes to sync — '
-                    'try again shortly.\n\n'
-                    f'Raid #{display_num:04d}'
-                ),
-                cog_prefix='raid', use_thumbnail=True, use_image=False, use_footer=True,
-            )
-            await interaction.edit_original_response(content=None, embed=embed)
-            return
-
-        # mode='partial' — award points for each task that individually passed
-        earned = 0
-        lines  = []
-        effective_claimed = {}
-        for task in ('like', 'comment', 'retweet'):
-            if not claimed.get(task):
-                effective_claimed[task] = False
-                continue
-            v   = results.get(task, {}).get('verified')
-            pts = total * nr[task] // 100
-            if v is True:
-                earned += pts
-                effective_claimed[task] = True
-                lines.append(f'{_task_emoji[task]} {_task_label[task]} — ✅ {pts} pts')
-            elif v is False:
-                effective_claimed[task] = False
-                lines.append(f'{_task_emoji[task]} {_task_label[task]} — ❌ not found on X (0 pts)')
-            else:
-                effective_claimed[task] = False
-                lines.append(f'{_task_emoji[task]} {_task_label[task]} — ⚠️ inconclusive (0 pts)')
-
-        if earned > 0:
-            create_raid_participation(guild_id, raid_id, user_id, json.dumps(effective_claimed), earned)
-            upsert_raid_user_points(guild_id, user_id, earned, delta_raids=1)
-            with get_connection() as conn:
-                conn.execute("UPDATE users SET total_points=total_points+? WHERE user_id=?",
-                             (earned, user_id))
-
-        for task, r in results.items():
-            v = r.get('verified')
-            db_v = 1 if v is True else (0 if v is False else -1)
-            add_raid_verification_log(guild_id, raid_id, user_id, task,
-                                      True, db_v, 'live', error_text=r.get('reason'))
-        _clear_panel_state(user_id, raid_id)
-        print(f'[raid] live_verify PARTIAL: user={user_id} raid={raid_id} earned={earned}')
-
-        title    = f'⚠️ Partial — {earned} pts earned' if earned > 0 else '❌ Verification failed — no points awarded'
-        desc_top = 'Some tasks were verified, others were not.' if earned > 0 else 'None of your tasks could be verified.'
-        embed = build_branded_embed(guild_id,
-            title=title,
-            description=(
-                f'{desc_top}\n\n**Results:**\n' + '\n'.join(lines) +
-                '\n\nCompleted the tasks but seeing this? X can take a few minutes to sync — '
-                'try again shortly.\n\n'
-                f'Raid #{display_num:04d}'
-            ),
-            cog_prefix='raid', use_thumbnail=True, use_image=False, use_footer=True,
+    elif total_credited:
+        create_raid_participation(
+            guild_id, raid_id, user_id,
+            json.dumps({t: True for t in total_credited}), cumulative_pts,
         )
-        await interaction.edit_original_response(content=None, embed=embed)
-        return
 
-    # any_inconclusive — API error: award provisionally, leave as pending for re-check
-    earned, lines = 0, []
-    for task in ('like', 'comment', 'retweet'):
-        if not claimed.get(task): continue
-        pts = total * nr[task] // 100; earned += pts
-        lines.append(f'{_task_emoji[task]} {_task_label[task]} — {pts} pts')
-
-    create_raid_participation(guild_id, raid_id, user_id, json.dumps(claimed), earned)
-    upsert_raid_user_points(guild_id, user_id, earned, delta_raids=1)
-    with get_connection() as conn:
-        conn.execute("UPDATE users SET total_points=total_points+? WHERE user_id=?",
-                     (earned, user_id))
     for task, r in results.items():
         v = r.get('verified')
         db_v = 1 if v is True else (0 if v is False else -1)
         add_raid_verification_log(guild_id, raid_id, user_id, task,
-                                  True, db_v, 'live_provisional', error_text=r.get('reason'))
+                                  True, db_v, 'live', error_text=r.get('reason'))
     _clear_panel_state(user_id, raid_id)
-    print(f'[raid] live_verify PROVISIONAL: user={user_id} raid={raid_id} earned={earned}')
+    print(f'[raid] live_verify: user={user_id} raid={raid_id} newly={newly_pts} '
+          f'cumulative={cumulative_pts} credited_now={sorted(newly)} '
+          f'already={sorted(already)} pending={sorted(pending_now)}')
+
+    # ── Result embed ──
+    lines = []
+    for task in ('like', 'comment', 'retweet'):
+        if not claimed.get(task) and task not in already:
+            continue
+        icon, lbl = _task_emoji[task], _task_label[task]
+        if task in newly:
+            lines.append(f'{icon} {lbl} — ✅ +{newly[task]} pts')
+        elif task in already:
+            lines.append(f'{icon} {lbl} — ✓ already credited')
+        elif task in passing_now:
+            lines.append(f'{icon} {lbl} — ✅ verified (waiting on other tasks)')
+        elif results.get(task, {}).get('verified') is False:
+            lines.append(f'{icon} {lbl} — ❌ not found on X yet')
+        else:
+            lines.append(f'{icon} {lbl} — ⚠️ could not verify yet')
+
+    if newly_pts > 0:
+        title = f'✅ Re-verified — +{newly_pts} pts' if already else f'✅ Verified — {newly_pts} pts earned'
+        tail = ''
+        if pending_now:
+            tail = ('\n\nSome tasks did not verify yet. X can take a few minutes to sync — '
+                    'press **Join Raid** and verify again shortly to claim the rest.')
+        desc = '**Tasks:**\n' + '\n'.join(lines) + tail + f'\n\nRaid #{display_num:04d}'
+    elif not pending_now and total_credited:
+        title = '✅ All tasks already credited'
+        desc = ('You have already been credited for every task you completed on this raid.\n\n'
+                '**Tasks:**\n' + '\n'.join(lines) + f'\n\nRaid #{display_num:04d}')
+    else:
+        title = '❌ Nothing to credit yet'
+        desc = ('None of your selected tasks could be verified on X yet.\n\n'
+                '**Results:**\n' + '\n'.join(lines) +
+                '\n\nCompleted them? X can take a few minutes to sync — '
+                'press **Join Raid** and verify again shortly.\n\n'
+                f'Raid #{display_num:04d}')
 
     embed = build_branded_embed(guild_id,
-        title=f'⚠️ Submitted — {earned} pts (provisional)',
-        description=(
-            'Verification hit a temporary API issue. Points have been credited provisionally '
-            'and will be re-checked by an admin.\n\n'
-            f'Raid #{display_num:04d}'
-        ),
+        title=title, description=desc,
         cog_prefix='raid', use_thumbnail=True, use_image=False, use_footer=True,
     )
     await interaction.edit_original_response(content=None, embed=embed)
@@ -597,9 +603,25 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
             await interaction.response.edit_message(content=msg, embed=None, view=None)
             return
 
-        if get_raid_participation(guild_id, raid_id, user_id):
-            await interaction.response.edit_message(content='✅ You already submitted this raid.', embed=None, view=None)
-            return
+        is_live = guild_id in LIVE_VERIFICATION_GUILD_IDS
+        if not is_live:
+            # Non-live guilds keep strict single-shot submission — re-verify
+            # would let them farm points (their tasks are sampled, not checked
+            # live), so behaviour here is unchanged.
+            if get_raid_participation(guild_id, raid_id, user_id):
+                await interaction.response.edit_message(content='✅ You already submitted this raid.', embed=None, view=None)
+                return
+        else:
+            # Live guilds (AmeretaVerse): re-verify allowed, but rate-limited so
+            # repeated presses cannot hammer the Twitter/X API. First attempt is
+            # always allowed; subsequent attempts respect a short cooldown.
+            remaining = _reverify_cooldown_remaining(user_id, raid_id)
+            if remaining > 0:
+                await interaction.response.edit_message(
+                    content=f'⏳ Please wait {int(remaining) + 1}s before verifying this raid again.',
+                    embed=None, view=None,
+                )
+                return
 
         state = _get_panel_state(user_id, raid_id)
         if not any([state.get('like'), state.get('comment'), state.get('retweet')]):
@@ -641,7 +663,8 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
             )
 
         # Branch: live verification (on-submit) vs instant award (daily check)
-        if guild_id in LIVE_VERIFICATION_GUILD_IDS:
+        if is_live:
+            _reverify_mark(user_id, raid_id)  # start cooldown before hitting the API
             x_username = get_user_x_username(user_id) or ''
             await _live_verify_and_award(
                 interaction, guild_id, user_id, raid, claimed, nr, x_username
@@ -715,7 +738,11 @@ class RaidJoinButton(
                 )
                 return
 
-            if get_raid_participation(guild_id, self.raid_id, user_id):
+            is_live = guild_id in LIVE_VERIFICATION_GUILD_IDS
+            already = get_credited_tasks(guild_id, self.raid_id, user_id) if is_live else {}
+
+            if get_raid_participation(guild_id, self.raid_id, user_id) and not is_live:
+                # Non-live guilds: single-shot, unchanged.
                 await interaction.response.send_message(
                     '✅ You already submitted this raid.', ephemeral=True
                 )
@@ -731,14 +758,32 @@ class RaidJoinButton(
             state = _get_panel_state(user_id, self.raid_id)
             view  = _build_personal_panel_view(self.raid_id, state, user_id, allowed_tasks)
             tweet_url = raid.get('tweet_url', '')
-            await interaction.response.send_message(
-                content=(
+
+            # On live guilds, show a re-verify prompt that lists tasks already
+            # credited and tells the user they can claim any remaining ones.
+            if is_live and already:
+                _lbl = {'like': 'Like', 'comment': 'Comment', 'retweet': 'Retweet'}
+                done = ', '.join(_lbl.get(t, t) for t in ('like', 'comment', 'retweet') if t in already)
+                remaining = [t for t in allowed_tasks if allowed_tasks.get(t) and t not in already]
+                if not remaining:
+                    await interaction.response.send_message(
+                        content=(f'✅ You are fully credited for this raid ({done}).\n'
+                                 'There is nothing left to claim.'),
+                        ephemeral=True,
+                    )
+                    return
+                content = (
+                    f'🐦 **Tweet:** <{tweet_url}>\n\n'
+                    f'✅ Already credited: **{done}**.\n'
+                    '**Complete any remaining tasks on X, toggle them below and click ✅ Confirm '
+                    'to claim the rest.** (Credited tasks are never counted twice.)'
+                )
+            else:
+                content = (
                     f'🐦 **Tweet:** <{tweet_url}>\n\n'
                     '**Complete the tasks on X, then toggle them below and click ✅ Confirm.**'
-                ),
-                view=view,
-                ephemeral=True,
-            )
+                )
+            await interaction.response.send_message(content=content, view=view, ephemeral=True)
 
         except Exception as e:
             print(f'[raid] join button error: {type(e).__name__}: {e}')

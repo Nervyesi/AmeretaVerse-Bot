@@ -715,6 +715,24 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_raidlog_guild
                 ON raid_verification_log(guild_id, checked_at DESC);
+
+            -- Per (guild, raid, user, task) record of which raid tasks have
+            -- already been credited points. The PRIMARY KEY guarantees a task
+            -- can never be credited twice (INSERT OR IGNORE is race-safe), which
+            -- underpins idempotent awarding and delta-only re-verify. Used ONLY
+            -- by live-verification guilds (AmeretaVerse); other tenants keep the
+            -- single-shot daily-check flow and never touch this table.
+            CREATE TABLE IF NOT EXISTS raid_credited_tasks (
+                guild_id    INTEGER NOT NULL,
+                raid_id     INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                task        TEXT NOT NULL,
+                points      INTEGER NOT NULL DEFAULT 0,
+                credited_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, raid_id, user_id, task)
+            );
+            CREATE INDEX IF NOT EXISTS idx_raidcredited_user
+                ON raid_credited_tasks(guild_id, raid_id, user_id);
         """)
 
         # One-time: copy ping_role_id -> raid_ping_role_id for existing rows
@@ -1606,6 +1624,49 @@ def add_raid_verification_log(
             (guild_id, raid_id, user_id, task,
              1 if claimed else 0, v_int, source, error_text),
         )
+
+
+def get_credited_tasks(guild_id: int, raid_id: int, user_id: int) -> dict:
+    """Return {task: points} already credited for this user on this raid.
+
+    Used by live-verification guilds (AmeretaVerse) to compute the delta on
+    re-verify and to guarantee no task is ever credited twice.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT task, points FROM raid_credited_tasks "
+            "WHERE guild_id=? AND raid_id=? AND user_id=?",
+            (guild_id, raid_id, user_id),
+        ).fetchall()
+    return {r['task']: int(r['points']) for r in rows}
+
+
+def add_credited_tasks(guild_id: int, raid_id: int, user_id: int, task_points: dict) -> dict:
+    """Idempotently credit raid tasks for a user.
+
+    Only tasks NOT already credited are inserted (INSERT OR IGNORE on the
+    composite PRIMARY KEY makes this race-safe — a concurrent double-submit
+    can never credit the same task twice). Negative point values are clamped
+    to 0 to guard against crafted/abusive input.
+
+    Returns {task: points} of the tasks that were *newly* credited (the delta).
+    """
+    if not task_points:
+        return {}
+    newly: dict = {}
+    with get_connection() as conn:
+        for task, pts in task_points.items():
+            if task not in ('like', 'comment', 'retweet'):
+                continue
+            pts = max(0, int(pts))
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO raid_credited_tasks "
+                "(guild_id, raid_id, user_id, task, points) VALUES (?,?,?,?,?)",
+                (guild_id, raid_id, user_id, task, pts),
+            )
+            if cur.rowcount > 0:
+                newly[task] = pts
+    return newly
 
 
 def get_raid_verification_log(

@@ -122,6 +122,114 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
+# ── Rate limiting (in-process, no external deps) ─────────────────────────────
+# Sliding-window counter keyed by an arbitrary string (caller decides whether to
+# key by client IP, user id, or both). Lightweight and good enough to blunt
+# hammering / abuse and protect downstream (Twitter API, DB). Launch-day safe
+# defaults; tune via the call sites.
+import time as _time
+import threading as _threading
+from collections import deque as _deque
+
+_rl_buckets: dict = {}
+_rl_lock = _threading.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP, honoring a single proxy hop (X-Forwarded-For)."""
+    xff = request.headers.get('x-forwarded-for', '')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.client.host if request.client else 'unknown'
+
+
+def rate_limit(key: str, max_calls: int, window_secs: float) -> None:
+    """Raise HTTP 429 if `key` exceeds max_calls within window_secs.
+
+    Pure in-memory sliding window. Buckets self-trim; a restart simply resets
+    all counters (acceptable for abuse protection).
+    """
+    now = _time.monotonic()
+    cutoff = now - window_secs
+    with _rl_lock:
+        dq = _rl_buckets.get(key)
+        if dq is None:
+            dq = _deque()
+            _rl_buckets[key] = dq
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= max_calls:
+            retry = max(1, int(dq[0] + window_secs - now) + 1)
+            raise HTTPException(
+                status_code=429,
+                detail='Too many requests. Please slow down and try again shortly.',
+                headers={'Retry-After': str(retry)},
+            )
+        dq.append(now)
+        # Opportunistic memory cap: keep the bucket table from growing without
+        # bound under a flood of distinct keys.
+        if len(_rl_buckets) > 50000:
+            for k in [k for k, d in list(_rl_buckets.items()) if not d or d[-1] < cutoff][:10000]:
+                _rl_buckets.pop(k, None)
+
+
+def rate_limit_public(request: Request, name: str, max_calls: int = 30, window_secs: float = 60.0) -> None:
+    """Convenience wrapper: rate limit a public (unauthenticated) endpoint by IP."""
+    rate_limit(f'pub:{name}:{_client_ip(request)}', max_calls, window_secs)
+
+
+# ── Global exception handler (no stack-trace / secret leakage) ───────────────
+from fastapi.exceptions import RequestValidationError as _RequestValidationError
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # HTTPException is handled by FastAPI's own handler; this catches the rest.
+    import traceback as _tb
+    print(f'[api] UNHANDLED {request.method} {request.url.path}: '
+          f'{type(exc).__name__}: {exc}')
+    _tb.print_exc()
+    return JSONResponse(status_code=500, content={'detail': 'Internal server error'})
+
+
+@app.exception_handler(_RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: _RequestValidationError):
+    # Do not echo back the full validation internals (can include payload shape);
+    # return a generic, safe message.
+    return JSONResponse(status_code=422, content={'detail': 'Invalid request payload'})
+
+
+# ── Input validation helpers ────────────────────────────────────────────────
+def validate_snowflake(value, field: str = 'id') -> int:
+    """Validate a Discord snowflake (guild/user/channel id). Reject malformed.
+
+    Discord snowflakes are positive 64-bit ints. We bound to a sane range to
+    reject negatives, zero, overflow and non-numeric junk from crafted input.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f'Invalid {field}')
+    if n <= 0 or n > 9_223_372_036_854_775_807:
+        raise HTTPException(status_code=400, detail=f'Invalid {field}')
+    return n
+
+
+# Hard bound on any single point award/removal to prevent integer abuse / overflow.
+MAX_POINT_DELTA = 1_000_000
+
+
+def validate_point_amount(value, field: str = 'amount') -> int:
+    """Validate a point delta magnitude: integer, non-zero-safe, bounded."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f'Invalid {field}')
+    if abs(n) > MAX_POINT_DELTA:
+        raise HTTPException(status_code=400, detail=f'{field} out of allowed range')
+    return n
+
+
 # ── JWT helpers ────────────────────────────────────────────────────────────────
 
 def create_jwt(payload: dict) -> str:
@@ -2622,8 +2730,9 @@ async def settings_access_update(server_id: int, body: dict, user: dict = Depend
 
 
 @app.get('/api/public/bot-info')
-async def public_bot_info():
+async def public_bot_info(request: Request):
     """Public endpoint: bot client ID + OAuth invite URL for Add to Server button."""
+    rate_limit_public(request, 'bot-info', max_calls=60, window_secs=60.0)
     cid = CLIENT_ID or ''
     return {
         'client_id':  cid,
@@ -2634,8 +2743,9 @@ async def public_bot_info():
 # ── Public overview endpoint ──────────────────────────────────────────────────
 
 @app.get('/api/public/ameretaverse-overview')
-async def public_ameretaverse_overview():
+async def public_ameretaverse_overview(request: Request):
     """Public read-only endpoint: 4 headline stats for AmeretaVerse main guild."""
+    rate_limit_public(request, 'ameretaverse-overview', max_calls=60, window_secs=60.0)
     AMERETAVERSE_GID = 1199707792706117642
     try:
         bot_instance = _get_bot_instance()
@@ -2728,22 +2838,50 @@ async def admin_adjust_points(server_id: int, body: dict, user: dict = Depends(g
         list_engage_pools, ensure_default_pool, get_engage_pool_by_id,
     )
 
+    # Rate limit: bound how fast an admin can fire point operations (abuse /
+    # runaway-script guard). Keyed per admin per guild.
+    actor_id = int(user.get('user_id') or user.get('id') or 0)
+    rate_limit(f'points-adjust:{server_id}:{actor_id}', max_calls=60, window_secs=60.0)
+
     action      = str(body.get('action', '')).strip()
     point_type  = str(body.get('type', '')).strip()
     target_uid  = body.get('user_id')
-    amount      = int(body.get('amount') or 0)
     pool_id_req = body.get('pool_id')
 
     if action not in ('add', 'remove', 'reset', 'reset-all'):
         raise HTTPException(status_code=400, detail='action must be add|remove|reset|reset-all')
     if point_type not in ('community', 'engage'):
         raise HTTPException(status_code=400, detail='type must be community|engage')
-    if action in ('add', 'remove') and amount < 1:
-        raise HTTPException(status_code=400, detail='amount must be positive')
+    # Bound the amount: positive, integer, and capped to prevent overflow /
+    # crafted negative input flipping an add into a runaway value.
+    amount = 0
+    if action in ('add', 'remove'):
+        amount = validate_point_amount(body.get('amount') or 0, 'amount')
+        if amount < 1:
+            raise HTTPException(status_code=400, detail='amount must be positive')
     if action == 'reset-all' and body.get('confirm') != 'CONFIRM':
         raise HTTPException(status_code=400, detail='reset-all requires confirm=CONFIRM')
-    if action != 'reset-all' and not target_uid:
-        raise HTTPException(status_code=400, detail='user_id required for this action')
+    if action != 'reset-all':
+        if not target_uid:
+            raise HTTPException(status_code=400, detail='user_id required for this action')
+        target_uid = validate_snowflake(target_uid, 'user_id')
+    if pool_id_req is not None:
+        try:
+            pool_id_req = int(pool_id_req)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail='Invalid pool_id')
+
+    # Security-relevant audit log for every point mutation.
+    log_event(
+        server_id, 'admin', 'points_adjusted',
+        f'{action} {amount or ""} {point_type} points'
+        + (f' for user {target_uid}' if action != 'reset-all' else ' (all users)'),
+        actor_user_id=actor_id, actor_username=user.get('username'),
+        module='points_admin', severity='warning' if action in ('reset', 'reset-all') else 'info',
+        details={'action': action, 'type': point_type, 'amount': amount,
+                 'target_user_id': str(target_uid) if target_uid else None,
+                 'pool_id': pool_id_req},
+    )
 
     if point_type == 'community':
         if action == 'add':
