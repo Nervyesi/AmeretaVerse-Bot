@@ -16,6 +16,7 @@ The bot instance is shared via shared_bot.py so guild data is available live.
 import os
 import json
 import time
+import asyncio
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 
@@ -23,7 +24,8 @@ import aiohttp
 import jwt
 from fastapi import FastAPI, Depends, HTTPException, Request, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
+from starlette.background import BackgroundTask
 from dotenv import load_dotenv
 
 import discord
@@ -2614,6 +2616,100 @@ async def admin_test_twitter(user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         return {'status': 'error', 'error': f'{type(e).__name__}: {e}'}
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  GLOBAL ADMIN — SECURE DATABASE BACKUPS (OWNER ONLY)
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+# All three operations are gated by require_global_admin (owner Discord id
+# 461460143343927306 only — NOT guild admins). Backups always use sqlite3's
+# online backup API for a consistent copy; the raw live file is never streamed.
+# log_event attribution uses the owner's home guild id.
+_BACKUP_LOG_GID = 1199707792706117642
+
+
+@app.get('/api/admin/backup/download')
+async def admin_backup_download(request: Request, user: dict = Depends(get_current_user)):
+    """Owner-only: download a consistent point-in-time copy of the live DB.
+
+    Makes a sqlite3 .backup() snapshot to a temp file, streams it as a dated
+    .db attachment, and deletes the temp file after the response is sent.
+    """
+    require_global_admin(user)
+    uid = int(user.get('user_id', 0))
+    # Heavy endpoint (full DB copy + transfer): tight per-owner rate limit.
+    rate_limit(f'backup:download:{uid}', max_calls=3, window_secs=300.0)
+
+    from backup_service import make_consistent_copy, backup_filename
+    try:
+        tmp_path = await asyncio.to_thread(make_consistent_copy)
+    except Exception as e:
+        log_event(
+            _BACKUP_LOG_GID, 'admin_action', 'db_backup_download_failed',
+            f'On-demand DB backup copy failed: {type(e).__name__}: {e}',
+            actor_user_id=uid, actor_username=user.get('username'),
+            module='backup', severity='error',
+        )
+        raise HTTPException(status_code=500, detail='Backup copy failed')
+
+    fname = backup_filename()
+    log_event(
+        _BACKUP_LOG_GID, 'admin_action', 'db_backup_downloaded',
+        f'Owner downloaded a consistent DB backup ({fname})',
+        actor_user_id=uid, actor_username=user.get('username'),
+        module='backup', severity='warning',
+        details={'filename': fname},
+    )
+
+    def _cleanup(path=tmp_path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    return FileResponse(
+        tmp_path,
+        media_type='application/x-sqlite3',
+        filename=fname,
+        background=BackgroundTask(_cleanup),
+    )
+
+
+@app.post('/api/admin/backup/run-now')
+async def admin_backup_run_now(request: Request, user: dict = Depends(get_current_user)):
+    """Owner-only: immediately run the R2 backup (consistent copy + upload +
+    retention prune) and return the resulting R2 key. Lets the owner force a
+    backup before risky changes."""
+    require_global_admin(user)
+    uid = int(user.get('user_id', 0))
+    rate_limit(f'backup:runnow:{uid}', max_calls=3, window_secs=300.0)
+
+    from backup_service import upload_backup_to_r2
+    try:
+        result = await asyncio.to_thread(upload_backup_to_r2)
+    except Exception as e:
+        log_event(
+            _BACKUP_LOG_GID, 'admin_action', 'db_backup_failed',
+            f'Owner-triggered R2 backup failed: {type(e).__name__}: {e}',
+            actor_user_id=uid, actor_username=user.get('username'),
+            module='backup', severity='error',
+            details={'trigger': 'run_now', 'error': f'{type(e).__name__}: {e}'},
+        )
+        raise HTTPException(status_code=500, detail=f'Backup failed: {type(e).__name__}')
+
+    log_event(
+        _BACKUP_LOG_GID, 'admin_action', 'db_backup_success',
+        f'Owner-triggered DB backup uploaded to R2: {result["key"]}',
+        actor_user_id=uid, actor_username=user.get('username'),
+        module='backup', severity='info',
+        details={'trigger': 'run_now', **result},
+    )
+    return {
+        'ok':     True,
+        'key':    result['key'],
+        'size':   result['size'],
+        'pruned': result['pruned'],
+    }
 
 
 # ── Engage admin endpoints ────────────────────────────────────────────────────

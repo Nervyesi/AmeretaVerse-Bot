@@ -15,6 +15,7 @@ async def setup_hook():
     await bot.load_extension('cogs.analytics')
     await bot.load_extension('cogs.tickets')
     await bot.load_extension('cogs.levels')
+    await bot.load_extension('cogs.backup')
     await bot.tree.sync()
     print('Cogs loaded and command tree synced.')
 
@@ -23,6 +24,12 @@ async def on_ready():
     for guild in bot.guilds:
         ensure_guild_defaults(guild.id)
     print(f'Bot is online: {bot.user}')
+
+    backup_cog = bot.get_cog('Backup')
+    if backup_cog and backup_cog.weekly_backup_task.is_running():
+        print('[startup] Weekly R2 DB backup task is running.')
+    else:
+        print('[startup] WARNING: Weekly R2 DB backup task is NOT running.')
 
     print('[startup] Checking TwitterAPI.io configuration...')
     try:
