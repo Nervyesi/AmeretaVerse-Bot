@@ -2724,6 +2724,80 @@ async def admin_backup_run_now(request: Request, user: dict = Depends(get_curren
     }
 
 
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  GLOBAL ADMIN — CROSS-TENANT OVERVIEW (OWNER ONLY)
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+# Exposes cross-tenant business data (every guild, members, usage). Owner-only,
+# same two-layer model as the backup endpoints: require_global_admin here
+# (JWT-derived id, NOT guild admin) + frontend visibility gate. Aggregates come
+# only from existing tables (database.get_global_overview) merged with live
+# guild info from the bot instance.
+
+
+@app.get('/api/admin/overview')
+async def admin_global_overview(request: Request, user: dict = Depends(get_current_user)):
+    """Owner-only: aggregate stats across ALL guilds the bot is in."""
+    require_global_admin(user)
+    uid = int(user.get('user_id', 0))
+    rate_limit(f'admin:overview:{uid}', max_calls=30, window_secs=60.0)
+
+    bot_instance = _get_bot_instance()
+    from database import get_global_overview
+    agg = await asyncio.to_thread(get_global_overview)
+
+    guilds = []
+    total_members = 0
+    for g in bot_instance.guilds:
+        gid = str(g.id)
+        members = g.member_count or agg['snap_by_guild'].get(gid, 0) or 0
+        total_members += members
+        try:
+            me = g.me
+            added_at = me.joined_at.isoformat() if me and me.joined_at else None
+        except Exception:
+            added_at = None
+        guilds.append({
+            'id':          gid,
+            'name':        g.name,
+            'icon':        str(g.icon.url) if g.icon else None,
+            'members':     members,
+            'added_at':    added_at,
+            'modules':     agg['modules_by_guild'].get(gid, []),
+            'raids':       agg['raids_by_guild'].get(gid, 0),
+            'points':      agg['points_by_guild'].get(gid, 0),
+            'engage_subs': agg['engage_by_guild'].get(gid, 0),
+            'last_active': agg['lastact_by_guild'].get(gid),
+            'is_premium':  g.id in PREMIUM_GUILD_IDS,
+        })
+
+    totals = {
+        'guilds':      len(guilds),
+        'members':     total_members,
+        'raids':       sum(x['raids'] for x in guilds),
+        'points':      sum(x['points'] for x in guilds),
+        'engage_subs': sum(x['engage_subs'] for x in guilds),
+    }
+    most_active = sorted(
+        guilds, key=lambda x: (x['raids'] + x['engage_subs'], x['members']), reverse=True
+    )[:5]
+
+    log_event(
+        _BACKUP_LOG_GID, 'admin_action', 'global_overview_viewed',
+        f'Owner viewed global tenant overview ({totals["guilds"]} guilds)',
+        actor_user_id=uid, actor_username=user.get('username'),
+        module='admin', severity='info',
+    )
+
+    return {
+        'totals':      totals,
+        'guilds':      guilds,
+        'most_active': [
+            {'id': x['id'], 'name': x['name'], 'raids': x['raids'], 'engage_subs': x['engage_subs']}
+            for x in most_active
+        ],
+    }
+
+
 # ── Engage admin endpoints ────────────────────────────────────────────────────
 
 _AMERETAVERSE_GID = 1199707792706117642

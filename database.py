@@ -2202,6 +2202,78 @@ def user_can_access_module(guild_id, user_id, module: str, bot) -> bool:
     return bool(user_role_ids & granted_ids)
 
 
+# ── Owner-only global tenant overview ──────────────────────────────────────────
+
+def get_global_overview() -> dict:
+    """Cross-tenant aggregate built ONLY from existing tables (no invented data).
+
+    Returns per-guild metric maps keyed by str(guild_id). Guild names, live
+    member counts and join dates are merged in by the caller from the running
+    bot instance. Read-only and defensive: a missing/old table degrades to an
+    empty map rather than raising. This powers the owner-only overview endpoint.
+    """
+    def _q(conn, sql):
+        try:
+            return conn.execute(sql).fetchall()
+        except Exception as e:
+            print(f'[overview] query skipped ({type(e).__name__}): {e}')
+            return []
+
+    out = {
+        'raids_by_guild':   {},   # gid -> raids created
+        'points_by_guild':  {},   # gid -> total raid points awarded
+        'engage_by_guild':  {},   # gid -> engage submissions
+        'snap_by_guild':    {},   # gid -> latest snapshot member_count
+        'lastact_by_guild': {},   # gid -> last activity ISO timestamp
+        'modules_by_guild': {},   # gid -> sorted list of enabled module names
+    }
+
+    with get_connection() as conn:
+        for r in _q(conn, "SELECT guild_id, COUNT(*) AS c FROM raids GROUP BY guild_id"):
+            out['raids_by_guild'][str(r['guild_id'])] = int(r['c'])
+
+        for r in _q(conn, "SELECT guild_id, COALESCE(SUM(total_points),0) AS p, "
+                          "MAX(last_active) AS la FROM raid_user_points GROUP BY guild_id"):
+            gid = str(r['guild_id'])
+            out['points_by_guild'][gid] = int(r['p'] or 0)
+            if r['la']:
+                out['lastact_by_guild'][gid] = r['la']
+
+        for r in _q(conn, "SELECT guild_id, COUNT(*) AS c FROM engage_submissions GROUP BY guild_id"):
+            out['engage_by_guild'][str(r['guild_id'])] = int(r['c'])
+
+        # Latest member snapshot per guild (row whose snapshot_date is the max).
+        for r in _q(conn,
+            "SELECT s.guild_id AS guild_id, s.member_count AS member_count "
+            "FROM analytics_snapshots s "
+            "JOIN (SELECT guild_id, MAX(snapshot_date) AS md FROM analytics_snapshots "
+            "      GROUP BY guild_id) m "
+            "ON s.guild_id=m.guild_id AND s.snapshot_date=m.md"):
+            out['snap_by_guild'][str(r['guild_id'])] = int(r['member_count'] or 0)
+
+        # Most recent logged event per guild = a real "last activity" signal.
+        for r in _q(conn, "SELECT guild_id, MAX(created_at) AS la FROM bot_events GROUP BY guild_id"):
+            gid, la = str(r['guild_id']), r['la']
+            if la and (gid not in out['lastact_by_guild'] or la > out['lastact_by_guild'][gid]):
+                out['lastact_by_guild'][gid] = la
+
+        # Enabled modules per guild from concrete, already-stored enable flags.
+        # Modules without a single clean flag are omitted rather than guessed.
+        mods: dict = {}
+        for r in _q(conn, "SELECT guild_id FROM raid_settings WHERE enabled=1"):
+            mods.setdefault(str(r['guild_id']), set()).add('raid')
+        for r in _q(conn, "SELECT DISTINCT guild_id FROM engage_pools WHERE enabled=1"):
+            mods.setdefault(str(r['guild_id']), set()).add('engage')
+        for r in _q(conn, "SELECT guild_id, key, value FROM config "
+                          "WHERE key IN ('tickets_enabled','verify_enabled') AND value='1'"):
+            mods.setdefault(str(r['guild_id']), set()).add(
+                'tickets' if r['key'] == 'tickets_enabled' else 'verify'
+            )
+        out['modules_by_guild'] = {g: sorted(s) for g, s in mods.items()}
+
+    return out
+
+
 # ── Activity-based leveling ────────────────────────────────────────────────────
 
 def xp_required_for_level(level: int) -> int:
