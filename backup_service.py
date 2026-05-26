@@ -13,6 +13,7 @@ Design notes:
     existing R2 client (r2_client.get_r2_client / R2_BUCKET_NAME). No new deps.
 """
 import os
+import re
 import uuid
 import sqlite3
 import tempfile
@@ -23,6 +24,11 @@ from database import DB_PATH
 # R2 layout / retention for automatic backups.
 R2_BACKUP_PREFIX    = 'backups/'
 R2_BACKUP_RETENTION = 8  # keep the newest N weekly backups; prune older ones
+
+# Current (safe) key format carries a uuid suffix; the legacy format did not and
+# was guessable on the public CDN. Used to identify old keys for one-off cleanup.
+_NEW_KEY_RE = re.compile(r'^backups/ameretaverse-\d{8}-\d{6}-[0-9a-f]{32}\.db$')
+_OLD_KEY_RE = re.compile(r'^backups/ameretaverse-\d{8}-\d{6}\.db$')
 
 
 def _timestamp() -> str:
@@ -91,8 +97,36 @@ def upload_backup_to_r2() -> dict:
         except OSError:
             pass
 
-    pruned = _prune_old_backups(keep=R2_BACKUP_RETENTION)
-    return {'key': key, 'size': size, 'pruned': pruned}
+    pruned         = _prune_old_backups(keep=R2_BACKUP_RETENTION)
+    legacy_deleted = cleanup_legacy_backups()
+    return {'key': key, 'size': size, 'pruned': pruned, 'legacy_deleted': legacy_deleted}
+
+
+def cleanup_legacy_backups() -> list:
+    """One-off cleanup: delete old guessable-key backups (the legacy
+    backups/ameretaverse-YYYYMMDD-HHMMSS.db format WITHOUT the uuid suffix).
+
+    Safe by construction: only deletes keys matching the exact legacy format
+    under the backups/ prefix, and never a key that also matches the current
+    uuid format. Anything else in the bucket is untouched. Returns the deleted
+    keys. Never raises — runs opportunistically on each backup."""
+    try:
+        from r2_client import get_r2_client, R2_BUCKET_NAME
+        client = get_r2_client()
+        resp = client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=R2_BACKUP_PREFIX)
+        deleted = []
+        for o in resp.get('Contents', []):
+            key = o['Key']
+            if _OLD_KEY_RE.match(key) and not _NEW_KEY_RE.match(key):
+                client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+                deleted.append(key)
+        if deleted:
+            print(f'[backup] cleanup_legacy_backups: deleted {len(deleted)} '
+                  f'old-format backup(s): {deleted}')
+        return deleted
+    except Exception as e:
+        print(f'[backup] cleanup_legacy_backups failed (non-fatal): {type(e).__name__}: {e}')
+        return []
 
 
 def _prune_old_backups(keep: int = R2_BACKUP_RETENTION) -> list:

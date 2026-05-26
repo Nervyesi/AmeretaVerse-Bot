@@ -54,6 +54,27 @@ async def _budget_allows() -> bool:
         _day_count += 1
         return True
 
+
+# Minimum spacing between consecutive outbound Twitter calls. Spreads deep
+# pagination out so it cannot spike the per-minute rate or the bill. Default
+# 0.25s; override with TWITTER_API_MIN_GAP (seconds, 0 disables).
+_MIN_GAP      = max(0.0, float(os.getenv('TWITTER_API_MIN_GAP', '0.25') or 0.25))
+_last_call_ts = 0.0
+_gap_lock     = asyncio.Lock()
+
+
+async def _respect_min_gap() -> None:
+    """Sleep just enough to keep at least _MIN_GAP seconds between calls."""
+    global _last_call_ts
+    if _MIN_GAP <= 0:
+        return
+    async with _gap_lock:
+        wait = _MIN_GAP - (time.monotonic() - _last_call_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_call_ts = time.monotonic()
+
+
 SCRAPING_HEALTHY      = True
 _consecutive_failures = 0
 _FAILURE_THRESHOLD    = 3
@@ -112,6 +133,9 @@ async def _api_get(path: str, params: dict, timeout: float = 30.0) -> Optional[d
         # Over budget — degrade to inconclusive rather than spend more money.
         return None
 
+    # Space consecutive calls so deep pagination cannot spike rate/cost.
+    await _respect_min_gap()
+
     url     = f'{API_BASE}{path}'
     headers = {'X-API-Key': API_KEY}
 
@@ -151,8 +175,11 @@ async def _api_get(path: str, params: dict, timeout: float = 30.0) -> Optional[d
 async def check_comment(tweet_id: str, target_username: str) -> dict:
     """Check if target_username replied to tweet_id.
 
-    Paginates through replies (up to 5 pages / ~200 replies).
-    Zero total replies → inconclusive. Any data + no match → False.
+    Paginates replies via next_cursor / has_next_page until the user is found,
+    the API says there are no more pages, or a page/time cap is hit (popular
+    tweets need many pages — a shallow cap caused legitimate replies to be
+    missed). Early-stops on match. Zero data → inconclusive; data + no match
+    → False.
     """
     print(f'[twitter] check_comment: tweet={tweet_id} target={target_username}')
     target = normalize_username(target_username)
@@ -161,10 +188,16 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
 
     cursor              = None
     seen                = 0
-    max_pages           = 5
+    pages               = 0
+    max_pages           = max(1, int(os.getenv('TWITTER_REPLIES_MAX_PAGES', '20') or 20))
+    deadline            = time.monotonic() + 25.0   # overall wall-clock budget
     api_call_succeeded  = False
 
     for _page in range(max_pages):
+        if time.monotonic() > deadline:
+            print(f'[twitter] check_comment: time budget reached after {pages} pages')
+            break
+
         params: dict = {'tweetId': str(tweet_id)}
         if cursor:
             params['cursor'] = cursor
@@ -178,6 +211,7 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             break
 
         api_call_succeeded = True
+        pages += 1
         tweets = data.get('tweets') or data.get('replies') or data.get('data') or []
         if not isinstance(tweets, list):
             tweets = []
@@ -188,16 +222,21 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
                 author.get('userName') or author.get('username') or author.get('screen_name') or ''
             )
             if author_name == target:
-                print(f'[twitter] check_comment: MATCH for @{target}')
+                print(f'[twitter] check_comment: MATCH for @{target} on page {pages} '
+                      f'(scanned {seen + len(tweets)} replies)')
                 return {'verified': True, 'reason': 'found_comment'}
 
-        seen  += len(tweets)
+        seen += len(tweets)
+        has_next = data.get('has_next_page')
+        if has_next is None:
+            has_next = data.get('hasNextPage')
         cursor = data.get('next_cursor') or data.get('nextCursor') or data.get('cursor')
-        if not cursor or len(tweets) == 0:
+        # Stop when API says no more pages, no cursor, or an empty page.
+        if has_next is False or not cursor or len(tweets) == 0:
             break
 
     # API succeeded — conclusive result: user did not comment
-    print(f'[twitter] check_comment: no match for @{target} in {seen} replies')
+    print(f'[twitter] check_comment: no match for @{target} in {seen} replies across {pages} pages')
     return {'verified': False, 'reason': 'no_comment_found'}
 
 
@@ -214,10 +253,16 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
 
     cursor             = None
     seen               = 0
-    max_pages          = 4
+    pages              = 0
+    max_pages          = max(1, int(os.getenv('TWITTER_RETWEETERS_MAX_PAGES', '20') or 20))
+    deadline           = time.monotonic() + 25.0   # overall wall-clock budget
     api_call_succeeded = False
 
     for _page in range(max_pages):
+        if time.monotonic() > deadline:
+            print(f'[twitter] check_retweet: time budget reached after {pages} pages')
+            break
+
         params: dict = {'tweetId': str(tweet_id)}
         if cursor:
             params['cursor'] = cursor
@@ -229,6 +274,7 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
             break  # later-page failure but we already scanned some retweeters
 
         api_call_succeeded = True
+        pages += 1
         users = data.get('users') or data.get('retweeters') or data.get('data') or []
         if not isinstance(users, list):
             users = []
@@ -238,15 +284,20 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
                 u.get('userName') or u.get('username') or u.get('screen_name') or ''
             )
             if uname == target:
-                print(f'[twitter] check_retweet: MATCH for @{target}')
+                print(f'[twitter] check_retweet: MATCH for @{target} on page {pages} '
+                      f'(scanned {seen + len(users)} retweeters)')
                 return {'verified': True, 'reason': 'found_retweet'}
 
-        seen  += len(users)
+        seen += len(users)
+        has_next = data.get('has_next_page')
+        if has_next is None:
+            has_next = data.get('hasNextPage')
         cursor = data.get('next_cursor') or data.get('nextCursor') or data.get('cursor')
-        if not cursor or len(users) == 0:
+        if has_next is False or not cursor or len(users) == 0:
             break
 
-    print(f'[twitter] check_retweet: @{target} not in {seen} retweeters of tweet {tweet_id}')
+    print(f'[twitter] check_retweet: @{target} not in {seen} retweeters of tweet {tweet_id} '
+          f'across {pages} pages')
     return {'verified': False, 'reason': 'no_retweet_found'}
 
 
