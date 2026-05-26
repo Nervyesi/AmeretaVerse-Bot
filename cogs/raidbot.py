@@ -132,13 +132,17 @@ def _clear_panel_state(user_id: int, raid_id: int):
 
 
 # ── Re-verify anti-spam cooldown (live-verification guilds only) ──────────────
-# Every confirm/re-verify on a live guild triggers Twitter/X API calls. To
-# protect the TwitterAPI.io budget and prevent spam, a user may only trigger a
-# verification for a given raid once per REVERIFY_COOLDOWN_SECONDS. In-memory is
-# sufficient: a bot restart simply resets the timers, and the worst case is a
-# few extra allowed calls right after a restart. key = (user_id, raid_id) → ts.
+# Every confirm/re-verify on a live guild triggers Twitter/X API calls. The
+# cooldown ONLY throttles repeated full Twitter re-checks to protect the
+# TwitterAPI.io budget — it must never silently block a legitimate user from
+# being credited. When a user is within the window we do NOT hit the API; we
+# serve their last known result (already-credited + remaining) with clear
+# feedback and a short wait. The window is intentionally short. In-memory is
+# sufficient: a restart resets the timers (worst case a few extra allowed calls).
+# key = (user_id, raid_id) → ts, so the cooldown is strictly per-user-per-raid:
+# one user never affects another, and verifying a different raid is never blocked.
 import time as _time
-REVERIFY_COOLDOWN_SECONDS = 20
+REVERIFY_COOLDOWN_SECONDS = 6
 _reverify_last: dict = {}
 
 
@@ -429,6 +433,7 @@ async def _live_verify_and_award(
     )
 
     if not tweet_id:
+        print(f'[raid] confirm skipped: reason=invalid_tweet user={user_id} raid={raid_id}')
         await interaction.edit_original_response(
             content='⚠️ This raid has an invalid tweet URL — contact an admin.',
         )
@@ -609,8 +614,15 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
     try:
         guild_id = interaction.guild_id or 0
 
+        # Entry trace — every Confirm click now leaves a log so a click that
+        # produces no award can be matched to its exact reason below.
+        _entry_state = _get_panel_state(user_id, raid_id)
+        _selected = [t for t in ('like', 'comment', 'retweet') if _entry_state.get(t)]
+        print(f'[raid] confirm clicked user={user_id} raid={raid_id} guild={guild_id} tasks={_selected}')
+
         raid = get_guild_raid(raid_id, guild_id)
         if not raid:
+            print(f'[raid] confirm skipped: reason=raid_not_found user={user_id} raid={raid_id} guild={guild_id}')
             await interaction.response.edit_message(content='❌ Raid not found.', embed=None, view=None)
             return
 
@@ -619,6 +631,7 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
         if raid['status'] != 'active':
             reason = raid.get('ended_reason') or ''
             msg = '❌ This raid has been ended by admin.' if reason == 'admin' else '❌ This raid has ended.'
+            print(f'[raid] confirm skipped: reason=raid_ended user={user_id} raid={raid_id} guild={guild_id}')
             await interaction.response.edit_message(content=msg, embed=None, view=None)
             return
 
@@ -628,22 +641,42 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
             # would let them farm points (their tasks are sampled, not checked
             # live), so behaviour here is unchanged.
             if get_raid_participation(guild_id, raid_id, user_id):
+                print(f'[raid] confirm skipped: reason=already_submitted user={user_id} raid={raid_id} guild={guild_id}')
                 await interaction.response.edit_message(content='✅ You already submitted this raid.', embed=None, view=None)
                 return
         else:
-            # Live guilds (AmeretaVerse): re-verify allowed, but rate-limited so
-            # repeated presses cannot hammer the Twitter/X API. First attempt is
-            # always allowed; subsequent attempts respect a short cooldown.
+            # Live guilds (AmeretaVerse): re-verify allowed, but the cooldown
+            # throttles repeated FULL Twitter re-checks. When inside the window we
+            # do NOT call the API and do NOT silently refuse — we serve the user's
+            # last known result (credited so far + what remains) with clear
+            # feedback. The credited-tasks delta tracking means nothing is lost:
+            # any uncredited task is claimable on the next press a few seconds on.
             remaining = _reverify_cooldown_remaining(user_id, raid_id)
             if remaining > 0:
+                wait_s = int(remaining) + 1
+                print(f'[raid] confirm skipped: reason=reverify_cooldown wait={wait_s}s user={user_id} raid={raid_id} guild={guild_id}')
+                credited = get_credited_tasks(guild_id, raid_id, user_id)  # {task: pts}
+                try:
+                    _allowed_cd = json.loads(raid.get('tasks_json') or '{}')
+                except Exception:
+                    _allowed_cd = {}
+                _lbl = {'like': 'Like', 'comment': 'Comment', 'retweet': 'Retweet'}
+                done = ', '.join(_lbl[t] for t in ('like', 'comment', 'retweet') if t in credited) or 'nothing yet'
+                remaining_tasks = [t for t in ('like', 'comment', 'retweet')
+                                   if _allowed_cd.get(t) and t not in credited]
+                tail = (f'\nComplete any remaining tasks on X, then press ✅ Confirm again in {wait_s}s to claim them.'
+                        if remaining_tasks
+                        else '\nYou are fully credited for this raid. Nothing left to claim.')
                 await interaction.response.edit_message(
-                    content=f'⏳ Please wait {int(remaining) + 1}s before verifying this raid again.',
+                    content=(f'⏳ Please wait {wait_s}s before re-checking on X.\n'
+                             f'✅ Credited so far: {done}.' + tail),
                     embed=None, view=None,
                 )
                 return
 
         state = _get_panel_state(user_id, raid_id)
         if not any([state.get('like'), state.get('comment'), state.get('retweet')]):
+            print(f'[raid] confirm skipped: reason=no_task_selected user={user_id} raid={raid_id} guild={guild_id}')
             await interaction.response.edit_message(content='⚠️ Select at least one task first.', embed=None, view=None)
             return
 
@@ -664,6 +697,7 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
             if claimed_tasks < enabled_tasks:
                 _friendly = {'like': 'Like', 'comment': 'Comment', 'retweet': 'Retweet'}
                 missing_str = ', '.join(_friendly.get(t, t.capitalize()) for t in sorted(enabled_tasks - claimed_tasks))
+                print(f'[raid] confirm skipped: reason=all_mode_incomplete user={user_id} raid={raid_id} guild={guild_id}')
                 await interaction.response.edit_message(
                     content=f"❌ This raid requires ALL tasks to be completed. You haven't selected: **{missing_str}**.",
                     embed=None, view=None,
@@ -694,9 +728,14 @@ async def _handle_personal_confirm(interaction: discord.Interaction, raid_id: in
     except Exception as e:
         print(f'[raid] confirm error: {type(e).__name__}: {e}')
         traceback.print_exc()
+        # Guarantee the user never sees a stuck spinner: edit the message whether
+        # or not the interaction has already been acknowledged.
+        _err_msg = 'An error occurred. Press Join Raid and try again shortly.'
         try:
             if not interaction.response.is_done():
-                await interaction.response.edit_message(content='An error occurred.', embed=None, view=None)
+                await interaction.response.edit_message(content=_err_msg, embed=None, view=None)
+            else:
+                await interaction.edit_original_response(content=_err_msg, embed=None, view=None)
         except Exception:
             pass
 
@@ -727,9 +766,12 @@ class RaidJoinButton(
             guild_id = interaction.guild_id or 0
             user_id  = interaction.user.id
 
+            print(f'[raid] join clicked user={user_id} raid={self.raid_id} guild={guild_id}')
+
             # FIX 7: check enabled first
             settings = get_raid_settings(guild_id)
             if not settings or not settings.get('enabled'):
+                print(f'[raid] join skipped: reason=raid_disabled user={user_id} raid={self.raid_id} guild={guild_id}')
                 await interaction.response.send_message(
                     '❌ The Raid System is currently disabled.', ephemeral=True
                 )
@@ -737,6 +779,7 @@ class RaidJoinButton(
 
             raid = get_guild_raid(self.raid_id, guild_id)
             if not raid:
+                print(f'[raid] join skipped: reason=raid_not_found user={user_id} raid={self.raid_id} guild={guild_id}')
                 await interaction.response.send_message('❌ Raid not found.', ephemeral=True)
                 return
 
@@ -747,11 +790,13 @@ class RaidJoinButton(
             if raid['status'] != 'active':
                 reason = raid.get('ended_reason') or ''
                 msg = '❌ This raid has been ended by admin.' if reason == 'admin' else '❌ This raid has ended.'
+                print(f'[raid] join skipped: reason=raid_ended user={user_id} raid={self.raid_id} guild={guild_id}')
                 await interaction.response.send_message(msg, ephemeral=True)
                 return
 
             x_username = get_user_x_username(user_id)
             if not x_username:
+                print(f'[raid] join skipped: reason=no_x_handle user={user_id} raid={self.raid_id} guild={guild_id}')
                 await interaction.response.send_message(
                     '⚠️ Link your X account first: `/setx your_username`', ephemeral=True
                 )
@@ -762,6 +807,7 @@ class RaidJoinButton(
 
             if get_raid_participation(guild_id, self.raid_id, user_id) and not is_live:
                 # Non-live guilds: single-shot, unchanged.
+                print(f'[raid] join skipped: reason=already_submitted user={user_id} raid={self.raid_id} guild={guild_id}')
                 await interaction.response.send_message(
                     '✅ You already submitted this raid.', ephemeral=True
                 )
@@ -785,6 +831,7 @@ class RaidJoinButton(
                 done = ', '.join(_lbl.get(t, t) for t in ('like', 'comment', 'retweet') if t in already)
                 remaining = [t for t in allowed_tasks if allowed_tasks.get(t) and t not in already]
                 if not remaining:
+                    print(f'[raid] join skipped: reason=fully_credited user={user_id} raid={self.raid_id} guild={guild_id}')
                     await interaction.response.send_message(
                         content=(f'✅ You are fully credited for this raid ({done}).\n'
                                  'There is nothing left to claim.'),
