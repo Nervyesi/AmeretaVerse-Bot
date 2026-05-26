@@ -445,17 +445,12 @@ async def _live_verify_and_award(
         print(f'[raid] live_verify: check_retweet tweet={tweet_id} user={x_username}')
         results['retweet'] = await check_retweet(tweet_id, x_username)
 
-    # Like conditional logic: tie to companions' outcomes
+    # Like task: auto-credited on claim. The likers list cannot be read reliably
+    # via the API (rate limited, paginated, frequently incomplete), so verifying
+    # likes produced constant false negatives. We now self attest the like and
+    # award it whenever the user claims it — no API call, never a false negative.
     if claimed.get('like'):
-        companion_results = [results[t] for t in ('comment', 'retweet') if t in results]
-        if not companion_results:
-            results['like'] = {'verified': True, 'reason': 'like_only_trusted'}
-        elif any(r.get('verified') is False for r in companion_results):
-            results['like'] = {'verified': False, 'reason': 'like_companion_failed'}
-        elif any(r.get('verified') is None for r in companion_results):
-            results['like'] = {'verified': None, 'reason': 'like_companion_inconclusive'}
-        else:
-            results['like'] = {'verified': True, 'reason': 'like_companions_passed'}
+        results['like'] = {'verified': True, 'reason': 'like_auto_credited'}
 
     # ── Idempotent, delta-only crediting (live verification / AmeretaVerse) ──
     #
@@ -542,6 +537,30 @@ async def _live_verify_and_award(
     print(f'[raid] live_verify: user={user_id} raid={raid_id} newly={newly_pts} '
           f'cumulative={cumulative_pts} credited_now={sorted(newly)} '
           f'already={sorted(already)} pending={sorted(pending_now)}')
+
+    # ── Concise verification diagnostics (no secrets, no raw API payloads) ──
+    # Leaves a readable trail in Railway logs for debugging comment/retweet
+    # failures: which tasks were checked, the per task result, and points awarded.
+    def _verdict(v):
+        return 'match' if v is True else ('no_match' if v is False else 'inconclusive')
+    _checked = [t for t in ('like', 'comment', 'retweet') if claimed.get(t)]
+    log_event(
+        guild_id, 'bot_activity', 'raid_verify_attempt',
+        f'Raid #{display_num:04d} verify: +{newly_pts} pts',
+        actor_user_id=user_id, module='raid',
+        severity='info' if (newly_pts > 0 or not pending_now) else 'warning',
+        details={
+            'raid_id':         raid_id,
+            'x_handle':        x_username or None,
+            'mode':            raid_mode,
+            'tasks_checked':   _checked,
+            'results':         {t: _verdict(results.get(t, {}).get('verified')) for t in _checked},
+            'reasons':         {t: results.get(t, {}).get('reason') for t in _checked},
+            'points_awarded':  newly_pts,
+            'credited_now':    sorted(newly),
+            'pending':         sorted(pending_now),
+        },
+    )
 
     # ── Result embed ──
     lines = []
@@ -1805,27 +1824,12 @@ class RaidsCog(commands.Cog, name='Raids'):
         comment_result = await tw_cc(tweet_id, x_username) if 'comment' in effective_tasks else None
         retweet_result = await tw_cr(tweet_id, x_username) if 'retweet' in effective_tasks else None
 
-        # Build like result based on companion outcomes (None companions → inconclusive, not failure)
+        # Like task: auto-credited on claim, never API verified (the likers list
+        # is unreliable). The daily check must never flag or deduct a like — treat
+        # it as always verified so it stays out of the flagged/inconclusive sets.
         like_result = None
         if 'like' in effective_tasks:
-            companions = effective_tasks - {'like'}
-            if not companions:
-                like_result = {'verified': True, 'reason': 'like_only_trusted'}
-            else:
-                any_companion_failed = (
-                    ('comment' in companions and comment_result and comment_result.get('verified') is False) or
-                    ('retweet' in companions and retweet_result and retweet_result.get('verified') is False)
-                )
-                any_companion_inconclusive = (
-                    ('comment' in companions and (not comment_result or comment_result.get('verified') is None)) or
-                    ('retweet' in companions and (not retweet_result or retweet_result.get('verified') is None))
-                )
-                if any_companion_failed:
-                    like_result = {'verified': False, 'reason': 'like_companion_failed'}
-                elif any_companion_inconclusive:
-                    like_result = {'verified': None, 'reason': 'like_companion_inconclusive'}
-                else:
-                    like_result = {'verified': True, 'reason': 'like_companions_passed'}
+            like_result = {'verified': True, 'reason': 'like_auto_credited'}
 
         task_results: dict = {}
         if comment_result is not None: task_results['comment'] = comment_result
@@ -1846,6 +1850,26 @@ class RaidsCog(commands.Cog, name='Raids'):
                 True, db_v, 'auto',
                 error_text=r.get('reason') if v is not True else None,
             )
+
+        # ── Concise daily verification diagnostics (no secrets, no raw payloads) ──
+        def _verdict(v):
+            return 'match' if v is True else ('no_match' if v is False else 'inconclusive')
+        _status = 'flagged' if any_real_failure else ('inconclusive' if any_inconclusive else 'verified')
+        log_event(
+            guild_id, 'bot_activity', 'raid_daily_verify',
+            f"Daily verify raid {row['raid_id']}: {_status}",
+            actor_user_id=row['user_id'], module='raid',
+            severity='warning' if any_real_failure else 'info',
+            details={
+                'raid_id':       row['raid_id'],
+                'x_handle':      x_username or None,
+                'tasks_checked': sorted(task_results.keys()),
+                'results':       {t: _verdict(r.get('verified')) for t, r in task_results.items()},
+                'reasons':       {t: r.get('reason') for t, r in task_results.items()},
+                'flagged':       sorted(flagged_tasks),
+                'inconclusive':  sorted(inconclusive_tasks),
+            },
+        )
 
         if any_real_failure:
             deduct      = sum(
