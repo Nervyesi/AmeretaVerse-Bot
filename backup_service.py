@@ -13,6 +13,7 @@ Design notes:
     existing R2 client (r2_client.get_r2_client / R2_BUCKET_NAME). No new deps.
 """
 import os
+import uuid
 import sqlite3
 import tempfile
 from datetime import datetime, timezone
@@ -68,7 +69,13 @@ def upload_backup_to_r2() -> dict:
 
     tmp_path = make_consistent_copy()
     try:
-        key  = f'{R2_BACKUP_PREFIX}ameretaverse-{_timestamp()}.db'
+        # The avbot-assets bucket is served publicly via the CDN (R2_PUBLIC_URL),
+        # so objects are reachable by key. A bare timestamp key would be brute-
+        # forceable (only ~seconds of entropy over a week). Append a uuid4 so the
+        # key carries 128 bits of entropy and cannot be guessed/enumerated. The
+        # fixed-width timestamp stays first, so lexical sort == chronological for
+        # retention pruning.
+        key  = f'{R2_BACKUP_PREFIX}ameretaverse-{_timestamp()}-{uuid.uuid4().hex}.db'
         size = os.path.getsize(tmp_path)
         client = get_r2_client()
         with open(tmp_path, 'rb') as f:

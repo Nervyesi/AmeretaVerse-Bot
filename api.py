@@ -2559,7 +2559,19 @@ _GLOBAL_ADMIN_IDS = {461460143343927306}
 
 
 def require_global_admin(user: dict):
-    uid = int(user.get('user_id', 0))
+    """Owner-only global gate.
+
+    The id is taken ONLY from the verified JWT payload (`user` is the decoded,
+    signature-checked token from get_current_user) — never from a client-supplied
+    body/query/header that could be spoofed. This is intentionally DISTINCT from
+    require_guild_admin / require_module_access: a guild owner or guild admin of
+    ANY guild is NOT granted access unless their id is in _GLOBAL_ADMIN_IDS.
+    """
+    raw = user.get('user_id')
+    try:
+        uid = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        uid = 0
     if uid not in _GLOBAL_ADMIN_IDS:
         raise HTTPException(status_code=403, detail='Global admin only')
 
