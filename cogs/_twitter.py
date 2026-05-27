@@ -86,6 +86,25 @@ else:
     print('[twitter] TWITTER_API_IO_KEY not set — verification disabled')
 
 
+# ── Pagination depth + wall-clock budget ────────────────────────────────────
+# Popular tweets need many pages of replies/retweeters. A shallow page cap OR a
+# too-tight time budget silently truncates the scan and causes verification
+# false negatives (a real commenter further down the list is missed). The page
+# caps default to a REAL 20 (not 5). The wall-clock budget defaults to 120s:
+# 20 pages × real API latency (several seconds each, plus the min-gap spacing)
+# easily exceeds the old 25s budget, which was the actual reason pagination
+# stopped at ~5 pages despite the 20-page cap. All three are env-overridable and
+# are printed at load so the ACTIVE values are visible in Railway even when an
+# env var overrides a default.
+_REPLIES_MAX_PAGES    = max(1, int(os.getenv('TWITTER_REPLIES_MAX_PAGES', '20') or 20))
+_RETWEETERS_MAX_PAGES = max(1, int(os.getenv('TWITTER_RETWEETERS_MAX_PAGES', '20') or 20))
+_PAGINATION_BUDGET_S  = max(5.0, float(os.getenv('TWITTER_PAGINATION_BUDGET_S', '120') or 120))
+
+print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
+      f'retweeters cap={_RETWEETERS_MAX_PAGES} '
+      f'time budget={_PAGINATION_BUDGET_S}s')
+
+
 async def _record_health(success: bool) -> None:
     global SCRAPING_HEALTHY, _consecutive_failures
     async with _health_lock:
@@ -108,6 +127,45 @@ def get_scraping_health() -> dict:
 
 def normalize_username(name: str) -> str:
     return (name or '').strip().lstrip('@').strip().lower()
+
+
+# Every handle-bearing field the TwitterAPI.io reply/retweeter objects may use.
+# The author can live directly on the object OR inside a nested container, and
+# different endpoints/versions name the handle differently. Missing any one of
+# these variants means a real comment/retweet is skipped — a false negative.
+_HANDLE_FIELDS  = ('userName', 'username', 'screen_name', 'screenName', 'handle')
+_NESTED_USER_KEYS = ('author', 'user', 'core', 'legacy', 'user_results',
+                     'result', 'userInfo', 'user_info', 'tweet')
+
+
+def _candidate_handles(obj, _depth: int = 0) -> list:
+    """Collect every plausible handle string from a reply/retweeter object,
+    including common nested user containers. Bounded depth guards against
+    unexpectedly deep payloads."""
+    out: list = []
+    if not isinstance(obj, dict) or _depth > 4:
+        return out
+    for f in _HANDLE_FIELDS:
+        v = obj.get(f)
+        if isinstance(v, str) and v.strip():
+            out.append(v)
+    for key in _NESTED_USER_KEYS:
+        nested = obj.get(key)
+        if isinstance(nested, dict):
+            out.extend(_candidate_handles(nested, _depth + 1))
+    return out
+
+
+def _matches_target(obj, target: str) -> bool:
+    """True if any handle field on the object (or a nested user) equals target
+    after normalization (case-insensitive, @/whitespace trimmed on both sides)."""
+    return any(normalize_username(h) == target for h in _candidate_handles(obj))
+
+
+def _primary_handle(obj) -> str:
+    """The first normalized handle found on the object — for diagnostics only."""
+    cands = _candidate_handles(obj)
+    return normalize_username(cands[0]) if cands else ''
 
 
 def extract_tweet_id(url: str) -> Optional[str]:
@@ -189,13 +247,15 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
     cursor              = None
     seen                = 0
     pages               = 0
-    max_pages           = max(1, int(os.getenv('TWITTER_REPLIES_MAX_PAGES', '20') or 20))
-    deadline            = time.monotonic() + 25.0   # overall wall-clock budget
+    max_pages           = _REPLIES_MAX_PAGES
+    deadline            = time.monotonic() + _PAGINATION_BUDGET_S   # wall-clock budget
     api_call_succeeded  = False
+    scanned_usernames: list = []   # diagnostic: primary handle of each reply scanned
 
     for _page in range(max_pages):
         if time.monotonic() > deadline:
-            print(f'[twitter] check_comment: time budget reached after {pages} pages')
+            print(f'[twitter] check_comment: time budget ({_PAGINATION_BUDGET_S}s) '
+                  f'reached after {pages} pages')
             break
 
         params: dict = {'tweetId': str(tweet_id)}
@@ -217,26 +277,32 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             tweets = []
 
         for t in tweets:
-            author      = t.get('author') or t.get('user') or {}
-            author_name = normalize_username(
-                author.get('userName') or author.get('username') or author.get('screen_name') or ''
-            )
-            if author_name == target:
+            if _matches_target(t, target):
                 print(f'[twitter] check_comment: MATCH for @{target} on page {pages} '
                       f'(scanned {seen + len(tweets)} replies)')
                 return {'verified': True, 'reason': 'found_comment'}
+            ph = _primary_handle(t)
+            if ph:
+                scanned_usernames.append(ph)
 
         seen += len(tweets)
         has_next = data.get('has_next_page')
         if has_next is None:
             has_next = data.get('hasNextPage')
         cursor = data.get('next_cursor') or data.get('nextCursor') or data.get('cursor')
-        # Stop when API says no more pages, no cursor, or an empty page.
+        # Stop ONLY when the API says no more pages, the cursor is empty, or the
+        # page was empty. (Match → early return above; page cap → loop bound;
+        # time budget → guard at top of loop.)
         if has_next is False or not cursor or len(tweets) == 0:
             break
 
-    # API succeeded — conclusive result: user did not comment
+    # API succeeded — conclusive result: user did not comment.
     print(f'[twitter] check_comment: no match for @{target} in {seen} replies across {pages} pages')
+    if scanned_usernames:
+        # Diagnostic: did the target ever appear in the data, or did matching miss
+        # them? Log only usernames — first few and last few scanned.
+        print(f'[twitter] check_comment: scanned usernames '
+              f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]}')
     return {'verified': False, 'reason': 'no_comment_found'}
 
 
@@ -254,13 +320,15 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
     cursor             = None
     seen               = 0
     pages              = 0
-    max_pages          = max(1, int(os.getenv('TWITTER_RETWEETERS_MAX_PAGES', '20') or 20))
-    deadline           = time.monotonic() + 25.0   # overall wall-clock budget
+    max_pages          = _RETWEETERS_MAX_PAGES
+    deadline           = time.monotonic() + _PAGINATION_BUDGET_S   # wall-clock budget
     api_call_succeeded = False
+    scanned_usernames: list = []   # diagnostic: primary handle of each retweeter scanned
 
     for _page in range(max_pages):
         if time.monotonic() > deadline:
-            print(f'[twitter] check_retweet: time budget reached after {pages} pages')
+            print(f'[twitter] check_retweet: time budget ({_PAGINATION_BUDGET_S}s) '
+                  f'reached after {pages} pages')
             break
 
         params: dict = {'tweetId': str(tweet_id)}
@@ -280,24 +348,28 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
             users = []
 
         for u in users:
-            uname = normalize_username(
-                u.get('userName') or u.get('username') or u.get('screen_name') or ''
-            )
-            if uname == target:
+            if _matches_target(u, target):
                 print(f'[twitter] check_retweet: MATCH for @{target} on page {pages} '
                       f'(scanned {seen + len(users)} retweeters)')
                 return {'verified': True, 'reason': 'found_retweet'}
+            ph = _primary_handle(u)
+            if ph:
+                scanned_usernames.append(ph)
 
         seen += len(users)
         has_next = data.get('has_next_page')
         if has_next is None:
             has_next = data.get('hasNextPage')
         cursor = data.get('next_cursor') or data.get('nextCursor') or data.get('cursor')
+        # Stop ONLY on explicit no-more-pages, empty cursor, or empty page.
         if has_next is False or not cursor or len(users) == 0:
             break
 
     print(f'[twitter] check_retweet: @{target} not in {seen} retweeters of tweet {tweet_id} '
           f'across {pages} pages')
+    if scanned_usernames:
+        print(f'[twitter] check_retweet: scanned usernames '
+              f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]}')
     return {'verified': False, 'reason': 'no_retweet_found'}
 
 
