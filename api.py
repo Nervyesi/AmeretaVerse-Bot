@@ -83,6 +83,11 @@ from database import (
     count_events,
     list_flags,
     resolve_flag,
+    list_embed_messages as db_list_embed_messages,
+    get_embed_message as db_get_embed_message,
+    create_embed_message as db_create_embed_message,
+    update_embed_message as db_update_embed_message,
+    delete_embed_message as db_delete_embed_message,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
@@ -2105,6 +2110,487 @@ async def forms_send(
                    channel_id=str(channel.id),
                    message_id=str(msg.id))
     return {'ok': True, 'message_id': str(msg.id), 'channel_id': str(channel.id)}
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  EMBED MESSAGE ENDPOINTS
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+# Unlimited drafts per guild; admin-only via require_module_access('embed_message').
+# Every read/write is filtered by (server_id, guild_id from the URL/JWT). The
+# Discord-side render goes through build_branded_embed via
+# cogs.embed_message.build_embed_from_row so brand consistency is automatic.
+
+class _EmbedCreate(BaseModel):
+    title: Optional[str] = ''
+    description: Optional[str] = ''
+    color: Optional[str] = None  # '#RRGGBB' string OR int; stored as int or NULL
+    image_url: Optional[str] = ''
+    thumbnail_url: Optional[str] = ''
+    fields: Optional[list] = None  # list of {name,value,inline}
+    channel_id: Optional[str] = ''
+
+
+class _EmbedUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    image_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    fields: Optional[list] = None
+    channel_id: Optional[str] = None
+
+
+class _EmbedSendBody(BaseModel):
+    channel_id: Optional[str] = None  # if absent, use the row's stored channel
+
+
+_EMBED_TITLE_MAX        = 256
+_EMBED_DESC_MAX         = 4000
+_EMBED_FIELD_NAME_MAX   = 256
+_EMBED_FIELD_VALUE_MAX  = 1024
+_EMBED_FIELDS_MAX       = 10
+_EMBED_TOTAL_MAX        = 6000
+
+
+def _coerce_embed_color(value) -> int | None:
+    """Accept '#RRGGBB', '0xRRGGBB', plain int, or None; return int|None."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, int):
+        return value & 0xFFFFFF
+    if isinstance(value, str):
+        v = value.strip().lower().lstrip('#')
+        if v.startswith('0x'):
+            v = v[2:]
+        if not v:
+            return None
+        try:
+            return int(v, 16) & 0xFFFFFF
+        except ValueError:
+            raise HTTPException(status_code=400, detail='Invalid color — use #RRGGBB hex')
+    raise HTTPException(status_code=400, detail='Invalid color')
+
+
+def _validate_url(url: str, field: str) -> str:
+    """Reject obviously malformed URLs; empty string is allowed (means unset)."""
+    if not url:
+        return ''
+    url = url.strip()
+    if not url:
+        return ''
+    if len(url) > 2048:
+        raise HTTPException(status_code=400, detail=f'{field} too long')
+    if not (url.startswith('http://') or url.startswith('https://')):
+        raise HTTPException(status_code=400, detail=f'{field} must be http(s)://')
+    return url
+
+
+def _validate_fields(fields) -> str:
+    """Coerce a fields list to canonical JSON string, enforcing caps. Returns
+    a valid JSON array string (possibly '[]'). Total length check happens
+    in _validate_embed_totals."""
+    if fields is None:
+        return '[]'
+    if not isinstance(fields, list):
+        raise HTTPException(status_code=400, detail='fields must be a list')
+    if len(fields) > _EMBED_FIELDS_MAX:
+        raise HTTPException(status_code=400,
+            detail=f'too many fields (max {_EMBED_FIELDS_MAX})')
+    out: list[dict] = []
+    for i, f in enumerate(fields):
+        if not isinstance(f, dict):
+            raise HTTPException(status_code=400, detail=f'field {i} must be an object')
+        name  = str(f.get('name')  or '')
+        value = str(f.get('value') or '')
+        if len(name)  > _EMBED_FIELD_NAME_MAX:
+            raise HTTPException(status_code=400, detail=f'field {i} name too long')
+        if len(value) > _EMBED_FIELD_VALUE_MAX:
+            raise HTTPException(status_code=400, detail=f'field {i} value too long')
+        out.append({
+            'name':   name,
+            'value':  value,
+            'inline': bool(f.get('inline')),
+        })
+    return json.dumps(out)
+
+
+def _validate_embed_totals(title: str, description: str, fields_str: str) -> None:
+    """Enforce Discord's overall 6000-char embed limit (title + desc + all
+    field names + all field values)."""
+    try:
+        flist = json.loads(fields_str or '[]')
+    except (ValueError, TypeError):
+        flist = []
+    total = len(title or '') + len(description or '')
+    for f in flist if isinstance(flist, list) else []:
+        if isinstance(f, dict):
+            total += len(str(f.get('name')  or ''))
+            total += len(str(f.get('value') or ''))
+    if total > _EMBED_TOTAL_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Total embed length {total} exceeds Discord limit of {_EMBED_TOTAL_MAX}',
+        )
+
+
+def _embed_row_to_dict(row: dict) -> dict:
+    """Hydrate a DB row for the dashboard: parse fields_json, expose color as
+    '#RRGGBB', leave id/channel/message ids as strings the JS side can handle."""
+    fields_str = row.get('fields_json') or '[]'
+    try:
+        fields = json.loads(fields_str)
+        if not isinstance(fields, list):
+            fields = []
+    except (ValueError, TypeError):
+        fields = []
+    color_int = row.get('color')
+    color_hex = f'#{int(color_int):06x}' if color_int is not None else None
+    return {
+        'id':             int(row['id']),
+        'guild_id':       str(row['guild_id']),
+        'channel_id':     row.get('channel_id') or '',
+        'message_id':     row.get('message_id') or '',
+        'title':          row.get('title') or '',
+        'description':    row.get('description') or '',
+        'color':          color_hex,
+        'image_url':      row.get('image_url') or '',
+        'thumbnail_url':  row.get('thumbnail_url') or '',
+        'fields':         fields,
+        'created_by':     str(row.get('created_by')) if row.get('created_by') else None,
+        'created_at':     row.get('created_at'),
+        'updated_at':     row.get('updated_at'),
+        'posted_at':      row.get('posted_at'),
+        'status':         'posted' if row.get('message_id') else 'draft',
+    }
+
+
+def _check_embed_owner(embed_id: int, server_id: int) -> dict:
+    row = db_get_embed_message(embed_id, server_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail='Embed not found')
+    return row
+
+
+@app.get('/api/servers/{server_id}/embeds')
+async def embeds_list(server_id: int, user: dict = Depends(get_current_user)):
+    require_module_access(user, server_id, 'embed_message')
+    rows = db_list_embed_messages(server_id)
+    return {'embeds': [_embed_row_to_dict(r) for r in rows]}
+
+
+@app.post('/api/servers/{server_id}/embeds')
+async def embeds_create(
+    server_id: int,
+    body: _EmbedCreate,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'embed_message')
+    rate_limit(f'embed_create:{server_id}', 30, 60.0)
+
+    title       = (body.title       or '')[:_EMBED_TITLE_MAX]
+    description = (body.description or '')[:_EMBED_DESC_MAX]
+    color_int   = _coerce_embed_color(body.color)
+    image_url   = _validate_url(body.image_url     or '', 'image_url')
+    thumb_url   = _validate_url(body.thumbnail_url or '', 'thumbnail_url')
+    fields_str  = _validate_fields(body.fields)
+    _validate_embed_totals(title, description, fields_str)
+
+    embed_id = db_create_embed_message(
+        server_id,
+        created_by=int(user.get('user_id') or user.get('id') or 0) or None,
+        title=title,
+        description=description,
+        color=color_int,
+        image_url=image_url,
+        thumbnail_url=thumb_url,
+        fields_json=fields_str,
+        channel_id=(body.channel_id or '').strip(),
+    )
+
+    log_event(
+        server_id, 'admin_action', 'embed_created',
+        f'Embed #{embed_id} created by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='embed_message', severity='info',
+        details={'embed_id': embed_id, 'title': title[:80]},
+    )
+
+    row = db_get_embed_message(embed_id, server_id)
+    return _embed_row_to_dict(row)
+
+
+@app.patch('/api/servers/{server_id}/embeds/{embed_id}')
+async def embeds_update(
+    server_id: int,
+    embed_id: int,
+    body: _EmbedUpdate,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'embed_message')
+    rate_limit(f'embed_update:{server_id}', 120, 60.0)
+    row = _check_embed_owner(embed_id, server_id)
+
+    updates: dict = {}
+    payload = body.model_dump(exclude_unset=True)
+
+    if 'title' in payload:
+        updates['title'] = (payload['title'] or '')[:_EMBED_TITLE_MAX]
+    if 'description' in payload:
+        updates['description'] = (payload['description'] or '')[:_EMBED_DESC_MAX]
+    if 'color' in payload:
+        updates['color'] = _coerce_embed_color(payload['color'])
+    if 'image_url' in payload:
+        updates['image_url'] = _validate_url(payload['image_url'] or '', 'image_url')
+    if 'thumbnail_url' in payload:
+        updates['thumbnail_url'] = _validate_url(payload['thumbnail_url'] or '', 'thumbnail_url')
+    if 'fields' in payload:
+        updates['fields_json'] = _validate_fields(payload['fields'])
+    if 'channel_id' in payload:
+        updates['channel_id'] = (payload['channel_id'] or '').strip() or None
+
+    # Validate aggregate length against the would-be result, not just the diff.
+    new_title = updates.get('title',       row.get('title') or '')
+    new_desc  = updates.get('description', row.get('description') or '')
+    new_fld   = updates.get('fields_json', row.get('fields_json') or '[]')
+    _validate_embed_totals(new_title, new_desc, new_fld)
+
+    if updates:
+        db_update_embed_message(embed_id, server_id, **updates)
+
+    fresh = db_get_embed_message(embed_id, server_id)
+
+    # If the embed is already posted, push the edits to the live Discord message
+    # so dashboard saves flow through automatically. Channel/message stays put;
+    # explicit "Resend" is what creates a new message.
+    live_edit_result = None
+    if fresh and fresh.get('message_id') and fresh.get('channel_id'):
+        try:
+            if not bot.is_ready():
+                live_edit_result = 'bot_not_ready'
+            else:
+                guild = bot.get_guild(server_id)
+                if guild is None:
+                    live_edit_result = 'bot_not_in_guild'
+                else:
+                    try:
+                        ch_int  = int(fresh['channel_id'])
+                        msg_int = int(fresh['message_id'])
+                    except (TypeError, ValueError):
+                        ch_int = msg_int = None
+                    ch = guild.get_channel(ch_int) if ch_int else None
+                    if ch is None:
+                        live_edit_result = 'channel_not_found'
+                    else:
+                        from cogs.embed_message import build_embed_from_row
+                        embed = build_embed_from_row(server_id, fresh)
+                        try:
+                            msg = await ch.fetch_message(msg_int)
+                            await msg.edit(embed=embed)
+                            live_edit_result = 'edited'
+                        except discord.NotFound:
+                            # The Discord message was deleted out-of-band — drop
+                            # the pointer so the row reverts to draft state.
+                            db_update_embed_message(
+                                embed_id, server_id,
+                                message_id=None, posted_at=None,
+                            )
+                            fresh = db_get_embed_message(embed_id, server_id)
+                            live_edit_result = 'message_missing'
+                        except discord.Forbidden:
+                            live_edit_result = 'forbidden'
+        except Exception as e:  # noqa: BLE001 — never break the save on edit fail
+            print(f'[embeds] live-edit failed for embed_id={embed_id} '
+                  f'guild={server_id}: {type(e).__name__}: {e}')
+            live_edit_result = 'error'
+
+    log_event(
+        server_id, 'admin_action', 'embed_edited',
+        f'Embed #{embed_id} edited by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='embed_message', severity='info',
+        details={'embed_id': embed_id, 'live_edit': live_edit_result,
+                 'changed': sorted(updates.keys())},
+    )
+
+    out = _embed_row_to_dict(fresh) if fresh else {'id': embed_id}
+    out['live_edit'] = live_edit_result
+    return out
+
+
+@app.post('/api/servers/{server_id}/embeds/{embed_id}/send')
+async def embeds_send(
+    server_id: int,
+    embed_id: int,
+    body: _EmbedSendBody,
+    user: dict = Depends(get_current_user),
+):
+    """Send (or resend) this embed to a channel. If the embed is already
+    posted, sending again creates a NEW message; for in-place updates use
+    PATCH (which edits the live message)."""
+    require_module_access(user, server_id, 'embed_message')
+    # Generous per-guild rate cap on a write-to-Discord op; per-user limit
+    # blunts a single admin hammering "Send" by accident.
+    rate_limit(f'embed_send:{server_id}', 30, 60.0)
+    uid = int(user.get('user_id') or user.get('id') or 0)
+    if uid:
+        rate_limit(f'embed_send_u:{uid}:{server_id}', 15, 60.0)
+
+    row = _check_embed_owner(embed_id, server_id)
+    target_ch = (body.channel_id or row.get('channel_id') or '').strip()
+    if not target_ch:
+        raise HTTPException(status_code=400, detail='No target channel — set one first')
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    from cogs._utils import resolve_channel
+    channel = resolve_channel(guild, target_ch)
+    if channel is None:
+        raise HTTPException(status_code=400, detail=f'Channel not found: {target_ch}')
+
+    from cogs.embed_message import build_embed_from_row
+    embed = build_embed_from_row(server_id, row)
+
+    try:
+        msg = await channel.send(embed=embed)
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    db_update_embed_message(
+        embed_id, server_id,
+        channel_id=str(channel.id),
+        message_id=str(msg.id),
+        posted_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    log_event(
+        server_id, 'admin_action', 'embed_posted',
+        f'Embed #{embed_id} posted to #{channel.name} by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='embed_message', severity='info',
+        details={'embed_id': embed_id, 'channel_id': str(channel.id),
+                 'message_id': str(msg.id)},
+    )
+
+    fresh = db_get_embed_message(embed_id, server_id)
+    return _embed_row_to_dict(fresh)
+
+
+@app.post('/api/servers/{server_id}/embeds/{embed_id}/delete-message')
+async def embeds_delete_message(
+    server_id: int,
+    embed_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Delete only the live Discord message; keep the draft row so the admin
+    can edit and re-send. No-op (200) if the row was never posted."""
+    require_module_access(user, server_id, 'embed_message')
+    rate_limit(f'embed_dmsg:{server_id}', 30, 60.0)
+    row = _check_embed_owner(embed_id, server_id)
+
+    msg_id = row.get('message_id')
+    ch_id  = row.get('channel_id')
+    if not msg_id or not ch_id:
+        return {'ok': True, 'note': 'not_posted'}
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    deleted = False
+    try:
+        ch = guild.get_channel(int(ch_id))
+        if ch is not None:
+            msg = await ch.fetch_message(int(msg_id))
+            await msg.delete()
+            deleted = True
+    except discord.NotFound:
+        deleted = True  # already gone — treat as success
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to delete that message')
+    except (ValueError, TypeError):
+        pass
+    except Exception as e:  # noqa: BLE001
+        print(f'[embeds] delete-message failed embed_id={embed_id} '
+              f'guild={server_id}: {type(e).__name__}: {e}')
+
+    # Clear the live-message pointer either way — the row is back to a draft.
+    db_update_embed_message(
+        embed_id, server_id,
+        message_id=None,
+        posted_at=None,
+    )
+
+    log_event(
+        server_id, 'admin_action', 'embed_message_deleted',
+        f'Live message for embed #{embed_id} deleted by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='embed_message', severity='info',
+        details={'embed_id': embed_id, 'discord_deleted': deleted},
+    )
+
+    fresh = db_get_embed_message(embed_id, server_id)
+    return _embed_row_to_dict(fresh) if fresh else {'id': embed_id, 'status': 'draft'}
+
+
+@app.delete('/api/servers/{server_id}/embeds/{embed_id}')
+async def embeds_delete(
+    server_id: int,
+    embed_id: int,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Delete the draft row. Pass ?delete_message=true to ALSO delete the
+    live Discord message; otherwise the posted message is left intact."""
+    require_module_access(user, server_id, 'embed_message')
+    row = _check_embed_owner(embed_id, server_id)
+
+    qs_flag = (request.query_params.get('delete_message') or '').lower()
+    also_delete_msg = qs_flag in ('1', 'true', 'yes', 'on')
+
+    msg_deleted = None
+    if also_delete_msg and row.get('message_id') and row.get('channel_id'):
+        if bot.is_ready():
+            guild = bot.get_guild(server_id)
+            if guild is not None:
+                try:
+                    ch = guild.get_channel(int(row['channel_id']))
+                    if ch is not None:
+                        msg = await ch.fetch_message(int(row['message_id']))
+                        await msg.delete()
+                        msg_deleted = True
+                except discord.NotFound:
+                    msg_deleted = True
+                except discord.Forbidden:
+                    msg_deleted = False
+                except Exception as e:  # noqa: BLE001
+                    print(f'[embeds] full-delete msg failed embed_id={embed_id} '
+                          f'guild={server_id}: {type(e).__name__}: {e}')
+                    msg_deleted = False
+
+    db_delete_embed_message(embed_id, server_id)
+
+    log_event(
+        server_id, 'admin_action', 'embed_deleted',
+        f'Embed #{embed_id} deleted by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='embed_message', severity='info',
+        details={'embed_id': embed_id, 'discord_message_deleted': msg_deleted},
+    )
+
+    return {'ok': True, 'discord_message_deleted': msg_deleted}
 
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──

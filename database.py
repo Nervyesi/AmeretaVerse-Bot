@@ -949,6 +949,28 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_engage_log ON engage_verification_log(submission_id, engager_user_id);
+
+            -- Embed Message module: dashboard-composed branded embeds posted
+            -- to any channel. Per-guild isolated; channel_id/message_id are
+            -- NULL until the embed has been sent. Draft → Posted lifecycle.
+            CREATE TABLE IF NOT EXISTS embed_messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id        INTEGER NOT NULL,
+                channel_id      TEXT DEFAULT NULL,
+                message_id      TEXT DEFAULT NULL,
+                title           TEXT NOT NULL DEFAULT '',
+                description     TEXT NOT NULL DEFAULT '',
+                color           INTEGER DEFAULT NULL,
+                image_url       TEXT NOT NULL DEFAULT '',
+                thumbnail_url   TEXT NOT NULL DEFAULT '',
+                fields_json     TEXT NOT NULL DEFAULT '[]',
+                created_by      INTEGER DEFAULT NULL,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                posted_at       TIMESTAMP DEFAULT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_embed_messages_guild ON embed_messages(guild_id);
+            CREATE INDEX IF NOT EXISTS idx_embed_messages_channel ON embed_messages(guild_id, channel_id);
         """)
 
     # Seed AmeretaVerse pools
@@ -1317,6 +1339,90 @@ def delete_form_field(field_id: int, form_id: int) -> bool:
         c = conn.execute(
             "DELETE FROM form_fields WHERE field_id=? AND form_id=?",
             (field_id, form_id),
+        )
+        return c.rowcount > 0
+
+
+# ── Embed Message helpers (dashboard-composed branded embeds) ───────────────
+# All reads and writes are scoped by guild_id — there is no cross-guild lookup
+# anywhere. The schema lets channel_id/message_id be NULL while still a draft;
+# update_embed_message is used both for editor saves AND for recording the
+# Discord IDs after the embed is sent.
+
+_EMBED_MESSAGE_FIELDS = (
+    'channel_id', 'message_id', 'title', 'description', 'color',
+    'image_url', 'thumbnail_url', 'fields_json', 'posted_at',
+)
+
+
+def list_embed_messages(guild_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM embed_messages WHERE guild_id=? "
+            "ORDER BY id DESC",
+            (guild_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_embed_message(embed_id: int, guild_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM embed_messages WHERE id=? AND guild_id=?",
+            (embed_id, guild_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_embed_message(
+    guild_id: int,
+    *,
+    created_by: int | None = None,
+    title: str = '',
+    description: str = '',
+    color: int | None = None,
+    image_url: str = '',
+    thumbnail_url: str = '',
+    fields_json: str = '[]',
+    channel_id: str = '',
+) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO embed_messages
+               (guild_id, created_by, title, description, color,
+                image_url, thumbnail_url, fields_json, channel_id)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                guild_id, created_by, title or '', description or '',
+                color, image_url or '', thumbnail_url or '',
+                fields_json or '[]', channel_id or None,
+            ),
+        )
+        return cur.lastrowid
+
+
+def update_embed_message(embed_id: int, guild_id: int, **fields) -> bool:
+    """Update arbitrary editable fields on an embed_messages row. Always
+    refreshes updated_at. Restricted to whitelisted columns so callers cannot
+    rewrite id/guild_id/created_by."""
+    sets = {k: v for k, v in fields.items() if k in _EMBED_MESSAGE_FIELDS}
+    if not sets:
+        return False
+    cols = ', '.join(f'{k}=?' for k in sets) + ', updated_at=CURRENT_TIMESTAMP'
+    vals = list(sets.values()) + [embed_id, guild_id]
+    with get_connection() as conn:
+        c = conn.execute(
+            f"UPDATE embed_messages SET {cols} WHERE id=? AND guild_id=?",
+            vals,
+        )
+        return c.rowcount > 0
+
+
+def delete_embed_message(embed_id: int, guild_id: int) -> bool:
+    with get_connection() as conn:
+        c = conn.execute(
+            "DELETE FROM embed_messages WHERE id=? AND guild_id=?",
+            (embed_id, guild_id),
         )
         return c.rowcount > 0
 
@@ -2120,7 +2226,7 @@ def reset_all_engage_points_in_guild(guild_id: int) -> int:
 
 MODULES = ('verify', 'roleselect', 'forms', 'tickets', 'raid', 'engage',
            'protection', 'flagged', 'mod_log', 'audit_log', 'analytics', 'settings',
-           'points_admin', 'logs')
+           'points_admin', 'logs', 'embed_message')
 
 
 def get_guild_settings(guild_id) -> dict:

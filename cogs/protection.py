@@ -33,11 +33,31 @@ _PROTECTION_SEVERITY = {
     'raid_ban_new':      'critical',
 }
 
+# IMPORTANT: scheme alternation MUST be a non-capturing group `(?:...)`. With a
+# *capturing* group, re.findall() returns only the group content (the scheme
+# "https://" / "www.") instead of the full match, which broke the whitelist:
+# every URL got reduced to an empty domain string and nothing in the whitelist
+# could match it, so every link was deleted regardless of allowed_domains.
 URL_RE = re.compile(
-    r"(https?://|www\.)\S+|"
+    r"(?:https?://|www\.)\S+|"
     r"\b(?:[a-zA-Z0-9\-]+\.)+(?:com|io|xyz|net|org|gg|app|co|ru|site|club|info|biz|me)\b",
     re.IGNORECASE,
 )
+
+
+def _normalize_domain(s: str) -> str:
+    """Reduce a URL or whitelist entry to a bare host: lower, no scheme, no
+    www, no path, no trailing dot/slash. Used on BOTH the URL side AND the
+    whitelist side so comparisons happen on apples-to-apples values."""
+    if not s:
+        return ""
+    s = s.strip().lower()
+    s = re.sub(r"^https?://", "", s)
+    s = re.sub(r"^www\.", "", s)
+    s = s.split("/", 1)[0]
+    s = s.split("?", 1)[0]
+    s = s.strip().strip(".")
+    return s
 
 
 # ── Per-guild config helpers ──────────────────────────────────────────────────
@@ -116,14 +136,33 @@ def log_action(guild_id: int, action_type: str, user_id: int, detail: str, *, us
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def extract_domains(text: str) -> list[str]:
+    """Pull every domain out of text. Uses URL_RE (non-capturing) so findall
+    yields the full URL match, then normalizes each through _normalize_domain
+    to drop scheme/www/path/case. Empty results are filtered out."""
     urls = URL_RE.findall(text)
     domains = []
     for u in urls:
-        u = re.sub(r"^https?://", "", u, flags=re.I)
-        u = re.sub(r"^www\.", "", u, flags=re.I)
-        domain = u.split("/")[0].lower()
-        domains.append(domain)
+        d = _normalize_domain(u)
+        if d:
+            domains.append(d)
     return domains
+
+
+def _whitelist_match(domain: str, whitelist: set[str]) -> str | None:
+    """Return the matching whitelist entry if `domain` is allowed.
+
+    A domain passes when it EXACTLY equals OR is a subdomain of any entry.
+    So ['x.com'] allows 'x.com' and 'sub.x.com' but NOT 'evilx.com' (the
+    leading '.' before the listed domain is what distinguishes a true
+    subdomain from a different host that just shares a suffix)."""
+    if not domain or not whitelist:
+        return None
+    for w in whitelist:
+        if not w:
+            continue
+        if domain == w or domain.endswith("." + w):
+            return w
+    return None
 
 
 async def get_mod_log(guild: discord.Guild) -> discord.TextChannel | None:
@@ -308,18 +347,34 @@ class ProtectionCog(commands.Cog):
                     await send_mod_log(message.guild, embed)
                     return
 
-        # 2. General link detection
+        # 2. General link detection — whitelist check ALWAYS runs first so a
+        # listed domain never reaches delete/warn/strike.
         if not cfg_bool(guild_id, "protection_link_detection"):
             return
 
         whitelist_raw = cfg_get(guild_id, "protection_link_whitelist",
                                 "twitter.com,x.com,discord.gg,youtube.com")
-        whitelist = {d.strip().lower() for d in whitelist_raw.split(",") if d.strip()}
+        whitelist = {
+            _normalize_domain(d) for d in whitelist_raw.split(",")
+        }
+        whitelist.discard("")  # drop empty / whitespace-only entries
 
         for d in domains:
-            if any(d == w or d.endswith("." + w) for w in whitelist):
+            matched = _whitelist_match(d, whitelist)
+            if matched:
+                print(
+                    f"[protection] link allowed: guild={guild_id} "
+                    f"user={message.author.id} domain={d} matched={matched}"
+                )
                 continue
+
             link_action = cfg_get(guild_id, "protection_link_action", "delete")
+            print(
+                f"[protection] link delete: guild={guild_id} "
+                f"user={message.author.id} domain={d} "
+                f"whitelist_hit=False reason=not_in_whitelist "
+                f"whitelist_size={len(whitelist)}"
+            )
             try:
                 await message.delete()
             except discord.NotFound:
