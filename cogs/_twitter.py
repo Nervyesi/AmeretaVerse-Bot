@@ -96,13 +96,36 @@ else:
 # stopped at ~5 pages despite the 20-page cap. All three are env-overridable and
 # are printed at load so the ACTIVE values are visible in Railway even when an
 # env var overrides a default.
-_REPLIES_MAX_PAGES    = max(1, int(os.getenv('TWITTER_REPLIES_MAX_PAGES', '20') or 20))
-_RETWEETERS_MAX_PAGES = max(1, int(os.getenv('TWITTER_RETWEETERS_MAX_PAGES', '20') or 20))
-_PAGINATION_BUDGET_S  = max(5.0, float(os.getenv('TWITTER_PAGINATION_BUDGET_S', '120') or 120))
+_REPLIES_MAX_PAGES      = max(1, int(os.getenv('TWITTER_REPLIES_MAX_PAGES',     '20') or 20))
+_RETWEETERS_MAX_PAGES   = max(1, int(os.getenv('TWITTER_RETWEETERS_MAX_PAGES', '20') or 20))
+_USER_TWEETS_MAX_PAGES  = max(1, int(os.getenv('TWITTER_USER_TWEETS_MAX_PAGES', '5') or 5))
+_PAGINATION_BUDGET_S    = max(5.0, float(os.getenv('TWITTER_PAGINATION_BUDGET_S', '120') or 120))
+# Short-TTL process-level cache for a user's recent tweets. One engage finalize
+# verifies many submissions for the same user — we'd hit /user/last_tweets
+# once per submission without this. 60s is plenty for one finalize batch and
+# short enough that brand-new replies show up before the next attempt.
+_USER_TWEETS_CACHE_TTL  = max(1.0, float(os.getenv('TWITTER_USER_TWEETS_CACHE_TTL', '60') or 60))
+# After scanning at least this many user tweets with no match, treat a
+# tweet-side inconclusive (None) as a soft "no" rather than a full inconclusive.
+# Keeps False-negatives during intermittent /tweet/replies outages.
+_USERSIDE_CONFIDENT_FALSE_MIN = max(
+    1, int(os.getenv('TWITTER_USERSIDE_CONFIDENT_FALSE_MIN', '20') or 20)
+)
 
 print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'retweeters cap={_RETWEETERS_MAX_PAGES} '
+      f'user_tweets cap={_USER_TWEETS_MAX_PAGES} '
+      f'cache_ttl={_USER_TWEETS_CACHE_TTL}s '
       f'time budget={_PAGINATION_BUDGET_S}s')
+
+
+# ── User-tweets cache (single fetch reused across one finalize batch) ────────
+# Keyed by normalized username. Value is (epoch_monotonic, list_of_tweet_dicts).
+# Read+write inside an asyncio.Lock so concurrent verifies share the same
+# in-flight result and a slow API call isn't billed twice.
+_user_tweets_cache: dict = {}
+_user_tweets_lock          = asyncio.Lock()
+_logged_response_shapes: set = set()   # one-shot keys for "raw shape" diagnostics
 
 
 async def _record_health(success: bool) -> None:
@@ -228,6 +251,207 @@ def _cursor_preview(c: Optional[str]) -> str:
     return f'{c[:12]}…(len={len(c)})'
 
 
+# ── In-reply-to / retweet-of field detection ─────────────────────────────────
+# TwitterAPI.io's user-tweets response uses several field names depending on
+# endpoint version. We probe every known variant; the first scan also logs the
+# observed shape ONCE so we can spot a new variant in production logs.
+
+_REPLY_TO_ID_FIELDS = (
+    'inReplyToId', 'in_reply_to_status_id_str', 'in_reply_to_status_id',
+    'inReplyToStatusId', 'in_reply_to_tweet_id', 'replyToId',
+    'inReplyTo', 'reply_to_id',
+)
+_RETWEET_REF_ID_FIELDS = (
+    'retweetedStatusId', 'retweeted_status_id', 'retweeted_status_id_str',
+    'retweetedTweetId', 'retweeted_tweet_id',
+)
+_RETWEET_NESTED_KEYS = (
+    'retweeted_status', 'retweeted_tweet', 'retweetedStatus', 'retweetedTweet',
+)
+
+
+def _id_str(v) -> str:
+    """Coerce a tweet id (int or string) to a clean string for comparison."""
+    if v is None:
+        return ''
+    return str(v).strip()
+
+
+def _tweet_replies_to(tw: dict, target_id: str) -> bool:
+    """True if `tw` is a reply whose in-reply-to id equals target_id.
+
+    Checks every known direct field plus the Twitter-v2 `referenced_tweets`
+    array (entries with type='replied_to')."""
+    if not isinstance(tw, dict) or not target_id:
+        return False
+    for f in _REPLY_TO_ID_FIELDS:
+        if _id_str(tw.get(f)) == target_id:
+            return True
+    refs = tw.get('referenced_tweets')
+    if isinstance(refs, list):
+        for r in refs:
+            if isinstance(r, dict) and str(r.get('type', '')) == 'replied_to':
+                if _id_str(r.get('id')) == target_id:
+                    return True
+    return False
+
+
+def _tweet_retweets(tw: dict, target_id: str) -> bool:
+    """True if `tw` is a retweet whose source tweet id equals target_id.
+
+    Quote-tweets are intentionally NOT counted — that's a different action."""
+    if not isinstance(tw, dict) or not target_id:
+        return False
+    for f in _RETWEET_REF_ID_FIELDS:
+        if _id_str(tw.get(f)) == target_id:
+            return True
+    for key in _RETWEET_NESTED_KEYS:
+        nested = tw.get(key)
+        if isinstance(nested, dict):
+            if (_id_str(nested.get('id'))     == target_id
+                    or _id_str(nested.get('id_str')) == target_id):
+                return True
+    refs = tw.get('referenced_tweets')
+    if isinstance(refs, list):
+        for r in refs:
+            if isinstance(r, dict) and str(r.get('type', '')) == 'retweeted':
+                if _id_str(r.get('id')) == target_id:
+                    return True
+    return False
+
+
+def _log_shape_once(tag: str, data: dict, sample: Optional[dict]) -> None:
+    """First time we see a given response shape, log keys for one tweet
+    object. Subsequent identical shapes are silent. Helps us notice if
+    TwitterAPI.io adds/renames fields without spamming the log."""
+    try:
+        top_keys    = sorted(data.keys()) if isinstance(data, dict) else []
+        sample_keys = sorted(sample.keys())[:30] if isinstance(sample, dict) else []
+    except Exception:
+        return
+    shape_key = f'{tag}|top={",".join(top_keys)}|sample={",".join(sample_keys)}'
+    if shape_key in _logged_response_shapes:
+        return
+    _logged_response_shapes.add(shape_key)
+    print(f'[twitter] {tag} shape: top_keys={top_keys}')
+    if sample_keys:
+        print(f'[twitter] {tag} sample tweet keys: {sample_keys}')
+
+
+async def _fetch_user_recent_tweets(username: str) -> list:
+    """Return the user's recent tweets via /twitter/user/last_tweets.
+
+    Cached for _USER_TWEETS_CACHE_TTL seconds keyed by normalized username so
+    one engage finalize batch (same user, many submissions) makes a single
+    network roundtrip. Returns [] on any failure — caller decides whether
+    that's inconclusive or "fall back".
+    """
+    target = normalize_username(username)
+    if not target:
+        return []
+
+    # Cache check — under the lock so two concurrent verifies share the result.
+    async with _user_tweets_lock:
+        cached = _user_tweets_cache.get(target)
+        if cached and (time.monotonic() - cached[0]) < _USER_TWEETS_CACHE_TTL:
+            age = time.monotonic() - cached[0]
+            print(f'[twitter] user_tweets cache HIT @{target} '
+                  f'age={age:.1f}s tweets={len(cached[1])}')
+            return cached[1]
+
+    all_tweets: list = []
+    sent_cursor: Optional[str] = None
+    started_at = time.monotonic()
+    deadline   = started_at + _PAGINATION_BUDGET_S
+    pages = 0
+    break_reason = f'page_cap({_USER_TWEETS_MAX_PAGES})'
+
+    for page_idx0 in range(_USER_TWEETS_MAX_PAGES):
+        page_idx = page_idx0 + 1
+        if time.monotonic() > deadline:
+            break_reason = f'time_budget({_PAGINATION_BUDGET_S}s)'
+            break
+
+        params: dict = {'userName': target}
+        if sent_cursor:
+            params['cursor'] = sent_cursor
+
+        data = await _api_get('/twitter/user/last_tweets', params, timeout=30.0)
+        if data is None:
+            break_reason = 'api_error_first_page' if pages == 0 else 'api_error_midstream'
+            break
+
+        pages += 1
+
+        # The tweet list may live under one of several keys; some endpoint
+        # versions also wrap it under a nested 'tweets' object.
+        tweets = (
+            data.get('tweets')
+            or data.get('data')
+            or data.get('items')
+            or data.get('results')
+            or []
+        )
+        if isinstance(tweets, dict):
+            tweets = tweets.get('tweets') or tweets.get('data') or []
+        if not isinstance(tweets, list):
+            tweets = []
+
+        _log_shape_once('user_tweets', data, tweets[0] if tweets else None)
+
+        all_tweets.extend(tweets)
+
+        raw_has_next = data.get('has_next_page')
+        if raw_has_next is None:
+            raw_has_next = data.get('hasNextPage')
+        parsed_has_next = _parse_has_next(raw_has_next)
+        new_cursor, cursor_src = _read_next_cursor(data, sent_cursor)
+        same_as_sent = (
+            new_cursor is not None and sent_cursor is not None
+            and new_cursor == sent_cursor
+        )
+
+        print(
+            f'[twitter] user_tweets p{page_idx} @{target}: '
+            f'got={len(tweets)} total={len(all_tweets)} '
+            f'has_next_parsed={parsed_has_next} '
+            f'next_cursor={_cursor_preview(new_cursor)} src={cursor_src!r} '
+            f'same_as_sent={same_as_sent}'
+        )
+
+        if len(tweets) == 0:
+            break_reason = 'empty_page'
+            break
+        if parsed_has_next is False:
+            break_reason = f'has_next_page=False(raw={raw_has_next!r})'
+            break
+        if not new_cursor:
+            break_reason = f'no_next_cursor(src={cursor_src!r})'
+            break
+        if same_as_sent:
+            break_reason = 'cursor_not_advancing'
+            break
+
+        sent_cursor = new_cursor
+
+    elapsed = time.monotonic() - started_at
+    print(f'[twitter] user_tweets done @{target}: '
+          f'tweets={len(all_tweets)} pages={pages} '
+          f'reason={break_reason} {elapsed:.1f}s')
+
+    async with _user_tweets_lock:
+        _user_tweets_cache[target] = (time.monotonic(), all_tweets)
+        # Opportunistic prune so the cache never grows without bound under
+        # heavy churn — drop entries older than 2× TTL.
+        if len(_user_tweets_cache) > 256:
+            stale_cutoff = time.monotonic() - (_USER_TWEETS_CACHE_TTL * 2)
+            for k in [k for k, v in list(_user_tweets_cache.items())
+                      if v[0] < stale_cutoff][:64]:
+                _user_tweets_cache.pop(k, None)
+
+    return all_tweets
+
+
 def extract_tweet_id(url: str) -> Optional[str]:
     m = re.search(r'/status/(\d+)', url or '')
     return m.group(1) if m else None
@@ -291,19 +515,81 @@ async def _api_get(path: str, params: dict, timeout: float = 30.0) -> Optional[d
 
 
 async def check_comment(tweet_id: str, target_username: str) -> dict:
-    """Check if target_username replied to tweet_id.
+    """Verify @target_username replied to tweet_id.
 
-    Paginates replies via next_cursor / has_next_page until the user is found,
-    the API says there are no more pages, or a page/time cap is hit (popular
-    tweets need many pages — a shallow cap caused legitimate replies to be
-    missed). Early-stops on match. Zero data → inconclusive; data + no match
-    → False.
+    Primary strategy: USER-SIDE — fetch the user's recent tweets ONCE (cached
+    across the finalize batch) and check whether any of them is a reply
+    whose in-reply-to id equals tweet_id. This is independent of how popular
+    the target tweet is and unaffected by /twitter/tweet/replies returning
+    intermittent zeros.
+
+    Secondary fallback: TWEET-SIDE — paginate /twitter/tweet/replies as
+    before. Kept so a true reply that fell outside the user's recent-tweets
+    window can still be caught when the replies endpoint is healthy.
+
+    Hybrid result rules (no regression vs the old behavior):
+      user_side True                                              -> True
+      user_side False (any depth) + tweet_side True               -> True
+      user_side False (≥ N scanned) + tweet_side False            -> False
+      user_side False (≥ N scanned) + tweet_side None             -> False  (trust user-side)
+      user_side False (< N scanned) + tweet_side False            -> False
+      user_side False (< N scanned) + tweet_side None             -> None
+      user_side fetched 0 tweets    + tweet_side <any>            -> whatever tweet_side said
     """
     print(f'[twitter] check_comment: tweet={tweet_id} target={target_username}')
     target = normalize_username(target_username)
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
+    target_id_s = _id_str(tweet_id)
 
+    # ── PRIMARY: user-side ───────────────────────────────────────────────────
+    user_tweets = await _fetch_user_recent_tweets(target)
+    us_count    = len(user_tweets)
+    if us_count:
+        for tw in user_tweets:
+            if _tweet_replies_to(tw, target_id_s):
+                reply_id = _id_str(tw.get('id') or tw.get('id_str'))
+                print(f'[twitter] check_comment: USERSIDE MATCH @{target} '
+                      f'replied to {target_id_s} (reply_tweet={reply_id}, '
+                      f'scanned={us_count})')
+                return {'verified': True, 'reason': 'found_comment_userside'}
+        print(f'[twitter] check_comment: userside no match in {us_count} tweets '
+              f'@{target} — running tweet-side fallback')
+    else:
+        print(f'[twitter] check_comment: userside returned 0 tweets @{target} '
+              f'— running tweet-side fallback')
+
+    # ── SECONDARY: tweet-side replies scan (legacy behavior, kept verbatim) ──
+    ts_result   = await _check_comment_tweetside(tweet_id, target)
+    ts_verified = ts_result.get('verified')
+
+    if ts_verified is True:
+        return {'verified': True, 'reason': 'found_comment_tweetside'}
+
+    confident_userside_no = us_count >= _USERSIDE_CONFIDENT_FALSE_MIN
+
+    if ts_verified is False:
+        reason = ('no_comment_found_both_sides' if us_count
+                  else 'no_comment_found_tweetside_only')
+        return {'verified': False, 'reason': reason}
+
+    # ts_verified is None
+    if confident_userside_no:
+        return {
+            'verified': False,
+            'reason':  f'no_comment_userside({us_count}_scanned)_tweetside_inconclusive',
+        }
+    if us_count:
+        return {
+            'verified': None,
+            'reason':  f'userside_shallow({us_count})_tweetside_inconclusive',
+        }
+    return {'verified': None, 'reason': 'both_sides_inconclusive'}
+
+
+async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
+    """Tweet-side replies pagination (the original /twitter/tweet/replies
+    scan, kept as the secondary check). Expects target already normalized."""
     sent_cursor: Optional[str] = None
     seen               = 0
     pages              = 0
@@ -322,7 +608,7 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             break_reason = f'time_budget({_PAGINATION_BUDGET_S}s)'
             break
 
-        print(f'[twitter] check_comment p{page_idx}: '
+        print(f'[twitter] check_comment tweetside p{page_idx}: '
               f'sending cursor={_cursor_preview(sent_cursor)} elapsed={elapsed:.1f}s')
 
         params: dict = {'tweetId': str(tweet_id)}
@@ -365,7 +651,7 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
         )
 
         print(
-            f'[twitter] check_comment p{page_idx}: '
+            f'[twitter] check_comment tweetside p{page_idx}: '
             f'replies={len(tweets)} unique_handles={len(page_handle_set)} '
             f'new={new_in_page} overlap_with_prev={overlap_in_page} '
             f'has_next_raw={raw_has_next!r}({type(raw_has_next).__name__}) '
@@ -377,7 +663,7 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
         # Match against the target — short-circuits the whole verify.
         for t in tweets:
             if _matches_target(t, target):
-                print(f'[twitter] check_comment: MATCH for @{target} on page {page_idx} '
+                print(f'[twitter] check_comment tweetside: MATCH for @{target} on page {page_idx} '
                       f'(scanned {seen + len(tweets)} replies)')
                 return {'verified': True, 'reason': 'found_comment'}
 
@@ -404,13 +690,13 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
         sent_cursor = new_cursor
 
     elapsed = time.monotonic() - started_at
-    print(f'[twitter] check_comment: stop reason={break_reason} '
+    print(f'[twitter] check_comment tweetside: stop reason={break_reason} '
           f'after {pages} pages, {seen} replies, {elapsed:.1f}s')
     if scanned_usernames:
         # Diagnostic: did the target ever appear in the data, or did matching
         # miss them? Log only usernames — first/last few + unique count.
         print(
-            f'[twitter] check_comment: scanned usernames '
+            f'[twitter] check_comment tweetside: scanned usernames '
             f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]} '
             f'total={len(scanned_usernames)} unique={len(seen_handles)}'
         )
@@ -418,16 +704,66 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
 
 
 async def check_retweet(tweet_id: str, target_username: str) -> dict:
-    """Check if target_username retweeted tweet_id via /twitter/tweet/retweeters.
+    """Verify @target_username retweeted tweet_id.
 
-    API success + user absent from retweeters list = verified=False (conclusive).
-    Only genuine API/network failure returns verified=None.
-    """
+    Same hybrid pattern as check_comment: user-side primary (scan the user's
+    recent tweets for a retweet that references tweet_id), with the existing
+    /twitter/tweet/retweeters scan as a secondary fallback. Same combine
+    rules — see check_comment for the result table."""
     print(f'[twitter] check_retweet: tweet={tweet_id} target={target_username}')
     target = normalize_username(target_username)
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
+    target_id_s = _id_str(tweet_id)
 
+    # ── PRIMARY: user-side ───────────────────────────────────────────────────
+    user_tweets = await _fetch_user_recent_tweets(target)
+    us_count    = len(user_tweets)
+    if us_count:
+        for tw in user_tweets:
+            if _tweet_retweets(tw, target_id_s):
+                rt_id = _id_str(tw.get('id') or tw.get('id_str'))
+                print(f'[twitter] check_retweet: USERSIDE MATCH @{target} '
+                      f'retweeted {target_id_s} (rt_tweet={rt_id}, '
+                      f'scanned={us_count})')
+                return {'verified': True, 'reason': 'found_retweet_userside'}
+        print(f'[twitter] check_retweet: userside no match in {us_count} tweets '
+              f'@{target} — running retweeters fallback')
+    else:
+        print(f'[twitter] check_retweet: userside returned 0 tweets @{target} '
+              f'— running retweeters fallback')
+
+    # ── SECONDARY: tweet-side retweeters scan ────────────────────────────────
+    ts_result   = await _check_retweet_tweetside(tweet_id, target)
+    ts_verified = ts_result.get('verified')
+
+    if ts_verified is True:
+        return {'verified': True, 'reason': 'found_retweet_tweetside'}
+
+    confident_userside_no = us_count >= _USERSIDE_CONFIDENT_FALSE_MIN
+
+    if ts_verified is False:
+        reason = ('no_retweet_found_both_sides' if us_count
+                  else 'no_retweet_found_tweetside_only')
+        return {'verified': False, 'reason': reason}
+
+    # ts_verified is None
+    if confident_userside_no:
+        return {
+            'verified': False,
+            'reason':  f'no_retweet_userside({us_count}_scanned)_tweetside_inconclusive',
+        }
+    if us_count:
+        return {
+            'verified': None,
+            'reason':  f'userside_shallow({us_count})_tweetside_inconclusive',
+        }
+    return {'verified': None, 'reason': 'both_sides_inconclusive'}
+
+
+async def _check_retweet_tweetside(tweet_id: str, target: str) -> dict:
+    """Tweet-side retweeters pagination (the original /twitter/tweet/retweeters
+    scan, kept as the secondary check). Expects target already normalized."""
     sent_cursor: Optional[str] = None
     seen               = 0
     pages              = 0
@@ -446,7 +782,7 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
             break_reason = f'time_budget({_PAGINATION_BUDGET_S}s)'
             break
 
-        print(f'[twitter] check_retweet p{page_idx}: '
+        print(f'[twitter] check_retweet tweetside p{page_idx}: '
               f'sending cursor={_cursor_preview(sent_cursor)} elapsed={elapsed:.1f}s')
 
         params: dict = {'tweetId': str(tweet_id)}
@@ -487,7 +823,7 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
         )
 
         print(
-            f'[twitter] check_retweet p{page_idx}: '
+            f'[twitter] check_retweet tweetside p{page_idx}: '
             f'users={len(users)} unique_handles={len(page_handle_set)} '
             f'new={new_in_page} overlap_with_prev={overlap_in_page} '
             f'has_next_raw={raw_has_next!r}({type(raw_has_next).__name__}) '
@@ -498,7 +834,7 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
 
         for u in users:
             if _matches_target(u, target):
-                print(f'[twitter] check_retweet: MATCH for @{target} on page {page_idx} '
+                print(f'[twitter] check_retweet tweetside: MATCH for @{target} on page {page_idx} '
                       f'(scanned {seen + len(users)} retweeters)')
                 return {'verified': True, 'reason': 'found_retweet'}
 
@@ -522,11 +858,11 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
         sent_cursor = new_cursor
 
     elapsed = time.monotonic() - started_at
-    print(f'[twitter] check_retweet: stop reason={break_reason} '
+    print(f'[twitter] check_retweet tweetside: stop reason={break_reason} '
           f'after {pages} pages, {seen} retweeters, {elapsed:.1f}s')
     if scanned_usernames:
         print(
-            f'[twitter] check_retweet: scanned usernames '
+            f'[twitter] check_retweet tweetside: scanned usernames '
             f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]} '
             f'total={len(scanned_usernames)} unique={len(seen_handles)}'
         )
