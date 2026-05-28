@@ -168,6 +168,66 @@ def _primary_handle(obj) -> str:
     return normalize_username(cands[0]) if cands else ''
 
 
+# ── Pagination signal parsing ────────────────────────────────────────────────
+# TwitterAPI.io's pagination shape varies by endpoint and we have seen issues
+# upstream where `has_next_page` arrives as a STRING ("true"/"false") rather
+# than a bool — strict `is False` checks miss that. And `next_cursor` can be
+# absent or empty, in which case a naive `data.get('next_cursor') or
+# data.get('cursor')` chain falls back to the response's `cursor` field, which
+# many APIs ECHO back the same value we sent. Sending the same cursor again
+# refetches the same page, producing the duplicate handles we observed.
+
+_CURSOR_KEYS_PRIORITY = (
+    'next_cursor', 'nextCursor',
+    'pagination_token', 'paginationToken',
+    'next_token',       'nextToken',
+)
+
+
+def _parse_has_next(value) -> Optional[bool]:
+    """Coerce a has_next_page value to True / False / None (unknown).
+    Accepts bool, int, and common string forms; anything else → None."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ('true',  '1', 'yes', 'on'):
+            return True
+        if s in ('false', '0', 'no',  'off', ''):
+            return False
+    return None
+
+
+def _read_next_cursor(data: dict, sent_cursor: Optional[str]) -> tuple[Optional[str], str]:
+    """Return (next_cursor, source_field) from a paginated response.
+
+    Tries known explicit next-page fields first. Only consults a bare `cursor`
+    field as a last resort AND only if it differs from what we sent — many
+    APIs echo the input cursor under `cursor`, which would silently make us
+    refetch the same page indefinitely."""
+    if not isinstance(data, dict):
+        return None, ''
+    for key in _CURSOR_KEYS_PRIORITY:
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip(), key
+    v = data.get('cursor')
+    if isinstance(v, str) and v.strip():
+        if v.strip() != (sent_cursor or ''):
+            return v.strip(), 'cursor'
+        return None, 'cursor(echo_ignored)'
+    return None, ''
+
+
+def _cursor_preview(c: Optional[str]) -> str:
+    """Short, safe-to-log cursor string: '(none)' or '<first 12>…(len=N)'."""
+    if not c:
+        return '(none)'
+    return f'{c[:12]}…(len={len(c)})'
+
+
 def extract_tweet_id(url: str) -> Optional[str]:
     m = re.search(r'/status/(\d+)', url or '')
     return m.group(1) if m else None
@@ -244,30 +304,36 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
 
-    cursor              = None
-    seen                = 0
-    pages               = 0
-    max_pages           = _REPLIES_MAX_PAGES
-    deadline            = time.monotonic() + _PAGINATION_BUDGET_S   # wall-clock budget
-    api_call_succeeded  = False
-    scanned_usernames: list = []   # diagnostic: primary handle of each reply scanned
+    sent_cursor: Optional[str] = None
+    seen               = 0
+    pages              = 0
+    max_pages          = _REPLIES_MAX_PAGES
+    started_at         = time.monotonic()
+    deadline           = started_at + _PAGINATION_BUDGET_S
+    api_call_succeeded = False
+    scanned_usernames: list = []
+    seen_handles: set  = set()   # all handles observed so far (dedupe analysis)
+    break_reason       = f'page_cap({max_pages})'
 
-    for _page in range(max_pages):
+    for page_idx0 in range(max_pages):
+        page_idx = page_idx0 + 1
+        elapsed  = time.monotonic() - started_at
         if time.monotonic() > deadline:
-            print(f'[twitter] check_comment: time budget ({_PAGINATION_BUDGET_S}s) '
-                  f'reached after {pages} pages')
+            break_reason = f'time_budget({_PAGINATION_BUDGET_S}s)'
             break
 
+        print(f'[twitter] check_comment p{page_idx}: '
+              f'sending cursor={_cursor_preview(sent_cursor)} elapsed={elapsed:.1f}s')
+
         params: dict = {'tweetId': str(tweet_id)}
-        if cursor:
-            params['cursor'] = cursor
+        if sent_cursor:
+            params['cursor'] = sent_cursor
 
         data = await _api_get('/twitter/tweet/replies', params, timeout=30.0)
         if data is None:
             if not api_call_succeeded:
-                # First call failed — we have no data at all, inconclusive
                 return {'verified': None, 'reason': 'api_error'}
-            # Later page failed but we already scanned some replies — treat as done
+            break_reason = 'api_error_midstream'
             break
 
         api_call_succeeded = True
@@ -276,33 +342,78 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
         if not isinstance(tweets, list):
             tweets = []
 
+        # Per-page dedupe analysis: how many handles on this page are new?
+        page_handles: list = []
+        for t in tweets:
+            h = _primary_handle(t)
+            if h:
+                page_handles.append(h)
+        page_handle_set = set(page_handles)
+        new_in_page = len(page_handle_set - seen_handles)
+        overlap_in_page = len(page_handle_set & seen_handles)
+
+        # Pagination signals (raw + parsed for log clarity)
+        raw_has_next = data.get('has_next_page')
+        if raw_has_next is None:
+            raw_has_next = data.get('hasNextPage')
+        parsed_has_next = _parse_has_next(raw_has_next)
+
+        new_cursor, cursor_src = _read_next_cursor(data, sent_cursor)
+        same_as_sent = (
+            new_cursor is not None and sent_cursor is not None
+            and new_cursor == sent_cursor
+        )
+
+        print(
+            f'[twitter] check_comment p{page_idx}: '
+            f'replies={len(tweets)} unique_handles={len(page_handle_set)} '
+            f'new={new_in_page} overlap_with_prev={overlap_in_page} '
+            f'has_next_raw={raw_has_next!r}({type(raw_has_next).__name__}) '
+            f'has_next_parsed={parsed_has_next} '
+            f'next_cursor={_cursor_preview(new_cursor)} src={cursor_src!r} '
+            f'same_as_sent={same_as_sent}'
+        )
+
+        # Match against the target — short-circuits the whole verify.
         for t in tweets:
             if _matches_target(t, target):
-                print(f'[twitter] check_comment: MATCH for @{target} on page {pages} '
+                print(f'[twitter] check_comment: MATCH for @{target} on page {page_idx} '
                       f'(scanned {seen + len(tweets)} replies)')
                 return {'verified': True, 'reason': 'found_comment'}
-            ph = _primary_handle(t)
-            if ph:
-                scanned_usernames.append(ph)
 
+        scanned_usernames.extend(page_handles)
+        seen_handles |= page_handle_set
         seen += len(tweets)
-        has_next = data.get('has_next_page')
-        if has_next is None:
-            has_next = data.get('hasNextPage')
-        cursor = data.get('next_cursor') or data.get('nextCursor') or data.get('cursor')
-        # Stop ONLY when the API says no more pages, the cursor is empty, or the
-        # page was empty. (Match → early return above; page cap → loop bound;
-        # time budget → guard at top of loop.)
-        if has_next is False or not cursor or len(tweets) == 0:
+
+        # Break conditions in priority order — log exactly which fired.
+        if len(tweets) == 0:
+            break_reason = 'empty_page'
+            break
+        if parsed_has_next is False:
+            break_reason = f'has_next_page=False(raw={raw_has_next!r})'
+            break
+        if not new_cursor:
+            break_reason = f'no_next_cursor(src={cursor_src!r})'
+            break
+        if same_as_sent:
+            # API echoed back what we sent — sending it again refetches the same
+            # page. Stop cleanly and report so the symptom is visible upstream.
+            break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
             break
 
-    # API succeeded — conclusive result: user did not comment.
-    print(f'[twitter] check_comment: no match for @{target} in {seen} replies across {pages} pages')
+        sent_cursor = new_cursor
+
+    elapsed = time.monotonic() - started_at
+    print(f'[twitter] check_comment: stop reason={break_reason} '
+          f'after {pages} pages, {seen} replies, {elapsed:.1f}s')
     if scanned_usernames:
-        # Diagnostic: did the target ever appear in the data, or did matching miss
-        # them? Log only usernames — first few and last few scanned.
-        print(f'[twitter] check_comment: scanned usernames '
-              f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]}')
+        # Diagnostic: did the target ever appear in the data, or did matching
+        # miss them? Log only usernames — first/last few + unique count.
+        print(
+            f'[twitter] check_comment: scanned usernames '
+            f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]} '
+            f'total={len(scanned_usernames)} unique={len(seen_handles)}'
+        )
     return {'verified': False, 'reason': 'no_comment_found'}
 
 
@@ -317,29 +428,37 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
 
-    cursor             = None
+    sent_cursor: Optional[str] = None
     seen               = 0
     pages              = 0
     max_pages          = _RETWEETERS_MAX_PAGES
-    deadline           = time.monotonic() + _PAGINATION_BUDGET_S   # wall-clock budget
+    started_at         = time.monotonic()
+    deadline           = started_at + _PAGINATION_BUDGET_S
     api_call_succeeded = False
-    scanned_usernames: list = []   # diagnostic: primary handle of each retweeter scanned
+    scanned_usernames: list = []
+    seen_handles: set  = set()
+    break_reason       = f'page_cap({max_pages})'
 
-    for _page in range(max_pages):
+    for page_idx0 in range(max_pages):
+        page_idx = page_idx0 + 1
+        elapsed  = time.monotonic() - started_at
         if time.monotonic() > deadline:
-            print(f'[twitter] check_retweet: time budget ({_PAGINATION_BUDGET_S}s) '
-                  f'reached after {pages} pages')
+            break_reason = f'time_budget({_PAGINATION_BUDGET_S}s)'
             break
 
+        print(f'[twitter] check_retweet p{page_idx}: '
+              f'sending cursor={_cursor_preview(sent_cursor)} elapsed={elapsed:.1f}s')
+
         params: dict = {'tweetId': str(tweet_id)}
-        if cursor:
-            params['cursor'] = cursor
+        if sent_cursor:
+            params['cursor'] = sent_cursor
 
         data = await _api_get('/twitter/tweet/retweeters', params, timeout=30.0)
         if data is None:
             if not api_call_succeeded:
                 return {'verified': None, 'reason': 'api_error'}
-            break  # later-page failure but we already scanned some retweeters
+            break_reason = 'api_error_midstream'
+            break
 
         api_call_succeeded = True
         pages += 1
@@ -347,29 +466,70 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
         if not isinstance(users, list):
             users = []
 
+        page_handles: list = []
+        for u in users:
+            h = _primary_handle(u)
+            if h:
+                page_handles.append(h)
+        page_handle_set = set(page_handles)
+        new_in_page = len(page_handle_set - seen_handles)
+        overlap_in_page = len(page_handle_set & seen_handles)
+
+        raw_has_next = data.get('has_next_page')
+        if raw_has_next is None:
+            raw_has_next = data.get('hasNextPage')
+        parsed_has_next = _parse_has_next(raw_has_next)
+
+        new_cursor, cursor_src = _read_next_cursor(data, sent_cursor)
+        same_as_sent = (
+            new_cursor is not None and sent_cursor is not None
+            and new_cursor == sent_cursor
+        )
+
+        print(
+            f'[twitter] check_retweet p{page_idx}: '
+            f'users={len(users)} unique_handles={len(page_handle_set)} '
+            f'new={new_in_page} overlap_with_prev={overlap_in_page} '
+            f'has_next_raw={raw_has_next!r}({type(raw_has_next).__name__}) '
+            f'has_next_parsed={parsed_has_next} '
+            f'next_cursor={_cursor_preview(new_cursor)} src={cursor_src!r} '
+            f'same_as_sent={same_as_sent}'
+        )
+
         for u in users:
             if _matches_target(u, target):
-                print(f'[twitter] check_retweet: MATCH for @{target} on page {pages} '
+                print(f'[twitter] check_retweet: MATCH for @{target} on page {page_idx} '
                       f'(scanned {seen + len(users)} retweeters)')
                 return {'verified': True, 'reason': 'found_retweet'}
-            ph = _primary_handle(u)
-            if ph:
-                scanned_usernames.append(ph)
 
+        scanned_usernames.extend(page_handles)
+        seen_handles |= page_handle_set
         seen += len(users)
-        has_next = data.get('has_next_page')
-        if has_next is None:
-            has_next = data.get('hasNextPage')
-        cursor = data.get('next_cursor') or data.get('nextCursor') or data.get('cursor')
-        # Stop ONLY on explicit no-more-pages, empty cursor, or empty page.
-        if has_next is False or not cursor or len(users) == 0:
+
+        if len(users) == 0:
+            break_reason = 'empty_page'
+            break
+        if parsed_has_next is False:
+            break_reason = f'has_next_page=False(raw={raw_has_next!r})'
+            break
+        if not new_cursor:
+            break_reason = f'no_next_cursor(src={cursor_src!r})'
+            break
+        if same_as_sent:
+            break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
             break
 
-    print(f'[twitter] check_retweet: @{target} not in {seen} retweeters of tweet {tweet_id} '
-          f'across {pages} pages')
+        sent_cursor = new_cursor
+
+    elapsed = time.monotonic() - started_at
+    print(f'[twitter] check_retweet: stop reason={break_reason} '
+          f'after {pages} pages, {seen} retweeters, {elapsed:.1f}s')
     if scanned_usernames:
-        print(f'[twitter] check_retweet: scanned usernames '
-              f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]}')
+        print(
+            f'[twitter] check_retweet: scanned usernames '
+            f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]} '
+            f'total={len(scanned_usernames)} unique={len(seen_handles)}'
+        )
     return {'verified': False, 'reason': 'no_retweet_found'}
 
 
