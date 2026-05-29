@@ -13,6 +13,7 @@ async def setup_hook():
     await bot.load_extension('cogs.engage')
     await bot.load_extension('cogs.protection')
     await bot.load_extension('cogs.analytics')
+    await bot.load_extension('cogs.voice_tracker')
     await bot.load_extension('cogs.tickets')
     await bot.load_extension('cogs.levels')
     await bot.load_extension('cogs.backup')

@@ -642,20 +642,101 @@ async def server_analytics(
             WHERE guild_id=?
         """, (server_id,)).fetchone()
 
-        e4e_stats = conn.execute("""
-            SELECT COUNT(*) as total_links,
-                   SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) as active_links
-            FROM engage_links
-        """).fetchone()
+        # ── Engage-for-Engage (real per-guild tables) ─────────────────────
+        # Legacy engage_links / engage_participation are global, schema-less
+        # for guild_id, and unused by the live cog. The live engage flow writes
+        # to engage_submissions / engage_actions / engage_user_points; query
+        # those, strictly scoped by guild_id.
+        gid_s = str(server_id)
 
-        e4e_part = conn.execute("""
-            SELECT COUNT(*) as total, SUM(points_earned) as points
-            FROM engage_participation
-        """).fetchone()
+        e4e_submissions = conn.execute("""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) AS active
+            FROM engage_submissions WHERE guild_id=?
+        """, (gid_s,)).fetchone()
+
+        e4e_claims = conn.execute("""
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(points_earned), 0) AS points_from_actions
+            FROM engage_actions WHERE guild_id=?
+        """, (gid_s,)).fetchone()
+
+        e4e_points_row = conn.execute("""
+            SELECT COALESCE(SUM(points), 0) AS points_balance,
+                   COALESCE(SUM(total_engaged),   0) AS total_engaged,
+                   COALESCE(SUM(total_submitted), 0) AS total_submitted
+            FROM engage_user_points WHERE guild_id=?
+        """, (gid_s,)).fetchone()
 
         e4e_participants = conn.execute("""
-            SELECT COUNT(DISTINCT user_id) as participants FROM engage_participation
-        """).fetchone()
+            SELECT COUNT(DISTINCT engager_user_id) AS engagers,
+                   COUNT(DISTINCT submission_id)   AS submissions_engaged
+            FROM engage_actions WHERE guild_id=?
+        """, (gid_s,)).fetchone()
+
+        e4e_contributors = conn.execute("""
+            SELECT COUNT(DISTINCT submitter_user_id) AS contributors
+            FROM engage_submissions WHERE guild_id=?
+        """, (gid_s,)).fetchone()
+
+        e4e_top_engagers = conn.execute("""
+            SELECT a.engager_user_id AS user_id,
+                   COALESCE(u.username,
+                            MAX(a.engager_x_username)) AS username,
+                   COUNT(*) AS claims,
+                   COALESCE(SUM(a.points_earned), 0) AS points
+            FROM engage_actions a
+            LEFT JOIN users u ON u.user_id = CAST(a.engager_user_id AS INTEGER)
+            WHERE a.guild_id=?
+            GROUP BY a.engager_user_id
+            ORDER BY points DESC, claims DESC
+            LIMIT 10
+        """, (gid_s,)).fetchall()
+
+        e4e_top_contributors = conn.execute("""
+            SELECT s.submitter_user_id AS user_id,
+                   COALESCE(u.username,
+                            MAX(s.submitter_x_username)) AS username,
+                   COUNT(*) AS submissions
+            FROM engage_submissions s
+            LEFT JOIN users u ON u.user_id = CAST(s.submitter_user_id AS INTEGER)
+            WHERE s.guild_id=?
+            GROUP BY s.submitter_user_id
+            ORDER BY submissions DESC
+            LIMIT 10
+        """, (gid_s,)).fetchall()
+
+        e4e_per_pool = conn.execute("""
+            SELECT p.pool_id,
+                   COALESCE(p.display_name, p.name) AS name,
+                   (SELECT COUNT(*) FROM engage_submissions s
+                     WHERE s.pool_id=p.pool_id AND s.guild_id=?) AS submissions,
+                   (SELECT COUNT(*) FROM engage_actions a
+                     WHERE a.pool_id=p.pool_id AND a.guild_id=?) AS claims,
+                   (SELECT COALESCE(SUM(points_earned),0) FROM engage_actions a
+                     WHERE a.pool_id=p.pool_id AND a.guild_id=?) AS points
+            FROM engage_pools p
+            WHERE p.guild_id=?
+            ORDER BY claims DESC, submissions DESC
+        """, (gid_s, gid_s, gid_s, gid_s)).fetchall()
+
+        # 30-day raw daily aggregates for engage activity. Python fills the
+        # gaps with zeros so the chart always has 30 contiguous days.
+        e4e_subs_daily = conn.execute("""
+            SELECT date(submitted_at) AS day, COUNT(*) AS subs
+            FROM engage_submissions
+            WHERE guild_id=? AND submitted_at >= date('now','-30 days')
+            GROUP BY date(submitted_at)
+        """, (gid_s,)).fetchall()
+
+        e4e_claims_daily = conn.execute("""
+            SELECT date(created_at) AS day,
+                   COUNT(*) AS claims,
+                   COALESCE(SUM(points_earned),0) AS points
+            FROM engage_actions
+            WHERE guild_id=? AND created_at >= date('now','-30 days')
+            GROUP BY date(created_at)
+        """, (gid_s,)).fetchall()
 
         # ── Messages per channel (cumulative, never pruned) ───────────────
         chan_rows = conn.execute("""
@@ -675,6 +756,49 @@ async def server_analytics(
         hour_dist_rows = conn.execute("""
             SELECT hour, count FROM message_hourly_dist WHERE guild_id=?
         """, (server_id,)).fetchall()
+
+        # ── Voice activity (per-guild) ────────────────────────────────────
+        voice_totals = conn.execute("""
+            SELECT COALESCE(SUM(duration_seconds), 0) AS total_seconds,
+                   COUNT(*) AS total_sessions,
+                   COUNT(DISTINCT user_id)    AS distinct_users,
+                   COUNT(DISTINCT channel_id) AS distinct_channels
+            FROM voice_sessions
+            WHERE guild_id=? AND left_at IS NOT NULL
+        """, (gid_s,)).fetchone()
+
+        voice_top_users = conn.execute("""
+            SELECT v.user_id,
+                   COALESCE(u.username, 'User ' || v.user_id) AS username,
+                   COALESCE(SUM(v.duration_seconds), 0) AS seconds,
+                   COUNT(*) AS sessions
+            FROM voice_sessions v
+            LEFT JOIN users u ON u.user_id = CAST(v.user_id AS INTEGER)
+            WHERE v.guild_id=? AND v.left_at IS NOT NULL
+            GROUP BY v.user_id
+            ORDER BY seconds DESC
+            LIMIT 10
+        """, (gid_s,)).fetchall()
+
+        voice_top_channels = conn.execute("""
+            SELECT channel_id,
+                   COALESCE(SUM(duration_seconds), 0) AS seconds,
+                   COUNT(*) AS sessions
+            FROM voice_sessions
+            WHERE guild_id=? AND left_at IS NOT NULL
+            GROUP BY channel_id
+            ORDER BY seconds DESC
+            LIMIT 10
+        """, (gid_s,)).fetchall()
+
+        voice_daily = conn.execute("""
+            SELECT date(joined_at) AS day,
+                   COALESCE(SUM(duration_seconds), 0) AS seconds
+            FROM voice_sessions
+            WHERE guild_id=? AND left_at IS NOT NULL
+              AND joined_at >= date('now','-30 days')
+            GROUP BY date(joined_at)
+        """, (gid_s,)).fetchall()
 
         # ── Community Points engagement (raids + community points) ────────
         comm_part = conn.execute("""
@@ -770,31 +894,47 @@ async def server_analytics(
         return mg, jl, msgs
 
     def build_year():
+        """Yearly view: only emit months from the first snapshot month → now.
+
+        The old behavior forced a 12-month window padded with zeros for months
+        before any real data, which produced an unreadable vertical drop. The
+        new behavior is honest: if the guild has 2 months of data, the chart
+        shows 2 months. The response carries data_start_date so the frontend
+        can show a small "showing all available data since X" note when the
+        span is short."""
         by_ym = {r['ym']: r for r in snaps_12mo}
-        # First snapshot month — do NOT plot phantom zero points for months
-        # before any real data existed (avoids the flat-then-jump artifact).
-        first_ym = None
-        if first_snap and first_snap['first_date']:
-            first_ym = str(first_snap['first_date'])[:7]
+        if not first_snap or not first_snap['first_date']:
+            return [], [], []
+        first_date = first_snap['first_date']  # 'YYYY-MM-DD'
+        try:
+            fy, fm = int(first_date[:4]), int(first_date[5:7])
+        except (TypeError, ValueError):
+            return [], [], []
+
+        # Walk from (fy, fm) forward to today's month, inclusive.
         mg, jl, msgs = [], [], []
-        for i in range(11, -1, -1):
-            y, m = today.year, today.month - i
-            while m <= 0:
-                m += 12; y -= 1
-            d = date(y, m, 1)
+        y, m = fy, fm
+        while (y, m) <= (today.year, today.month):
+            d  = date(y, m, 1)
             ym = d.strftime('%Y-%m')
             snap = by_ym.get(ym)
-            before_data = bool(first_ym) and ym < first_ym
-            # value=None tells the chart to start the line at the first real
-            # snapshot rather than drawing a phantom 0.
-            mg.append({'label': month_label(d),
-                       'value': None if (before_data or not snap)
-                                else int(snap['avg_members'] or 0)})
-            jl.append({'label': month_label(d),
-                       'joins':  None if before_data else int(snap['total_joins']  or 0) if snap else 0,
-                       'leaves': None if before_data else int(snap['total_leaves'] or 0) if snap else 0})
-            msgs.append({'label': month_label(d),
-                         'value': None if before_data else int(snap['total_msgs'] or 0) if snap else 0})
+            mg.append({
+                'label': month_label(d),
+                'value': int(snap['avg_members'] or 0) if snap else None,
+            })
+            jl.append({
+                'label':  month_label(d),
+                'joins':  int(snap['total_joins']  or 0) if snap else 0,
+                'leaves': int(snap['total_leaves'] or 0) if snap else 0,
+            })
+            msgs.append({
+                'label': month_label(d),
+                'value': int(snap['total_msgs'] or 0) if snap else 0,
+            })
+            m += 1
+            if m > 12:
+                m = 1
+                y += 1
         return mg, jl, msgs
 
     def build_day():
@@ -820,10 +960,68 @@ async def server_analytics(
         joins_leaves  = {'day': jl_day, 'week': jl_week, 'month': jl_month, 'year': jl_year}
         messages      = {'day': msgs_day, 'week': msgs_week, 'month': msgs_month, 'year': msgs_year}
 
+    # ── Voice rollups ─────────────────────────────────────────────────────
+    voice_total_seconds = int(voice_totals['total_seconds'] or 0) if voice_totals else 0
+    voice_top_channel_list = _build_channel_messages(
+        server_id,
+        [{'channel_id': r['channel_id'], 'count': int(r['seconds'] or 0)}
+         for r in voice_top_channels],
+    )
+    # Re-key channel rollups so the frontend can render minutes/sessions clearly.
+    for ch, r in zip(voice_top_channel_list, voice_top_channels):
+        ch['seconds']  = int(r['seconds'] or 0)
+        ch['minutes']  = int((r['seconds'] or 0) // 60)
+        ch['sessions'] = int(r['sessions'] or 0)
+        ch.pop('count', None)
+
+    # Voice daily fill: build a 30-slot dense series for the chart.
+    voice_by_day = {r['day']: int(r['seconds'] or 0) for r in voice_daily}
+    voice_timeseries = []
+    for i in range(29, -1, -1):
+        d = today - timedelta(days=i)
+        voice_timeseries.append({
+            'label':   date_label(d),
+            'date':    d.isoformat(),
+            'minutes': voice_by_day.get(d.isoformat(), 0) // 60,
+        })
+
+    # ── Engage timeseries fill (30 contiguous days) ───────────────────────
+    e4e_subs_by_day   = {r['day']: int(r['subs']   or 0) for r in e4e_subs_daily}
+    e4e_claims_by_day = {r['day']: (int(r['claims'] or 0), int(r['points'] or 0))
+                         for r in e4e_claims_daily}
+    e4e_series = []
+    for i in range(29, -1, -1):
+        d  = today - timedelta(days=i)
+        cl, pt = e4e_claims_by_day.get(d.isoformat(), (0, 0))
+        e4e_series.append({
+            'label':       date_label(d),
+            'date':        d.isoformat(),
+            'submissions': e4e_subs_by_day.get(d.isoformat(), 0),
+            'claims':      cl,
+            'points':      pt,
+        })
+
+    # ── Yearly span metadata (so the frontend can show an honest note) ────
+    data_start_date = first_snap['first_date'] if first_snap and first_snap['first_date'] else None
+    months_covered  = 0
+    if data_start_date:
+        try:
+            fy, fm = int(data_start_date[:4]), int(data_start_date[5:7])
+            months_covered = (today.year - fy) * 12 + (today.month - fm) + 1
+            if months_covered < 0:
+                months_covered = 0
+        except (TypeError, ValueError):
+            months_covered = 0
+
     return {
         'member_growth':             member_growth,
         'joins_leaves':              joins_leaves,
         'messages':                  messages,
+        'yearly_meta': {
+            'data_start_date':   data_start_date,
+            'months_covered':    months_covered,
+            'is_sparse':         months_covered < 3,
+        },
         'leaves_tracking_started':   leaves_tracking_started or None,
         'first_message_tracked_date': first_msg_row['first_date'] if first_msg_row else None,
         'raids': {
@@ -831,15 +1029,9 @@ async def server_analytics(
             'active':         raid_stats['active_raids'],
             'points_offered': raid_stats['total_points_offered'] or 0,
         },
-        'engage': {
-            'total_links':       e4e_stats['total_links'],
-            'active_links':      e4e_stats['active_links'],
-            'total_engagements': e4e_part['total'],
-            'total_points':      e4e_part['points'] or 0,
-        },
         'leaderboard':         [dict(r) for r in leaderboard],
-        'data_started':        first_snap['first_date'] if first_snap else None,
-        'first_snapshot_date': first_snap['first_date'] if first_snap else None,
+        'data_started':        data_start_date,
+        'first_snapshot_date': data_start_date,
         'has_any_data':        has_data,
 
         # ── Messages per channel (real, cumulative) ───────────────────────
@@ -856,15 +1048,24 @@ async def server_analytics(
         # ── Most active hours (real, cumulative 24h distribution) ─────────
         'active_hours': _build_active_hours(hour_dist_rows),
 
-        # ── Voice: no voice data collected yet. Structured empty state so
-        #    the UI renders cleanly and the aggregation path is correct for
-        #    when data does exist. ───────────────────────────────────────
+        # ── Voice activity (real, per-guild) ──────────────────────────────
         'voice': {
-            'available':     False,
-            'total_minutes': 0,
-            'total_sessions': 0,
-            'top_channels':  [],
-            'top_users':     [],
+            'available':       voice_total_seconds > 0,
+            'total_seconds':   voice_total_seconds,
+            'total_minutes':   voice_total_seconds // 60,
+            'total_hours':     round(voice_total_seconds / 3600, 1),
+            'total_sessions':  int(voice_totals['total_sessions']   or 0) if voice_totals else 0,
+            'distinct_users':  int(voice_totals['distinct_users']    or 0) if voice_totals else 0,
+            'distinct_channels': int(voice_totals['distinct_channels'] or 0) if voice_totals else 0,
+            'top_users': [
+                {'user_id': str(r['user_id']),
+                 'username': r['username'] or f"User {r['user_id']}",
+                 'minutes': int((r['seconds'] or 0) // 60),
+                 'sessions': int(r['sessions'] or 0)}
+                for r in voice_top_users
+            ],
+            'top_channels': voice_top_channel_list,
+            'timeseries':   voice_timeseries,
         },
 
         # ── Engagement, split into two independent sections ───────────────
@@ -884,11 +1085,37 @@ async def server_analytics(
             ],
         },
         'engage_engagement': {
-            'total_links':       e4e_stats['total_links'] or 0,
-            'active_links':      e4e_stats['active_links'] or 0,
-            'total_engagements': e4e_part['total'] or 0,
-            'total_points':      e4e_part['points'] or 0,
-            'participants':      e4e_participants['participants'] or 0,
+            'total_submissions':  int(e4e_submissions['total']  or 0) if e4e_submissions else 0,
+            'active_submissions': int(e4e_submissions['active'] or 0) if e4e_submissions else 0,
+            'total_claims':       int(e4e_claims['total'] or 0) if e4e_claims else 0,
+            'total_points':       int(e4e_points_row['points_balance'] or 0) if e4e_points_row else 0,
+            'points_from_actions': int(e4e_claims['points_from_actions'] or 0) if e4e_claims else 0,
+            'total_engaged':      int(e4e_points_row['total_engaged']   or 0) if e4e_points_row else 0,
+            'total_submitted':    int(e4e_points_row['total_submitted'] or 0) if e4e_points_row else 0,
+            'engagers':           int(e4e_participants['engagers']      or 0) if e4e_participants else 0,
+            'contributors':       int(e4e_contributors['contributors']  or 0) if e4e_contributors else 0,
+            'top_engagers': [
+                {'user_id': str(r['user_id']),
+                 'username': r['username'] or f"User {r['user_id']}",
+                 'claims':   int(r['claims'] or 0),
+                 'points':   int(r['points'] or 0)}
+                for r in e4e_top_engagers
+            ],
+            'top_contributors': [
+                {'user_id': str(r['user_id']),
+                 'username': r['username'] or f"User {r['user_id']}",
+                 'submissions': int(r['submissions'] or 0)}
+                for r in e4e_top_contributors
+            ],
+            'pools': [
+                {'pool_id':     int(r['pool_id']),
+                 'name':        r['name'] or 'Pool',
+                 'submissions': int(r['submissions'] or 0),
+                 'claims':      int(r['claims']      or 0),
+                 'points':      int(r['points']      or 0)}
+                for r in e4e_per_pool
+            ],
+            'timeseries':  e4e_series,
         },
         'stat_cards': {
             'total_members':      live_count,

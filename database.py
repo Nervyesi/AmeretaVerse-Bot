@@ -971,6 +971,27 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_embed_messages_guild ON embed_messages(guild_id);
             CREATE INDEX IF NOT EXISTS idx_embed_messages_channel ON embed_messages(guild_id, channel_id);
+
+            -- Voice activity: one row per voice session. left_at is NULL while
+            -- a member is still in voice; the listener closes it on leave/move
+            -- and a sweep on bot ready also closes any sessions left dangling
+            -- by a restart. duration_seconds is the materialized session
+            -- length so analytics queries don't need to compute it.
+            CREATE TABLE IF NOT EXISTS voice_sessions (
+                session_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id          TEXT NOT NULL,
+                user_id           TEXT NOT NULL,
+                channel_id        TEXT NOT NULL,
+                joined_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                left_at           TIMESTAMP DEFAULT NULL,
+                duration_seconds  INTEGER NOT NULL DEFAULT 0,
+                afk               INTEGER NOT NULL DEFAULT 0,
+                self_mute         INTEGER NOT NULL DEFAULT 0,
+                self_deaf         INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user ON voice_sessions(guild_id, user_id);
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_joined ON voice_sessions(guild_id, joined_at);
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_open ON voice_sessions(guild_id, left_at);
         """)
 
     # Seed AmeretaVerse pools
