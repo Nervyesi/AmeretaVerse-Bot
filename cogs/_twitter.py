@@ -98,7 +98,7 @@ else:
 # env var overrides a default.
 _REPLIES_MAX_PAGES      = max(1, int(os.getenv('TWITTER_REPLIES_MAX_PAGES',     '20') or 20))
 _RETWEETERS_MAX_PAGES   = max(1, int(os.getenv('TWITTER_RETWEETERS_MAX_PAGES', '20') or 20))
-_USER_TWEETS_MAX_PAGES  = max(1, int(os.getenv('TWITTER_USER_TWEETS_MAX_PAGES', '5') or 5))
+_USER_TWEETS_MAX_PAGES  = max(1, int(os.getenv('TWITTER_USER_TWEETS_MAX_PAGES', '12') or 12))
 _PAGINATION_BUDGET_S    = max(5.0, float(os.getenv('TWITTER_PAGINATION_BUDGET_S', '120') or 120))
 # Short-TTL process-level cache for a user's recent tweets. One engage finalize
 # verifies many submissions for the same user — we'd hit /user/last_tweets
@@ -260,6 +260,23 @@ _REPLY_TO_ID_FIELDS = (
     'inReplyToId', 'in_reply_to_status_id_str', 'in_reply_to_status_id',
     'inReplyToStatusId', 'in_reply_to_tweet_id', 'replyToId',
     'inReplyTo', 'reply_to_id',
+    # TwitterAPI.io variants observed in user_tweets payloads:
+    'replied_to_status_id', 'repliedToStatusId', 'replied_to_status_id_str',
+)
+# Conversation-id fields. We use these ONLY as a last-resort signal — a
+# conversation_id matching the target tweet means the tweet is in the target's
+# thread, which covers most reply scenarios but can also match the root tweet
+# itself. We guard against false positives below (own-id != target + a reply
+# hint).
+_CONVERSATION_ID_FIELDS = (
+    'conversation_id', 'conversationId', 'conversationID',
+)
+# Boolean-ish "this is a reply" flags. Used together with conversation_id to
+# distinguish a real reply from the root tweet of the conversation.
+_REPLY_HINT_FIELDS = (
+    'isReply', 'is_reply',
+    'inReplyToUserId', 'in_reply_to_user_id', 'in_reply_to_user_id_str',
+    'in_reply_to_screen_name', 'inReplyToScreenName',
 )
 _RETWEET_REF_ID_FIELDS = (
     'retweetedStatusId', 'retweeted_status_id', 'retweeted_status_id_str',
@@ -280,19 +297,41 @@ def _id_str(v) -> str:
 def _tweet_replies_to(tw: dict, target_id: str) -> bool:
     """True if `tw` is a reply whose in-reply-to id equals target_id.
 
-    Checks every known direct field plus the Twitter-v2 `referenced_tweets`
-    array (entries with type='replied_to')."""
+    Priority order:
+      1. Any of the known direct in-reply-to id fields (snake_case + camelCase).
+      2. The Twitter-v2 `referenced_tweets` array (type='replied_to').
+      3. conversation_id == target_id AS LAST RESORT, gated by the tweet being
+         not the root of that conversation AND carrying a reply hint (so we
+         don't false-positive on the original target tweet itself).
+    """
     if not isinstance(tw, dict) or not target_id:
         return False
+
+    # 1. Direct in-reply-to fields.
     for f in _REPLY_TO_ID_FIELDS:
         if _id_str(tw.get(f)) == target_id:
             return True
+
+    # 2. Twitter-v2 referenced_tweets array.
     refs = tw.get('referenced_tweets')
     if isinstance(refs, list):
         for r in refs:
             if isinstance(r, dict) and str(r.get('type', '')) == 'replied_to':
                 if _id_str(r.get('id')) == target_id:
                     return True
+
+    # 3. conversation_id last-resort. Only counts when:
+    #    - the tweet's own id isn't the target (don't match the root tweet)
+    #    - at least one reply-hint field exists (rules out a top-level tweet
+    #      that happens to be the conversation root)
+    own_id = _id_str(tw.get('id') or tw.get('id_str'))
+    if own_id == target_id:
+        return False
+    for cf in _CONVERSATION_ID_FIELDS:
+        if _id_str(tw.get(cf)) == target_id:
+            if any(tw.get(h) for h in _REPLY_HINT_FIELDS):
+                return True
+            break  # conversation matched but no reply-hint → not enough to claim
     return False
 
 
@@ -338,6 +377,109 @@ def _log_shape_once(tag: str, data: dict, sample: Optional[dict]) -> None:
         print(f'[twitter] {tag} sample tweet keys: {sample_keys}')
 
 
+# ── user_tweets payload shape & tweet extraction ────────────────────────────
+# TwitterAPI.io's /twitter/user/last_tweets wraps the payload in a
+# {code, msg, status, data, has_next_page, next_cursor} envelope. The
+# `data` field itself can be either a list of tweet dicts OR a dict whose
+# `tweets` key holds the list (and sometimes `pin_tweet` next to it). The
+# previous parser short-circuited with an `or` truthiness chain that fell
+# through when `data` was an empty list AND when `data['tweets']` was empty
+# next to a non-empty `pin_tweet`, giving got=0 even though the cursor said
+# more pages exist. This helper tries every documented path in priority
+# order and returns the path string so we can confirm in logs which shape
+# this endpoint version actually uses.
+
+def _extract_tweets_from_payload(data) -> tuple[list, str]:
+    """Return (tweet_list, path_used) for a /user/last_tweets response.
+
+    path_used is one of: 'data[]', 'data.tweets', 'data.data[]',
+    'data.items', 'data.results', 'tweets', 'items', 'results', 'none',
+    'not-a-dict'. Logged on every page so we can confirm field shape."""
+    if not isinstance(data, dict):
+        return [], 'not-a-dict'
+
+    d = data.get('data')
+
+    # 1. data is itself a list of tweets.
+    if isinstance(d, list):
+        return d, 'data[]'
+
+    # 2. data is a dict wrapping the tweets list. Probe known carrier keys.
+    if isinstance(d, dict):
+        for sub in ('tweets', 'data', 'items', 'results', 'statuses'):
+            v = d.get(sub)
+            if isinstance(v, list):
+                return v, f'data.{sub}{"[]" if sub == "data" else ""}'
+
+    # 3. Top-level carrier (older / alternate shapes).
+    for k in ('tweets', 'items', 'results', 'statuses'):
+        v = data.get(k)
+        if isinstance(v, list):
+            return v, k
+
+    return [], 'none'
+
+
+def _log_user_tweets_data_shape_once(data) -> None:
+    """ONCE per process, log the deep structure of the user_tweets `data`
+    field so the path our extractor uses is verifiable against production
+    payloads. Subsequent calls are silent."""
+    key = 'user_tweets:data-shape'
+    if key in _logged_response_shapes:
+        return
+    _logged_response_shapes.add(key)
+    if not isinstance(data, dict):
+        print(f'[twitter] user_tweets data: top-level type={type(data).__name__}')
+        return
+    d = data.get('data')
+    if isinstance(d, list):
+        first = d[0] if d else None
+        first_keys = sorted(first.keys())[:30] if isinstance(first, dict) else None
+        print(f'[twitter] user_tweets data: list len={len(d)} '
+              f'first_tweet_keys={first_keys}')
+        return
+    if isinstance(d, dict):
+        sub_keys = sorted(d.keys())
+        print(f'[twitter] user_tweets data: dict keys={sub_keys}')
+        for sk in ('tweets', 'data', 'items', 'results', 'statuses'):
+            sv = d.get(sk)
+            if isinstance(sv, list):
+                first = sv[0] if sv else None
+                first_keys = sorted(first.keys())[:30] if isinstance(first, dict) else None
+                print(f'[twitter] user_tweets data.{sk}: list len={len(sv)} '
+                      f'first_tweet_keys={first_keys}')
+                break
+        return
+    print(f'[twitter] user_tweets data: type={type(d).__name__} '
+          f'preview={str(d)[:200]}')
+
+
+def _log_first_tweet_keys_once(tw) -> None:
+    """ONCE per process, log the keys of the first observed user tweet
+    object and any reply / conversation / retweet related fields with their
+    values. Makes new field-name variants instantly visible in Railway."""
+    key = 'user_tweets:first-tweet-keys'
+    if key in _logged_response_shapes:
+        return
+    if not isinstance(tw, dict):
+        return
+    _logged_response_shapes.add(key)
+    print(f'[twitter] user_tweets first tweet keys: {sorted(tw.keys())[:40]}')
+    reply_like = {
+        k: tw[k] for k in tw.keys()
+        if isinstance(k, str) and (
+            'reply' in k.lower() or 'conversation' in k.lower() or 'retweet' in k.lower()
+        )
+    }
+    if reply_like:
+        # Trim very long string values so the log line stays readable.
+        compact = {
+            k: (v if not isinstance(v, str) or len(v) <= 80 else v[:77] + '…')
+            for k, v in reply_like.items()
+        }
+        print(f'[twitter] user_tweets first tweet reply/retweet fields: {compact}')
+
+
 async def _fetch_user_recent_tweets(username: str) -> list:
     """Return the user's recent tweets via /twitter/user/last_tweets.
 
@@ -364,6 +506,7 @@ async def _fetch_user_recent_tweets(username: str) -> list:
     started_at = time.monotonic()
     deadline   = started_at + _PAGINATION_BUDGET_S
     pages = 0
+    prev_empty = False   # tolerate one empty page when the cursor is advancing
     break_reason = f'page_cap({_USER_TWEETS_MAX_PAGES})'
 
     for page_idx0 in range(_USER_TWEETS_MAX_PAGES):
@@ -383,21 +526,16 @@ async def _fetch_user_recent_tweets(username: str) -> list:
 
         pages += 1
 
-        # The tweet list may live under one of several keys; some endpoint
-        # versions also wrap it under a nested 'tweets' object.
-        tweets = (
-            data.get('tweets')
-            or data.get('data')
-            or data.get('items')
-            or data.get('results')
-            or []
-        )
-        if isinstance(tweets, dict):
-            tweets = tweets.get('tweets') or tweets.get('data') or []
-        if not isinstance(tweets, list):
-            tweets = []
+        # Extract tweets via the path-probing helper. The previous chain
+        # short-circuited on truthiness when `data['data']` was an empty list
+        # or had an empty `tweets` array alongside a populated `pin_tweet`,
+        # which silently returned [] even when later pages had real data.
+        tweets, extract_path = _extract_tweets_from_payload(data)
 
+        _log_user_tweets_data_shape_once(data)
         _log_shape_once('user_tweets', data, tweets[0] if tweets else None)
+        if tweets:
+            _log_first_tweet_keys_once(tweets[0])
 
         all_tweets.extend(tweets)
 
@@ -414,22 +552,43 @@ async def _fetch_user_recent_tweets(username: str) -> list:
         print(
             f'[twitter] user_tweets p{page_idx} @{target}: '
             f'got={len(tweets)} total={len(all_tweets)} '
-            f'has_next_parsed={parsed_has_next} '
+            f'path={extract_path!r} '
+            f'has_next_raw={raw_has_next!r} has_next_parsed={parsed_has_next} '
             f'next_cursor={_cursor_preview(new_cursor)} src={cursor_src!r} '
             f'same_as_sent={same_as_sent}'
         )
 
-        if len(tweets) == 0:
-            break_reason = 'empty_page'
-            break
-        if parsed_has_next is False:
-            break_reason = f'has_next_page=False(raw={raw_has_next!r})'
-            break
+        # Stop conditions in priority order. The cursor is the source of
+        # truth: production logs show /user/last_tweets returns
+        # has_next_page=False on page 1 WITH a real next_cursor that DOES
+        # yield more data. Trust the cursor; treat has_next=False alone as
+        # advisory.
         if not new_cursor:
             break_reason = f'no_next_cursor(src={cursor_src!r})'
             break
         if same_as_sent:
-            break_reason = 'cursor_not_advancing'
+            break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
+            break
+
+        # Tolerate ONE empty page if the cursor is still advancing — the
+        # API occasionally returns a metadata-only first page. A second
+        # empty page in a row means we're really out of data.
+        if len(tweets) == 0:
+            if prev_empty:
+                break_reason = 'two_empty_pages_in_a_row'
+                break
+            prev_empty = True
+            print(f'[twitter] user_tweets p{page_idx} @{target}: '
+                  f'empty page but cursor advances — continuing')
+        else:
+            prev_empty = False
+
+        # has_next_page=False with NO next cursor is handled above. If it's
+        # False but a cursor exists, the API is being inconsistent — keep
+        # paging and let the cursor / empty-page logic stop us.
+        if parsed_has_next is False and not tweets and prev_empty:
+            # The API really wants us to stop and there's nothing in hand.
+            break_reason = f'has_next_page=False(raw={raw_has_next!r})_after_empty'
             break
 
         sent_cursor = new_cursor
