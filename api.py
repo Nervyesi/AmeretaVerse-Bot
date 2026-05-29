@@ -88,6 +88,14 @@ from database import (
     create_embed_message as db_create_embed_message,
     update_embed_message as db_update_embed_message,
     delete_embed_message as db_delete_embed_message,
+    list_giveaways as db_list_giveaways,
+    get_giveaway as db_get_giveaway,
+    create_giveaway as db_create_giveaway,
+    update_giveaway as db_update_giveaway,
+    delete_giveaway as db_delete_giveaway,
+    list_giveaway_entries as db_list_giveaway_entries,
+    count_giveaway_entries as db_count_giveaway_entries,
+    refund_giveaway_entries as db_refund_giveaway_entries,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
@@ -2818,6 +2826,662 @@ async def embeds_delete(
     )
 
     return {'ok': True, 'discord_message_deleted': msg_deleted}
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  GIVEAWAY ENDPOINTS
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+# Dashboard CRUD + lifecycle (start / end-now / reroll / cancel). The Discord
+# side (cogs/giveaway.py) owns the runtime scheduler, button handlers, and
+# winner-draw; this section just lets admins compose, post, and manage the
+# embed and entrants list.
+
+# Lock these fields once status='active' so an admin can't shrink the prize
+# pool or duration after entrants joined. description/image_url/thumbnail/
+# color stay editable so a typo can be corrected mid-flight.
+_GIVEAWAY_LOCKED_WHEN_ACTIVE = {
+    'duration_seconds', 'winner_count', 'entry_cost_points',
+    'allowed_role_ids', 'mention_role_id', 'channel_id',
+}
+
+_GIVEAWAY_TITLE_MAX        = 256
+_GIVEAWAY_DESC_MAX         = 4000
+_GIVEAWAY_PRIZE_MAX        = 512
+_GIVEAWAY_MIN_DURATION_S   = 60
+_GIVEAWAY_MAX_DURATION_S   = 30 * 24 * 3600  # 30 days
+_GIVEAWAY_MAX_WINNER_COUNT = 50
+
+
+class _GiveawayCreate(BaseModel):
+    title: Optional[str] = ''
+    description: Optional[str] = ''
+    prize: Optional[str] = ''
+    image_url: Optional[str] = ''
+    thumbnail_url: Optional[str] = ''
+    color: Optional[str] = None
+    duration_seconds: Optional[int] = 3600
+    winner_count: Optional[int] = 1
+    entry_cost_points: Optional[int] = 0
+    allowed_role_ids: Optional[list] = None   # list of role-id strings
+    mention_role_id: Optional[str] = None
+    channel_id: Optional[str] = ''
+
+
+class _GiveawayUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    prize: Optional[str] = None
+    image_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    color: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    winner_count: Optional[int] = None
+    entry_cost_points: Optional[int] = None
+    allowed_role_ids: Optional[list] = None
+    mention_role_id: Optional[str] = None
+    channel_id: Optional[str] = None
+
+
+def _check_giveaway_owner(giveaway_id: int, server_id: int) -> dict:
+    g = db_get_giveaway(giveaway_id, server_id)
+    if g is None:
+        raise HTTPException(status_code=404, detail='Giveaway not found')
+    return g
+
+
+def _coerce_giveaway_color(value) -> int | None:
+    if value is None or value == '':
+        return None
+    if isinstance(value, int):
+        return value & 0xFFFFFF
+    if isinstance(value, str):
+        v = value.strip().lower().lstrip('#')
+        if v.startswith('0x'):
+            v = v[2:]
+        if not v:
+            return None
+        try:
+            return int(v, 16) & 0xFFFFFF
+        except ValueError:
+            raise HTTPException(status_code=400, detail='Invalid color — use #RRGGBB hex')
+    raise HTTPException(status_code=400, detail='Invalid color')
+
+
+def _validate_giveaway_url(url: str, field: str) -> str:
+    if not url:
+        return ''
+    u = url.strip()
+    if not u:
+        return ''
+    if len(u) > 2048:
+        raise HTTPException(status_code=400, detail=f'{field} too long')
+    if not (u.startswith('http://') or u.startswith('https://')):
+        raise HTTPException(status_code=400, detail=f'{field} must be http(s)://')
+    return u
+
+
+def _validate_role_id_list(values) -> str:
+    if values is None:
+        return '[]'
+    if not isinstance(values, list):
+        raise HTTPException(status_code=400, detail='allowed_role_ids must be a list')
+    out: list[str] = []
+    for v in values:
+        s = str(v).strip()
+        if not s:
+            continue
+        if not s.isdigit() or len(s) > 32:
+            raise HTTPException(status_code=400,
+                detail='allowed_role_ids must be a list of numeric role ids')
+        out.append(s)
+    return json.dumps(out)
+
+
+def _validate_giveaway_payload(
+    *, title: Optional[str], description: Optional[str], prize: Optional[str],
+    duration_seconds: Optional[int], winner_count: Optional[int],
+    entry_cost_points: Optional[int],
+) -> None:
+    if title is not None and len(title) > _GIVEAWAY_TITLE_MAX:
+        raise HTTPException(status_code=400, detail=f'title too long (max {_GIVEAWAY_TITLE_MAX})')
+    if description is not None and len(description) > _GIVEAWAY_DESC_MAX:
+        raise HTTPException(status_code=400, detail=f'description too long (max {_GIVEAWAY_DESC_MAX})')
+    if prize is not None and len(prize) > _GIVEAWAY_PRIZE_MAX:
+        raise HTTPException(status_code=400, detail=f'prize too long (max {_GIVEAWAY_PRIZE_MAX})')
+    if duration_seconds is not None:
+        if (duration_seconds < _GIVEAWAY_MIN_DURATION_S
+                or duration_seconds > _GIVEAWAY_MAX_DURATION_S):
+            raise HTTPException(
+                status_code=400,
+                detail=(f'duration_seconds must be between {_GIVEAWAY_MIN_DURATION_S}s '
+                        f'and {_GIVEAWAY_MAX_DURATION_S}s'),
+            )
+    if winner_count is not None:
+        if winner_count < 1 or winner_count > _GIVEAWAY_MAX_WINNER_COUNT:
+            raise HTTPException(status_code=400,
+                detail=f'winner_count must be 1..{_GIVEAWAY_MAX_WINNER_COUNT}')
+    if entry_cost_points is not None and entry_cost_points < 0:
+        raise HTTPException(status_code=400, detail='entry_cost_points must be ≥ 0')
+
+
+def _giveaway_row_to_dict(g: dict) -> dict:
+    """Hydrate a DB row for the dashboard: parse JSON columns, expose color
+    as '#RRGGBB', stringify snowflakes, mirror entry_count if present."""
+    try:
+        roles = json.loads(g.get('allowed_role_ids') or '[]')
+        if not isinstance(roles, list):
+            roles = []
+    except (ValueError, TypeError):
+        roles = []
+    try:
+        winners = json.loads(g.get('winners_json') or '[]')
+        if not isinstance(winners, list):
+            winners = []
+    except (ValueError, TypeError):
+        winners = []
+    color_int = g.get('color')
+    color_hex = f'#{int(color_int):06x}' if color_int is not None else None
+    return {
+        'id':                int(g['id']),
+        'guild_id':          str(g['guild_id']),
+        'channel_id':        g.get('channel_id') or '',
+        'message_id':        g.get('message_id') or '',
+        'title':             g.get('title') or '',
+        'description':       g.get('description') or '',
+        'prize':             g.get('prize') or '',
+        'image_url':         g.get('image_url') or '',
+        'thumbnail_url':     g.get('thumbnail_url') or '',
+        'color':             color_hex,
+        'duration_seconds':  int(g.get('duration_seconds') or 0),
+        'ends_at':           g.get('ends_at'),
+        'winner_count':      int(g.get('winner_count') or 1),
+        'entry_cost_points': int(g.get('entry_cost_points') or 0),
+        'allowed_role_ids':  [str(r) for r in roles],
+        'mention_role_id':   str(g['mention_role_id']) if g.get('mention_role_id') else None,
+        'status':            g.get('status') or 'draft',
+        'created_by':        str(g.get('created_by')) if g.get('created_by') else None,
+        'created_at':        g.get('created_at'),
+        'started_at':        g.get('started_at'),
+        'ended_at':          g.get('ended_at'),
+        'winners':           [str(w) for w in winners],
+        'entry_count':       int(g.get('entry_count') or 0),
+    }
+
+
+@app.get('/api/servers/{server_id}/giveaways')
+async def giveaways_list(server_id: int, user: dict = Depends(get_current_user)):
+    require_module_access(user, server_id, 'giveaway')
+    rows = db_list_giveaways(server_id)
+    return {'giveaways': [_giveaway_row_to_dict(r) for r in rows]}
+
+
+@app.post('/api/servers/{server_id}/giveaways')
+async def giveaways_create(
+    server_id: int,
+    body: _GiveawayCreate,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'giveaway')
+    rate_limit(f'giveaway_create:{server_id}', 30, 60.0)
+
+    _validate_giveaway_payload(
+        title=body.title, description=body.description, prize=body.prize,
+        duration_seconds=body.duration_seconds, winner_count=body.winner_count,
+        entry_cost_points=body.entry_cost_points,
+    )
+
+    color_int = _coerce_giveaway_color(body.color)
+    image_url = _validate_giveaway_url(body.image_url     or '', 'image_url')
+    thumb_url = _validate_giveaway_url(body.thumbnail_url or '', 'thumbnail_url')
+    roles_str = _validate_role_id_list(body.allowed_role_ids)
+    mention   = (body.mention_role_id or '').strip() or None
+    if mention and (not mention.isdigit() or len(mention) > 32):
+        raise HTTPException(status_code=400, detail='mention_role_id must be a numeric role id')
+
+    gid = db_create_giveaway(
+        server_id,
+        created_by=int(user.get('user_id') or user.get('id') or 0) or None,
+        title=(body.title or '')[:_GIVEAWAY_TITLE_MAX],
+        description=(body.description or '')[:_GIVEAWAY_DESC_MAX],
+        prize=(body.prize or '')[:_GIVEAWAY_PRIZE_MAX],
+        image_url=image_url, thumbnail_url=thumb_url,
+        color=color_int,
+        duration_seconds=int(body.duration_seconds or 3600),
+        winner_count=int(body.winner_count or 1),
+        entry_cost_points=int(body.entry_cost_points or 0),
+        allowed_role_ids=roles_str,
+        mention_role_id=mention,
+        channel_id=(body.channel_id or '').strip(),
+    )
+
+    log_event(
+        server_id, 'admin_action', 'giveaway_created',
+        f'Giveaway #{gid} created by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='giveaway', severity='info',
+        details={'giveaway_id': gid, 'title': (body.title or '')[:80]},
+    )
+
+    return _giveaway_row_to_dict(db_get_giveaway(gid, server_id))
+
+
+@app.patch('/api/servers/{server_id}/giveaways/{giveaway_id}')
+async def giveaways_update(
+    server_id: int,
+    giveaway_id: int,
+    body: _GiveawayUpdate,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'giveaway')
+    rate_limit(f'giveaway_update:{server_id}', 120, 60.0)
+    g = _check_giveaway_owner(giveaway_id, server_id)
+    status = g.get('status') or 'draft'
+
+    payload = body.model_dump(exclude_unset=True)
+    if status not in ('draft', 'active'):
+        raise HTTPException(status_code=400, detail=f'Cannot edit a {status} giveaway')
+
+    if status == 'active':
+        rejected = sorted(_GIVEAWAY_LOCKED_WHEN_ACTIVE & set(payload.keys()))
+        if rejected:
+            raise HTTPException(
+                status_code=400,
+                detail=(f'These fields are locked while a giveaway is active: '
+                        f'{", ".join(rejected)}. Cancel and recreate to change them.'),
+            )
+
+    _validate_giveaway_payload(
+        title=payload.get('title'),
+        description=payload.get('description'),
+        prize=payload.get('prize'),
+        duration_seconds=payload.get('duration_seconds'),
+        winner_count=payload.get('winner_count'),
+        entry_cost_points=payload.get('entry_cost_points'),
+    )
+
+    updates: dict = {}
+    if 'title' in payload:
+        updates['title'] = (payload['title'] or '')[:_GIVEAWAY_TITLE_MAX]
+    if 'description' in payload:
+        updates['description'] = (payload['description'] or '')[:_GIVEAWAY_DESC_MAX]
+    if 'prize' in payload:
+        updates['prize'] = (payload['prize'] or '')[:_GIVEAWAY_PRIZE_MAX]
+    if 'image_url' in payload:
+        updates['image_url'] = _validate_giveaway_url(payload['image_url'] or '', 'image_url')
+    if 'thumbnail_url' in payload:
+        updates['thumbnail_url'] = _validate_giveaway_url(payload['thumbnail_url'] or '', 'thumbnail_url')
+    if 'color' in payload:
+        updates['color'] = _coerce_giveaway_color(payload['color'])
+    if 'duration_seconds' in payload:
+        updates['duration_seconds'] = int(payload['duration_seconds'])
+    if 'winner_count' in payload:
+        updates['winner_count'] = int(payload['winner_count'])
+    if 'entry_cost_points' in payload:
+        updates['entry_cost_points'] = int(payload['entry_cost_points'])
+    if 'allowed_role_ids' in payload:
+        updates['allowed_role_ids'] = _validate_role_id_list(payload['allowed_role_ids'])
+    if 'mention_role_id' in payload:
+        m = (payload['mention_role_id'] or '').strip() or None
+        if m and (not m.isdigit() or len(m) > 32):
+            raise HTTPException(status_code=400, detail='mention_role_id must be a numeric role id')
+        updates['mention_role_id'] = m
+    if 'channel_id' in payload:
+        updates['channel_id'] = (payload['channel_id'] or '').strip() or None
+
+    if updates:
+        db_update_giveaway(giveaway_id, server_id, **updates)
+
+    fresh = db_get_giveaway(giveaway_id, server_id)
+
+    # If already posted, refresh the live embed so dashboard edits flow through.
+    live_edit_result = None
+    if fresh and fresh.get('message_id') and fresh.get('channel_id'):
+        try:
+            if bot.is_ready():
+                cog = bot.get_cog('Giveaway')
+                if cog is not None:
+                    await cog.refresh_embed(int(fresh['id']), int(fresh['guild_id']))
+                    live_edit_result = 'edited'
+                else:
+                    live_edit_result = 'cog_unavailable'
+            else:
+                live_edit_result = 'bot_not_ready'
+        except Exception as e:  # noqa: BLE001
+            print(f'[giveaway] live-edit failed giveaway_id={giveaway_id} '
+                  f'guild={server_id}: {type(e).__name__}: {e}')
+            live_edit_result = 'error'
+
+    log_event(
+        server_id, 'admin_action', 'giveaway_edited',
+        f'Giveaway #{giveaway_id} edited by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='giveaway', severity='info',
+        details={'giveaway_id': giveaway_id, 'changed': sorted(updates.keys()),
+                 'live_edit': live_edit_result},
+    )
+
+    out = _giveaway_row_to_dict(fresh) if fresh else {'id': giveaway_id}
+    out['live_edit'] = live_edit_result
+    return out
+
+
+@app.post('/api/servers/{server_id}/giveaways/{giveaway_id}/start')
+async def giveaways_start(
+    server_id: int,
+    giveaway_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Post the branded giveaway embed to the configured channel, compute
+    ends_at = now + duration_seconds, flip status to 'active'. Idempotent
+    failure modes: if Discord post fails, status stays 'draft' and nothing
+    permanent is written."""
+    require_module_access(user, server_id, 'giveaway')
+    rate_limit(f'giveaway_start:{server_id}', 30, 60.0)
+    g = _check_giveaway_owner(giveaway_id, server_id)
+
+    if g.get('status') not in ('draft',):
+        raise HTTPException(status_code=400,
+            detail=f'Cannot start a {g.get("status")} giveaway')
+    if not (g.get('channel_id') or '').strip():
+        raise HTTPException(status_code=400, detail='Set a target channel before starting.')
+    if not (g.get('title') or '').strip():
+        raise HTTPException(status_code=400, detail='Set a title before starting.')
+    if not (g.get('prize') or '').strip():
+        raise HTTPException(status_code=400, detail='Set a prize before starting.')
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    from cogs._utils import resolve_channel
+    channel = resolve_channel(guild, g.get('channel_id'))
+    if channel is None:
+        raise HTTPException(status_code=400,
+            detail=f'Channel not found: {g.get("channel_id")}')
+
+    # Compute ends_at + seed BEFORE we update the row, so they're written in a
+    # single update and never split-brain with the posted message.
+    import secrets
+    now      = datetime.now(timezone.utc)
+    ends_at  = now + timedelta(seconds=int(g.get('duration_seconds') or 3600))
+    seed     = secrets.token_hex(16)
+
+    # Prime the row so the embed (which reads the row) sees the right state.
+    db_update_giveaway(
+        giveaway_id, server_id,
+        status='active',
+        started_at=now.isoformat(),
+        ends_at=ends_at.isoformat(),
+        random_seed=seed,
+    )
+
+    primed = db_get_giveaway(giveaway_id, server_id)
+    entry_count = db_count_giveaway_entries(giveaway_id, server_id)
+
+    from cogs.giveaway import build_giveaway_embed, build_giveaway_view
+    embed = build_giveaway_embed(server_id, primed, entry_count)
+    view  = build_giveaway_view(primed)
+
+    content = None
+    if primed.get('mention_role_id'):
+        content = f'<@&{primed["mention_role_id"]}>'
+
+    try:
+        msg = await channel.send(
+            content=content,
+            embed=embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
+    except discord.Forbidden:
+        # Roll back the state flip so the admin can fix permissions and retry.
+        db_update_giveaway(giveaway_id, server_id,
+                           status='draft', started_at=None, ends_at=None, random_seed=None)
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:
+        db_update_giveaway(giveaway_id, server_id,
+                           status='draft', started_at=None, ends_at=None, random_seed=None)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    db_update_giveaway(
+        giveaway_id, server_id,
+        channel_id=str(channel.id),
+        message_id=str(msg.id),
+    )
+
+    log_event(
+        server_id, 'admin_action', 'giveaway_started',
+        f'Giveaway #{giveaway_id} started by {user.get("username")} '
+        f'(ends {ends_at.isoformat()})',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='giveaway', severity='info',
+        details={'giveaway_id': giveaway_id, 'channel_id': str(channel.id),
+                 'message_id': str(msg.id), 'ends_at': ends_at.isoformat(),
+                 'duration_seconds': int(g.get('duration_seconds') or 0)},
+    )
+
+    return _giveaway_row_to_dict(db_get_giveaway(giveaway_id, server_id))
+
+
+@app.post('/api/servers/{server_id}/giveaways/{giveaway_id}/end-now')
+async def giveaways_end_now(
+    server_id: int,
+    giveaway_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Force the draw immediately. The cog's _finalize_one handles the
+    transition atomically (claim_giveaway_for_draw guards the race)."""
+    require_module_access(user, server_id, 'giveaway')
+    rate_limit(f'giveaway_end:{server_id}', 30, 60.0)
+    g = _check_giveaway_owner(giveaway_id, server_id)
+
+    if g.get('status') != 'active':
+        raise HTTPException(status_code=400,
+            detail=f'Cannot end a {g.get("status")} giveaway')
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+
+    cog = bot.get_cog('Giveaway')
+    if cog is None:
+        raise HTTPException(status_code=503, detail='Giveaway runtime not ready')
+
+    try:
+        await cog._finalize_one(g)
+    except Exception as e:  # noqa: BLE001
+        print(f'[giveaway] end-now failed gid={giveaway_id}: {type(e).__name__}: {e}')
+        raise HTTPException(status_code=500, detail='Could not finalize the giveaway')
+
+    log_event(
+        server_id, 'admin_action', 'giveaway_ended_manual',
+        f'Giveaway #{giveaway_id} ended early by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='giveaway', severity='info',
+        details={'giveaway_id': giveaway_id},
+    )
+
+    return _giveaway_row_to_dict(db_get_giveaway(giveaway_id, server_id))
+
+
+@app.post('/api/servers/{server_id}/giveaways/{giveaway_id}/reroll')
+async def giveaways_reroll(
+    server_id: int,
+    giveaway_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Re-draw winners from the SAME entrant pool, excluding previous winners.
+    Uses a derived seed (random_seed + ':reroll:N') so the same admin clicking
+    Reroll a second time gets a different result while a single click is still
+    reproducible."""
+    require_module_access(user, server_id, 'giveaway')
+    rate_limit(f'giveaway_reroll:{server_id}', 10, 60.0)
+    uid = int(user.get('user_id') or user.get('id') or 0)
+    if uid:
+        rate_limit(f'giveaway_reroll_u:{uid}:{server_id}', 5, 60.0)
+
+    g = _check_giveaway_owner(giveaway_id, server_id)
+    if g.get('status') != 'ended':
+        raise HTTPException(status_code=400,
+            detail='Reroll is only available after the giveaway has ended.')
+
+    try:
+        previous = json.loads(g.get('winners_json') or '[]')
+        if not isinstance(previous, list):
+            previous = []
+    except (TypeError, ValueError):
+        previous = []
+    previous_ids = {str(w) for w in previous}
+
+    entries = db_list_giveaway_entries(giveaway_id, server_id)
+    pool = [int(e['user_id']) for e in entries
+            if str(e['user_id']) not in previous_ids and e.get('user_id') is not None]
+    if not pool:
+        raise HTTPException(status_code=400,
+            detail='No more entrants to reroll from.')
+
+    winner_count = max(1, int(g.get('winner_count') or 1))
+    seed = (g.get('random_seed') or '') + f':reroll:{len(previous_ids)}'
+    import random as _random
+    rng = _random.Random(seed)
+    n = min(winner_count, len(pool))
+    new_winners = rng.sample(pool, n)
+
+    all_winners = [str(w) for w in previous] + [str(w) for w in new_winners]
+    db_update_giveaway(
+        giveaway_id, server_id,
+        winners_json=json.dumps(all_winners),
+    )
+
+    # Refresh embed in-place + announce the new winners.
+    fresh = db_get_giveaway(giveaway_id, server_id)
+    cog = bot.get_cog('Giveaway') if bot.is_ready() else None
+    if cog is not None:
+        try:
+            await cog.refresh_embed(giveaway_id, server_id)
+            await cog._announce_winners(fresh, new_winners, len(entries))
+        except Exception as e:  # noqa: BLE001
+            print(f'[giveaway] reroll refresh/announce failed gid={giveaway_id}: '
+                  f'{type(e).__name__}: {e}')
+
+    log_event(
+        server_id, 'admin_action', 'giveaway_rerolled',
+        f'Giveaway #{giveaway_id} rerolled by {user.get("username")} '
+        f'({len(new_winners)} new winner(s))',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='giveaway', severity='info',
+        details={'giveaway_id': giveaway_id,
+                 'previous_winners': list(previous_ids),
+                 'new_winners': [str(w) for w in new_winners]},
+    )
+
+    return _giveaway_row_to_dict(db_get_giveaway(giveaway_id, server_id))
+
+
+@app.post('/api/servers/{server_id}/giveaways/{giveaway_id}/cancel')
+async def giveaways_cancel(
+    server_id: int,
+    giveaway_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Cancel a draft or active giveaway. If active AND entry_cost_points > 0,
+    refund every entry's points_charged atomically through the existing
+    community-points table before flipping status."""
+    require_module_access(user, server_id, 'giveaway')
+    rate_limit(f'giveaway_cancel:{server_id}', 30, 60.0)
+    g = _check_giveaway_owner(giveaway_id, server_id)
+
+    if g.get('status') not in ('draft', 'active'):
+        raise HTTPException(status_code=400,
+            detail=f'Cannot cancel a {g.get("status")} giveaway')
+
+    refund_info = {'refunded_users': 0, 'refunded_points': 0}
+    if g.get('status') == 'active' and int(g.get('entry_cost_points') or 0) > 0:
+        try:
+            refund_info = db_refund_giveaway_entries(giveaway_id, server_id)
+        except Exception as e:  # noqa: BLE001
+            print(f'[giveaway] refund failed gid={giveaway_id}: {type(e).__name__}: {e}')
+            raise HTTPException(status_code=500, detail='Refund failed; cancel aborted')
+
+    db_update_giveaway(
+        giveaway_id, server_id,
+        status='cancelled',
+        ended_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    # Refresh the live embed so users see the cancellation immediately.
+    cog = bot.get_cog('Giveaway') if bot.is_ready() else None
+    if cog is not None:
+        try:
+            await cog.refresh_embed(giveaway_id, server_id)
+        except Exception as e:  # noqa: BLE001
+            print(f'[giveaway] cancel refresh failed gid={giveaway_id}: '
+                  f'{type(e).__name__}: {e}')
+
+    log_event(
+        server_id, 'admin_action', 'giveaway_cancelled',
+        f'Giveaway #{giveaway_id} cancelled by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='giveaway', severity='info',
+        details={'giveaway_id': giveaway_id, **refund_info},
+    )
+
+    out = _giveaway_row_to_dict(db_get_giveaway(giveaway_id, server_id))
+    out['refund'] = refund_info
+    return out
+
+
+@app.delete('/api/servers/{server_id}/giveaways/{giveaway_id}')
+async def giveaways_delete(
+    server_id: int,
+    giveaway_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Delete a DRAFT giveaway. Active / drawing / ended / cancelled rows are
+    kept as an audit trail — admins should Cancel instead."""
+    require_module_access(user, server_id, 'giveaway')
+    g = _check_giveaway_owner(giveaway_id, server_id)
+    if g.get('status') != 'draft':
+        raise HTTPException(status_code=400,
+            detail='Only draft giveaways can be deleted. Cancel an active one instead.')
+
+    db_delete_giveaway(giveaway_id, server_id)
+    log_event(
+        server_id, 'admin_action', 'giveaway_deleted',
+        f'Giveaway draft #{giveaway_id} deleted by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='giveaway', severity='info',
+        details={'giveaway_id': giveaway_id},
+    )
+    return {'ok': True}
+
+
+@app.get('/api/servers/{server_id}/giveaways/{giveaway_id}/entries')
+async def giveaways_entries(
+    server_id: int,
+    giveaway_id: int,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'giveaway')
+    _check_giveaway_owner(giveaway_id, server_id)
+    rows = db_list_giveaway_entries(giveaway_id, server_id)
+    return {
+        'entries': [
+            {'id':             int(r['id']),
+             'user_id':        str(r['user_id']),
+             'entered_at':     r.get('entered_at'),
+             'points_charged': int(r.get('points_charged') or 0)}
+            for r in rows
+        ],
+        'total': len(rows),
+    }
 
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──

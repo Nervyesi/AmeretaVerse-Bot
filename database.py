@@ -992,6 +992,54 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user ON voice_sessions(guild_id, user_id);
             CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_joined ON voice_sessions(guild_id, joined_at);
             CREATE INDEX IF NOT EXISTS idx_voice_sessions_open ON voice_sessions(guild_id, left_at);
+
+            -- Giveaway module. status lifecycle: draft -> active -> drawing
+            -- -> ended (or cancelled at any point before ended). ends_at is
+            -- set at start; winners_json and ended_at are filled by the draw.
+            -- random_seed is stored at start so the draw is reproducible if
+            -- ever questioned. allowed_role_ids is a JSON array of role ids
+            -- as strings; empty/null = no role restriction.
+            CREATE TABLE IF NOT EXISTS giveaways (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id            INTEGER NOT NULL,
+                channel_id          TEXT DEFAULT NULL,
+                message_id          TEXT DEFAULT NULL,
+                title               TEXT NOT NULL DEFAULT '',
+                description         TEXT NOT NULL DEFAULT '',
+                prize               TEXT NOT NULL DEFAULT '',
+                image_url           TEXT NOT NULL DEFAULT '',
+                thumbnail_url       TEXT NOT NULL DEFAULT '',
+                color               INTEGER DEFAULT NULL,
+                duration_seconds    INTEGER NOT NULL DEFAULT 3600,
+                ends_at             TIMESTAMP DEFAULT NULL,
+                winner_count        INTEGER NOT NULL DEFAULT 1,
+                entry_cost_points   INTEGER NOT NULL DEFAULT 0,
+                allowed_role_ids    TEXT NOT NULL DEFAULT '[]',
+                mention_role_id     TEXT DEFAULT NULL,
+                status              TEXT NOT NULL DEFAULT 'draft',
+                created_by          INTEGER DEFAULT NULL,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at          TIMESTAMP DEFAULT NULL,
+                ended_at            TIMESTAMP DEFAULT NULL,
+                winners_json        TEXT NOT NULL DEFAULT '[]',
+                random_seed         TEXT DEFAULT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_giveaways_guild_status ON giveaways(guild_id, status);
+            CREATE INDEX IF NOT EXISTS idx_giveaways_guild_ends   ON giveaways(guild_id, ends_at);
+            CREATE INDEX IF NOT EXISTS idx_giveaways_guild_chan   ON giveaways(guild_id, channel_id);
+
+            CREATE TABLE IF NOT EXISTS giveaway_entries (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                giveaway_id     INTEGER NOT NULL,
+                guild_id        INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                entered_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                points_charged  INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(giveaway_id, user_id),
+                FOREIGN KEY (giveaway_id) REFERENCES giveaways(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_giveaway_entries_g ON giveaway_entries(giveaway_id);
+            CREATE INDEX IF NOT EXISTS idx_giveaway_entries_gu ON giveaway_entries(guild_id, user_id);
         """)
 
     # Seed AmeretaVerse pools
@@ -1446,6 +1494,297 @@ def delete_embed_message(embed_id: int, guild_id: int) -> bool:
             (embed_id, guild_id),
         )
         return c.rowcount > 0
+
+
+# ── Giveaway helpers (guild-scoped) ──────────────────────────────────────────
+# Every read and write filters by guild_id. update_giveaway is restricted to
+# whitelisted columns so callers cannot rewrite id/guild_id/winners. Entry
+# uniqueness is enforced at the schema level (UNIQUE(giveaway_id, user_id));
+# IntegrityError on insert is the API caller's hint that the user already
+# entered.
+
+_GIVEAWAY_EDITABLE = (
+    'channel_id', 'message_id', 'title', 'description', 'prize',
+    'image_url', 'thumbnail_url', 'color', 'duration_seconds', 'ends_at',
+    'winner_count', 'entry_cost_points', 'allowed_role_ids',
+    'mention_role_id', 'status', 'started_at', 'ended_at',
+    'winners_json', 'random_seed',
+)
+
+
+def list_giveaways(guild_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT g.*, "
+            "       (SELECT COUNT(*) FROM giveaway_entries e "
+            "          WHERE e.giveaway_id=g.id AND e.guild_id=g.guild_id) AS entry_count "
+            "  FROM giveaways g WHERE g.guild_id=? "
+            "  ORDER BY g.id DESC",
+            (int(guild_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_giveaway(giveaway_id: int, guild_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT g.*, "
+            "       (SELECT COUNT(*) FROM giveaway_entries e "
+            "          WHERE e.giveaway_id=g.id AND e.guild_id=g.guild_id) AS entry_count "
+            "  FROM giveaways g WHERE g.id=? AND g.guild_id=?",
+            (int(giveaway_id), int(guild_id)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_giveaway(
+    guild_id: int,
+    *,
+    created_by: int | None = None,
+    title: str = '', description: str = '', prize: str = '',
+    image_url: str = '', thumbnail_url: str = '',
+    color: int | None = None,
+    duration_seconds: int = 3600,
+    winner_count: int = 1, entry_cost_points: int = 0,
+    allowed_role_ids: str = '[]', mention_role_id: str | None = None,
+    channel_id: str = '',
+) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO giveaways
+               (guild_id, created_by, title, description, prize,
+                image_url, thumbnail_url, color,
+                duration_seconds, winner_count, entry_cost_points,
+                allowed_role_ids, mention_role_id, channel_id, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft')""",
+            (
+                int(guild_id), created_by,
+                title or '', description or '', prize or '',
+                image_url or '', thumbnail_url or '', color,
+                int(duration_seconds), int(winner_count), int(entry_cost_points),
+                allowed_role_ids or '[]', mention_role_id, channel_id or None,
+            ),
+        )
+        return cur.lastrowid
+
+
+def update_giveaway(giveaway_id: int, guild_id: int, **fields) -> bool:
+    sets = {k: v for k, v in fields.items() if k in _GIVEAWAY_EDITABLE}
+    if not sets:
+        return False
+    cols = ', '.join(f'{k}=?' for k in sets)
+    vals = list(sets.values()) + [int(giveaway_id), int(guild_id)]
+    with get_connection() as conn:
+        c = conn.execute(
+            f"UPDATE giveaways SET {cols} WHERE id=? AND guild_id=?",
+            vals,
+        )
+        return c.rowcount > 0
+
+
+def delete_giveaway(giveaway_id: int, guild_id: int) -> bool:
+    with get_connection() as conn:
+        c = conn.execute(
+            "DELETE FROM giveaways WHERE id=? AND guild_id=?",
+            (int(giveaway_id), int(guild_id)),
+        )
+        return c.rowcount > 0
+
+
+def list_giveaway_entries(giveaway_id: int, guild_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT e.* FROM giveaway_entries e "
+            " WHERE e.giveaway_id=? AND e.guild_id=? "
+            " ORDER BY e.entered_at ASC, e.id ASC",
+            (int(giveaway_id), int(guild_id)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_giveaway_entries(giveaway_id: int, guild_id: int) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM giveaway_entries "
+            " WHERE giveaway_id=? AND guild_id=?",
+            (int(giveaway_id), int(guild_id)),
+        ).fetchone()
+    return int(row['c'] if row else 0)
+
+
+def get_giveaway_entry(giveaway_id: int, guild_id: int, user_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM giveaway_entries "
+            " WHERE giveaway_id=? AND guild_id=? AND user_id=?",
+            (int(giveaway_id), int(guild_id), int(user_id)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+class GiveawayInsufficientPoints(Exception):
+    """Raised when an entry would deduct more community points than the user
+    holds. Carries the balance and required cost for the caller's message."""
+    def __init__(self, balance: int, required: int):
+        super().__init__(f'insufficient_points balance={balance} required={required}')
+        self.balance  = balance
+        self.required = required
+
+
+class GiveawayAlreadyEntered(Exception):
+    """Raised when a UNIQUE(giveaway_id, user_id) collision happens — the user
+    is already in. Caller surfaces a friendly ephemeral message."""
+
+
+def enter_giveaway_atomic(
+    giveaway_id: int, guild_id: int, user_id: int, cost: int,
+) -> dict:
+    """Atomically deduct `cost` community points (if > 0) AND insert the entry
+    row in one transaction. Either both succeed or neither — the unique index
+    catches double-entry races, and a balance check happens INSIDE the
+    transaction to avoid TOCTOU.
+
+    Returns {'entry_id', 'points_charged', 'new_balance'} on success.
+    Raises:
+      GiveawayInsufficientPoints — user lacks the cost
+      GiveawayAlreadyEntered     — uniqueness collision (idempotent re-click)
+    """
+    cost = max(0, int(cost))
+    conn = get_connection()
+    try:
+        conn.isolation_level = None        # manual transaction
+        conn.execute('BEGIN IMMEDIATE')
+
+        new_balance = 0
+        if cost > 0:
+            row = conn.execute(
+                "SELECT total_points FROM raid_user_points "
+                " WHERE guild_id=? AND user_id=?",
+                (int(guild_id), int(user_id)),
+            ).fetchone()
+            balance = int(row['total_points']) if row else 0
+            if balance < cost:
+                conn.execute('ROLLBACK')
+                raise GiveawayInsufficientPoints(balance, cost)
+            conn.execute(
+                "UPDATE raid_user_points "
+                "   SET total_points = total_points - ?, "
+                "       last_active = datetime('now') "
+                " WHERE guild_id=? AND user_id=?",
+                (cost, int(guild_id), int(user_id)),
+            )
+            new_balance = balance - cost
+
+        try:
+            cur = conn.execute(
+                """INSERT INTO giveaway_entries
+                     (giveaway_id, guild_id, user_id, points_charged)
+                   VALUES (?,?,?,?)""",
+                (int(giveaway_id), int(guild_id), int(user_id), cost),
+            )
+        except sqlite3.IntegrityError:
+            conn.execute('ROLLBACK')
+            raise GiveawayAlreadyEntered()
+
+        conn.execute('COMMIT')
+        return {
+            'entry_id':       int(cur.lastrowid),
+            'points_charged': cost,
+            'new_balance':    new_balance,
+        }
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def refund_giveaway_entries(giveaway_id: int, guild_id: int) -> dict:
+    """Refund the points_charged of every entry on this giveaway, atomically.
+
+    Used when an active paid giveaway is cancelled. Refunds go through the
+    same raid_user_points table the entry charged — so users who entered and
+    then left the guild still receive their points back if they ever return,
+    and the audit log of changes stays in one place.
+
+    Returns {'refunded_users': N, 'refunded_points': total}.
+    """
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute('BEGIN IMMEDIATE')
+
+        rows = conn.execute(
+            "SELECT user_id, points_charged FROM giveaway_entries "
+            " WHERE giveaway_id=? AND guild_id=? AND points_charged > 0",
+            (int(giveaway_id), int(guild_id)),
+        ).fetchall()
+
+        total = 0
+        users = 0
+        for r in rows:
+            uid  = int(r['user_id'])
+            pts  = int(r['points_charged'] or 0)
+            if pts <= 0:
+                continue
+            conn.execute(
+                """INSERT INTO raid_user_points
+                     (guild_id, user_id, total_points, raids_completed, last_active)
+                   VALUES (?, ?, ?, 0, datetime('now'))
+                   ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                       total_points = total_points + ?,
+                       last_active  = datetime('now')""",
+                (int(guild_id), uid, pts, pts),
+            )
+            total += pts
+            users += 1
+
+        conn.execute('COMMIT')
+        return {'refunded_users': users, 'refunded_points': total}
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def claim_giveaway_for_draw(giveaway_id: int, guild_id: int) -> bool:
+    """Atomically move a giveaway from 'active' to 'drawing'. Returns True if
+    THIS caller claimed it; False if someone else already did. The scheduler
+    relies on this to prevent two parallel draws after a restart race."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE giveaways SET status='drawing' "
+            " WHERE id=? AND guild_id=? AND status='active'",
+            (int(giveaway_id), int(guild_id)),
+        )
+        return (cur.rowcount or 0) > 0
+
+
+def list_due_giveaways(now_iso: str) -> list:
+    """Cross-guild list of giveaways the scheduler should finalize: still
+    active with ends_at past, OR stuck in 'drawing' from a prior crash. Each
+    row carries guild_id so the caller routes the draw correctly."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM giveaways "
+            " WHERE (status='active'  AND ends_at IS NOT NULL AND ends_at <= ?) "
+            "    OR  status='drawing'",
+            (now_iso,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def create_form_submission(
@@ -2247,7 +2586,7 @@ def reset_all_engage_points_in_guild(guild_id: int) -> int:
 
 MODULES = ('verify', 'roleselect', 'forms', 'tickets', 'raid', 'engage',
            'protection', 'flagged', 'mod_log', 'audit_log', 'analytics', 'settings',
-           'points_admin', 'logs', 'embed_message')
+           'points_admin', 'logs', 'embed_message', 'giveaway')
 
 
 def get_guild_settings(guild_id) -> dict:
