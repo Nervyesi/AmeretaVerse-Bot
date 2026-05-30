@@ -1044,6 +1044,75 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_giveaway_entries_g ON giveaway_entries(giveaway_id);
             CREATE INDEX IF NOT EXISTS idx_giveaway_entries_gu ON giveaway_entries(guild_id, user_id);
+
+            -- Radar module. Phase 1 ships crypto-only behavior, but the
+            -- schema reserves columns for every planned topic (NFT, meme,
+            -- forex, stocks, liquidations) so later phases need NO schema
+            -- migration — just adapter + cog code.
+            CREATE TABLE IF NOT EXISTS radar_settings (
+                guild_id                      INTEGER PRIMARY KEY,
+                timezone_offset               INTEGER NOT NULL DEFAULT 0,
+                daily_time                    TEXT    NOT NULL DEFAULT '08:00',
+                daily_enabled                 INTEGER NOT NULL DEFAULT 0,
+                daily_channel_crypto          INTEGER,
+                daily_channel_nft             INTEGER,
+                daily_channel_meme            INTEGER,
+                daily_channel_forex           INTEGER,
+                daily_channel_stocks          INTEGER,
+                alerts_channel                INTEGER,
+                alerts_enabled                INTEGER NOT NULL DEFAULT 0,
+                movement_threshold_pct        REAL    NOT NULL DEFAULT 5.0,
+                volume_multiplier_threshold   REAL    NOT NULL DEFAULT 3.0,
+                liquidation_channel           INTEGER,
+                liquidation_enabled           INTEGER NOT NULL DEFAULT 0,
+                liquidation_min_usd           INTEGER NOT NULL DEFAULT 1000000,
+                stocks_alpha_vantage_key      TEXT,
+                last_daily_sent_date          TEXT,    -- 'YYYY-MM-DD' guild-local
+                created_at                    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at                    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS radar_watchlist (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id         INTEGER NOT NULL,
+                asset_kind       TEXT    NOT NULL,
+                asset_identifier TEXT    NOT NULL,
+                display_name     TEXT    NOT NULL DEFAULT '',
+                display_order    INTEGER NOT NULL DEFAULT 0,
+                added_by         INTEGER,
+                added_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, asset_kind, asset_identifier)
+            );
+            CREATE INDEX IF NOT EXISTS idx_radar_watch_g_k ON radar_watchlist(guild_id, asset_kind);
+
+            CREATE TABLE IF NOT EXISTS radar_alerts_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id         INTEGER NOT NULL,
+                asset_kind       TEXT    NOT NULL,
+                asset_identifier TEXT    NOT NULL,
+                alert_type       TEXT    NOT NULL,
+                payload_json     TEXT    NOT NULL DEFAULT '{}',
+                sent_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_radar_alerts_cooldown
+                ON radar_alerts_log(guild_id, asset_identifier, alert_type, sent_at);
+            CREATE INDEX IF NOT EXISTS idx_radar_alerts_guild
+                ON radar_alerts_log(guild_id, sent_at DESC);
+
+            -- radar_liquidations_window: reserved for the Phase 3 WS clients.
+            -- Created here so Phase 3 only adds code, not schema.
+            CREATE TABLE IF NOT EXISTS radar_liquidations_window (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          INTEGER NOT NULL,
+                exchange    TEXT    NOT NULL,
+                symbol      TEXT    NOT NULL,
+                side        TEXT    NOT NULL,
+                price       REAL    NOT NULL,
+                qty         REAL    NOT NULL,
+                usd_value   REAL    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_radar_liq_ts ON radar_liquidations_window(ts);
+            CREATE INDEX IF NOT EXISTS idx_radar_liq_sym ON radar_liquidations_window(symbol, ts);
         """)
 
     # Seed AmeretaVerse pools
@@ -1788,6 +1857,179 @@ def list_due_giveaways(now_iso: str) -> list:
             " WHERE (status='active'  AND ends_at IS NOT NULL AND ends_at <= ?) "
             "    OR  status='drawing'",
             (now_iso,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Radar helpers (Phase 1 — crypto wiring; non-crypto schema is reserved) ──
+# Per-guild scoped. Every query filters on guild_id. Watchlist enforces
+# UNIQUE(guild_id, asset_kind, asset_identifier) at the schema level, so the
+# add path can rely on IntegrityError to detect duplicates.
+
+_RADAR_SETTINGS_EDITABLE = (
+    'timezone_offset', 'daily_time', 'daily_enabled',
+    'daily_channel_crypto', 'daily_channel_nft', 'daily_channel_meme',
+    'daily_channel_forex', 'daily_channel_stocks',
+    'alerts_channel', 'alerts_enabled',
+    'movement_threshold_pct', 'volume_multiplier_threshold',
+    'liquidation_channel', 'liquidation_enabled', 'liquidation_min_usd',
+    'stocks_alpha_vantage_key', 'last_daily_sent_date',
+)
+
+
+def get_radar_settings(guild_id) -> dict:
+    """Read-or-insert per-guild radar settings. Always returns a dict with
+    every default field populated so the caller never deals with None
+    rows."""
+    gid = int(guild_id)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM radar_settings WHERE guild_id=?", (gid,),
+        ).fetchone()
+        if row:
+            return dict(row)
+        conn.execute(
+            "INSERT OR IGNORE INTO radar_settings (guild_id) VALUES (?)", (gid,),
+        )
+        row = conn.execute(
+            "SELECT * FROM radar_settings WHERE guild_id=?", (gid,),
+        ).fetchone()
+    return dict(row) if row else {'guild_id': gid}
+
+
+def update_radar_settings(guild_id, **fields) -> dict:
+    sets = {k: v for k, v in fields.items() if k in _RADAR_SETTINGS_EDITABLE}
+    get_radar_settings(guild_id)   # ensure row exists
+    if sets:
+        cols = ', '.join(f'{k}=?' for k in sets) + ', updated_at=CURRENT_TIMESTAMP'
+        with get_connection() as conn:
+            conn.execute(
+                f"UPDATE radar_settings SET {cols} WHERE guild_id=?",
+                list(sets.values()) + [int(guild_id)],
+            )
+    return get_radar_settings(guild_id)
+
+
+def list_radar_watchlist(guild_id, *, asset_kind: str | None = None) -> list:
+    with get_connection() as conn:
+        if asset_kind:
+            rows = conn.execute(
+                "SELECT * FROM radar_watchlist "
+                " WHERE guild_id=? AND asset_kind=? "
+                " ORDER BY display_order, id",
+                (int(guild_id), asset_kind),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM radar_watchlist "
+                " WHERE guild_id=? "
+                " ORDER BY asset_kind, display_order, id",
+                (int(guild_id),),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_radar_watchlist_entry(
+    guild_id, asset_kind: str, asset_identifier: str,
+    *, display_name: str = '', added_by: int | None = None,
+) -> int:
+    """Insert one row. Raises sqlite3.IntegrityError on duplicate (caller
+    decides what 'already added' looks like in the UI)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO radar_watchlist
+                 (guild_id, asset_kind, asset_identifier, display_name, added_by)
+               VALUES (?,?,?,?,?)""",
+            (int(guild_id), asset_kind, asset_identifier,
+             display_name or '', added_by),
+        )
+        return cur.lastrowid
+
+
+def remove_radar_watchlist_entry(guild_id, entry_id: int) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM radar_watchlist WHERE id=? AND guild_id=?",
+            (int(entry_id), int(guild_id)),
+        )
+        return (cur.rowcount or 0) > 0
+
+
+def remove_radar_watchlist_by_identifier(
+    guild_id, asset_kind: str, asset_identifier: str,
+) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM radar_watchlist "
+            " WHERE guild_id=? AND asset_kind=? AND asset_identifier=?",
+            (int(guild_id), asset_kind, asset_identifier),
+        )
+        return (cur.rowcount or 0) > 0
+
+
+def list_all_radar_watchlists(asset_kind: str) -> list:
+    """Cross-guild list used by the fetcher. Returns every watchlist row
+    (with guild_id) for a given asset_kind. The fetcher uses the UNION of
+    identifiers for its one-shot batched API call, then dispatches results
+    per-guild from the cache."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM radar_watchlist WHERE asset_kind=?",
+            (asset_kind,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_guilds_with_radar() -> list:
+    """Every guild that has a radar_settings row. Used by the digest and
+    alert dispatchers to enumerate work."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT guild_id FROM radar_settings",
+        ).fetchall()
+    return [int(r['guild_id']) for r in rows]
+
+
+def record_radar_alert(
+    guild_id, asset_kind: str, asset_identifier: str,
+    alert_type: str, payload: dict | None = None,
+) -> int:
+    """Append to radar_alerts_log AFTER a successful Discord send. Returns
+    the new row id. payload is JSON-encoded for audit + cooldown lookup."""
+    import json as _json
+    payload_str = _json.dumps(payload or {}, default=str)
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO radar_alerts_log
+                 (guild_id, asset_kind, asset_identifier, alert_type, payload_json)
+               VALUES (?,?,?,?,?)""",
+            (int(guild_id), asset_kind, asset_identifier, alert_type, payload_str),
+        )
+        return cur.lastrowid
+
+
+def last_radar_alert_at(
+    guild_id, asset_identifier: str, alert_type: str,
+) -> str | None:
+    """Return the sent_at of the most recent matching alert (ISO string), or
+    None. Used for cooldown checks before sending the same alert again."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT sent_at FROM radar_alerts_log
+                WHERE guild_id=? AND asset_identifier=? AND alert_type=?
+                ORDER BY sent_at DESC LIMIT 1""",
+            (int(guild_id), asset_identifier, alert_type),
+        ).fetchone()
+    return row['sent_at'] if row else None
+
+
+def list_recent_radar_alerts(guild_id, limit: int = 50) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM radar_alerts_log
+                WHERE guild_id=?
+                ORDER BY sent_at DESC LIMIT ?""",
+            (int(guild_id), int(limit)),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -2591,7 +2833,7 @@ def reset_all_engage_points_in_guild(guild_id: int) -> int:
 
 MODULES = ('verify', 'roleselect', 'forms', 'tickets', 'raid', 'engage',
            'protection', 'flagged', 'mod_log', 'audit_log', 'analytics', 'settings',
-           'points_admin', 'logs', 'embed_message', 'giveaway')
+           'points_admin', 'logs', 'embed_message', 'giveaway', 'radar')
 
 
 def get_guild_settings(guild_id) -> dict:

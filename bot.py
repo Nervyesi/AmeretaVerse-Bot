@@ -18,6 +18,7 @@ async def setup_hook():
     await bot.load_extension('cogs.tickets')
     await bot.load_extension('cogs.levels')
     await bot.load_extension('cogs.backup')
+    await bot.load_extension('cogs.radar')
     await bot.tree.sync()
     print('Cogs loaded and command tree synced.')
 
@@ -32,6 +33,24 @@ async def on_ready():
         print('[startup] Weekly R2 DB backup task is running.')
     else:
         print('[startup] WARNING: Weekly R2 DB backup task is NOT running.')
+
+    # Radar background tasks. Phase 1: fetcher (chains alerts dispatcher
+    # after each tick) + digest scheduler. Each loop is self-guarding —
+    # adapter errors are caught inside the loop, so a bad upstream never
+    # crashes the bot. Started exactly once per process.
+    import asyncio as _asyncio
+    if not getattr(bot, '_radar_tasks_started', False):
+        bot._radar_tasks_started = True
+        try:
+            from services.radar.fetcher import fetch_loop
+            from services.radar.digest  import scheduler_loop
+            _asyncio.create_task(fetch_loop(bot),     name='radar.fetcher')
+            _asyncio.create_task(scheduler_loop(bot), name='radar.digest')
+            print('[startup] Radar background loops started (fetcher + digest)')
+        except Exception as e:
+            import traceback as _tb
+            print(f'[startup] Radar tasks failed to start: {type(e).__name__}: {e}')
+            _tb.print_exc()
 
     print('[startup] Checking TwitterAPI.io configuration...')
     try:

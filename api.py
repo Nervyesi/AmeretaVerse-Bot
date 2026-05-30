@@ -17,6 +17,7 @@ import os
 import json
 import time
 import asyncio
+import sqlite3
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 
@@ -96,6 +97,12 @@ from database import (
     list_giveaway_entries as db_list_giveaway_entries,
     count_giveaway_entries as db_count_giveaway_entries,
     refund_giveaway_entries as db_refund_giveaway_entries,
+    get_radar_settings as db_get_radar_settings,
+    update_radar_settings as db_update_radar_settings,
+    list_radar_watchlist as db_list_radar_watchlist,
+    add_radar_watchlist_entry as db_add_radar_watchlist_entry,
+    remove_radar_watchlist_entry as db_remove_radar_watchlist_entry,
+    list_recent_radar_alerts as db_list_recent_radar_alerts,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
@@ -3583,6 +3590,427 @@ async def giveaways_entries(
         ],
         'total': len(rows),
     }
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+#  RADAR ENDPOINTS  (Phase 1 — crypto)
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+# Per-guild settings + watchlist CRUD + search + preview. Every endpoint is
+# guild-scoped and module-gated through require_module_access('radar'). The
+# fetcher / alerts / digest loops run elsewhere; this file just exposes
+# config and reads from the cache.
+
+_RADAR_SUPPORTED_KINDS  = ('crypto',)             # phase-1 only
+_RADAR_FUTURE_KINDS     = ('nft', 'meme', 'forex', 'stocks')
+_RADAR_ALL_KINDS        = _RADAR_SUPPORTED_KINDS + _RADAR_FUTURE_KINDS
+
+# Threshold bounds — protect users from setting absurd values that would
+# either spam every tick or never fire. Mirrors the spec.
+_RADAR_MOVE_PCT_RANGE       = (0.5, 50.0)
+_RADAR_VOL_MULT_RANGE       = (1.5, 20.0)
+_RADAR_LIQ_MIN_USD_RANGE    = (100_000, 1_000_000_000)
+_RADAR_TZ_OFFSET_RANGE      = (-12 * 60, 14 * 60)  # minutes; UTC-12 .. UTC+14
+
+
+class _RadarSettingsUpdate(BaseModel):
+    timezone_offset:              Optional[int]    = None
+    daily_time:                   Optional[str]    = None
+    daily_enabled:                Optional[int]    = None
+    daily_channel_crypto:         Optional[str]    = None
+    daily_channel_nft:            Optional[str]    = None
+    daily_channel_meme:           Optional[str]    = None
+    daily_channel_forex:          Optional[str]    = None
+    daily_channel_stocks:         Optional[str]    = None
+    alerts_channel:               Optional[str]    = None
+    alerts_enabled:               Optional[int]    = None
+    movement_threshold_pct:       Optional[float]  = None
+    volume_multiplier_threshold:  Optional[float]  = None
+    liquidation_channel:          Optional[str]    = None
+    liquidation_enabled:          Optional[int]    = None
+    liquidation_min_usd:          Optional[int]    = None
+    stocks_alpha_vantage_key:     Optional[str]    = None
+
+
+class _RadarWatchlistCreate(BaseModel):
+    asset_kind:       str
+    asset_identifier: str
+    display_name:     Optional[str] = ''
+
+
+def _radar_clamp(v, low, high, *, kind: str, field: str):
+    """Reject out-of-range thresholds with a clear error. Returns the
+    coerced numeric value."""
+    try:
+        n = float(v) if kind == 'float' else int(v)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f'{field} must be numeric')
+    if n < low or n > high:
+        raise HTTPException(
+            status_code=400,
+            detail=f'{field} must be between {low} and {high}',
+        )
+    return n
+
+
+def _radar_hhmm(s: str) -> str:
+    """Validate "HH:MM" string. Empty/None falls back to a sane default."""
+    val = (s or '').strip()
+    if not val:
+        return '08:00'
+    try:
+        hh, mm = val.split(':')
+        h, m = int(hh), int(mm)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+        return f'{h:02d}:{m:02d}'
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail='daily_time must be a 24h HH:MM string (e.g. 08:00)',
+        )
+
+
+def _radar_channel(value, *, field: str) -> int | None:
+    """Coerce an optional channel id. Empty/None → None. Otherwise must be
+    a numeric Discord snowflake."""
+    if value is None or value == '':
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if not s.isdigit() or not (17 <= len(s) <= 20):
+        raise HTTPException(status_code=400,
+            detail=f'{field} must be a numeric Discord channel id')
+    return int(s)
+
+
+def _radar_mask_settings(s: dict) -> dict:
+    """Redact the Alpha Vantage key in responses — clients can write it
+    via PATCH but never read it back."""
+    out = dict(s)
+    key = out.get('stocks_alpha_vantage_key')
+    if key:
+        out['stocks_alpha_vantage_key'] = f'••••{str(key)[-4:]}' if len(str(key)) > 4 else '••••'
+    out['stocks_alpha_vantage_key_set'] = bool(key)
+    return out
+
+
+@app.get('/api/servers/{server_id}/radar/settings')
+async def radar_settings_get(
+    server_id: int, user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'radar')
+    s = db_get_radar_settings(server_id)
+    return _radar_mask_settings(s)
+
+
+@app.patch('/api/servers/{server_id}/radar/settings')
+async def radar_settings_patch(
+    server_id: int,
+    body: _RadarSettingsUpdate,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'radar')
+    rate_limit(f'radar_settings:{server_id}', 60, 60.0)
+    payload = body.model_dump(exclude_unset=True)
+    updates: dict = {}
+
+    if 'timezone_offset' in payload:
+        updates['timezone_offset'] = int(_radar_clamp(
+            payload['timezone_offset'],
+            _RADAR_TZ_OFFSET_RANGE[0], _RADAR_TZ_OFFSET_RANGE[1],
+            kind='int', field='timezone_offset',
+        ))
+    if 'daily_time' in payload:
+        updates['daily_time'] = _radar_hhmm(payload['daily_time'] or '')
+    if 'daily_enabled' in payload:
+        updates['daily_enabled'] = 1 if payload['daily_enabled'] else 0
+    for ch_key in ('daily_channel_crypto', 'daily_channel_nft',
+                   'daily_channel_meme', 'daily_channel_forex',
+                   'daily_channel_stocks', 'alerts_channel',
+                   'liquidation_channel'):
+        if ch_key in payload:
+            updates[ch_key] = _radar_channel(payload[ch_key], field=ch_key)
+    if 'alerts_enabled' in payload:
+        updates['alerts_enabled'] = 1 if payload['alerts_enabled'] else 0
+    if 'movement_threshold_pct' in payload:
+        updates['movement_threshold_pct'] = _radar_clamp(
+            payload['movement_threshold_pct'],
+            _RADAR_MOVE_PCT_RANGE[0], _RADAR_MOVE_PCT_RANGE[1],
+            kind='float', field='movement_threshold_pct',
+        )
+    if 'volume_multiplier_threshold' in payload:
+        updates['volume_multiplier_threshold'] = _radar_clamp(
+            payload['volume_multiplier_threshold'],
+            _RADAR_VOL_MULT_RANGE[0], _RADAR_VOL_MULT_RANGE[1],
+            kind='float', field='volume_multiplier_threshold',
+        )
+    if 'liquidation_enabled' in payload:
+        updates['liquidation_enabled'] = 1 if payload['liquidation_enabled'] else 0
+    if 'liquidation_min_usd' in payload:
+        updates['liquidation_min_usd'] = int(_radar_clamp(
+            payload['liquidation_min_usd'],
+            _RADAR_LIQ_MIN_USD_RANGE[0], _RADAR_LIQ_MIN_USD_RANGE[1],
+            kind='int', field='liquidation_min_usd',
+        ))
+    if 'stocks_alpha_vantage_key' in payload:
+        # Only persist non-empty values — empty string means "leave the key
+        # alone" in the dashboard's mask-friendly model.
+        new_key = (payload['stocks_alpha_vantage_key'] or '').strip()
+        if new_key and not new_key.startswith('••'):
+            updates['stocks_alpha_vantage_key'] = new_key[:128]
+
+    fresh = db_update_radar_settings(server_id, **updates)
+
+    log_event(
+        server_id, 'admin_action', 'radar_settings_updated',
+        f'Radar settings updated by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='radar', severity='info',
+        details={'changed': sorted(updates.keys())},
+    )
+    return _radar_mask_settings(fresh)
+
+
+@app.get('/api/servers/{server_id}/radar/watchlist')
+async def radar_watchlist_list(
+    server_id: int,
+    asset_kind: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'radar')
+    kind = (asset_kind or '').strip().lower() or None
+    if kind and kind not in _RADAR_ALL_KINDS:
+        raise HTTPException(status_code=400, detail=f'unknown asset_kind: {kind}')
+    rows = db_list_radar_watchlist(server_id, asset_kind=kind)
+    out = []
+    # Hydrate each crypto row with the latest cache snapshot for the UI.
+    try:
+        from services.radar.cache import CACHE as _RADAR_CACHE
+    except Exception:  # noqa: BLE001
+        _RADAR_CACHE = None
+    for r in rows:
+        kind_v = (r.get('asset_kind') or '').lower()
+        ident  = (r.get('asset_identifier') or '').lower()
+        snap   = None
+        if _RADAR_CACHE is not None and kind_v == 'crypto':
+            snap = _RADAR_CACHE.get_snapshot('crypto', ident)
+        out.append({
+            'id':               int(r['id']),
+            'asset_kind':       kind_v,
+            'asset_identifier': r.get('asset_identifier'),
+            'display_name':     r.get('display_name') or r.get('asset_identifier'),
+            'display_order':    int(r.get('display_order') or 0),
+            'added_by':         str(r.get('added_by')) if r.get('added_by') else None,
+            'added_at':         r.get('added_at'),
+            'snapshot':         snap,
+        })
+    return {'watchlist': out}
+
+
+@app.post('/api/servers/{server_id}/radar/watchlist')
+async def radar_watchlist_add(
+    server_id: int,
+    body: _RadarWatchlistCreate,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'radar')
+    rate_limit(f'radar_watchlist:{server_id}', 30, 60.0)
+
+    kind  = (body.asset_kind or '').strip().lower()
+    ident = (body.asset_identifier or '').strip().lower()
+    if kind not in _RADAR_ALL_KINDS:
+        raise HTTPException(status_code=400, detail=f'unknown asset_kind: {kind}')
+    if not ident:
+        raise HTTPException(status_code=400, detail='asset_identifier is required')
+
+    if kind in _RADAR_FUTURE_KINDS:
+        # Phase 1: reject non-crypto additions with a clear message. The
+        # schema accepts them, but only crypto data is live, so misleading
+        # the admin with a silent "saved" would be a mistake.
+        raise HTTPException(
+            status_code=400,
+            detail=(f'{kind} watchlist support ships in a later phase. '
+                    'Only crypto entries are accepted right now.'),
+        )
+
+    display_name = (body.display_name or '').strip() or ident
+
+    # Resolve crypto via CoinGecko so we store the canonical id, not a typo.
+    if kind == 'crypto':
+        try:
+            from services.radar.adapters import ADAPTERS_BY_KIND
+            from services.radar.cache    import CACHE as _RADAR_CACHE
+            adapter = ADAPTERS_BY_KIND.get('crypto')
+            snap = None
+            if adapter:
+                snap = await adapter.fetch_one(ident)
+                if not snap:
+                    sugg = await adapter.search(ident, limit=1)
+                    if sugg:
+                        ident = (sugg[0].get('identifier') or ident).lower()
+                        snap = await adapter.fetch_one(ident)
+            if snap:
+                _RADAR_CACHE.put('crypto', snap['identifier'], snap)
+                if display_name == body.asset_identifier or display_name == ident:
+                    display_name = (snap.get('symbol_display')
+                                    or snap.get('raw', {}).get('name')
+                                    or ident).upper()
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] resolve failed for {ident}: {type(e).__name__}: {e}')
+
+    try:
+        entry_id = db_add_radar_watchlist_entry(
+            server_id, kind, ident,
+            display_name=display_name,
+            added_by=int(user.get('user_id') or user.get('id') or 0) or None,
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409,
+            detail=f'{ident} is already on the {kind} watchlist')
+    except Exception as e:  # noqa: BLE001
+        print(f'[radar/api] add failed: {type(e).__name__}: {e}')
+        raise HTTPException(status_code=500, detail='Could not save the entry')
+
+    log_event(
+        server_id, 'admin_action', 'radar_watchlist_added',
+        f'Radar watchlist: {kind} {ident} added via dashboard',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='radar', severity='info',
+        details={'entry_id': entry_id, 'kind': kind, 'identifier': ident},
+    )
+    return {
+        'id':               entry_id,
+        'asset_kind':       kind,
+        'asset_identifier': ident,
+        'display_name':     display_name,
+    }
+
+
+@app.delete('/api/servers/{server_id}/radar/watchlist/{entry_id}')
+async def radar_watchlist_delete(
+    server_id: int, entry_id: int,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'radar')
+    ok = db_remove_radar_watchlist_entry(server_id, entry_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail='entry not found')
+    log_event(
+        server_id, 'admin_action', 'radar_watchlist_removed',
+        f'Radar watchlist entry #{entry_id} removed via dashboard',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='radar', severity='info',
+        details={'entry_id': entry_id},
+    )
+    return {'ok': True}
+
+
+@app.get('/api/servers/{server_id}/radar/search-asset')
+async def radar_search_asset(
+    server_id: int,
+    kind: str = 'crypto',
+    q: str = '',
+    user: dict = Depends(get_current_user),
+):
+    """Autocomplete for the dashboard add UI. Phase 1: crypto via CoinGecko
+    /search. Other kinds return an empty list with a clear note."""
+    require_module_access(user, server_id, 'radar')
+    rate_limit(f'radar_search:{server_id}', 30, 60.0)
+    kind = (kind or 'crypto').strip().lower()
+    query = (q or '').strip()
+    if not query:
+        return {'kind': kind, 'q': '', 'suggestions': [], 'note': None}
+
+    if kind == 'crypto':
+        try:
+            from services.radar.adapters import ADAPTERS_BY_KIND
+            adapter = ADAPTERS_BY_KIND.get('crypto')
+            results = await adapter.search(query, limit=10) if adapter else []
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] search failed: {type(e).__name__}: {e}')
+            results = []
+        return {'kind': kind, 'q': query, 'suggestions': results, 'note': None}
+
+    return {
+        'kind':        kind,
+        'q':           query,
+        'suggestions': [],
+        'note':        f'Search for {kind} ships in a later phase.',
+    }
+
+
+@app.get('/api/servers/{server_id}/radar/preview')
+async def radar_preview(
+    server_id: int,
+    kind: str = 'crypto',
+    identifier: str = '',
+    user: dict = Depends(get_current_user),
+):
+    """Current cache snapshot for the dashboard live-preview card."""
+    require_module_access(user, server_id, 'radar')
+    kind = (kind or 'crypto').strip().lower()
+    ident = (identifier or '').strip().lower()
+    if not ident:
+        raise HTTPException(status_code=400, detail='identifier is required')
+    try:
+        from services.radar.cache import CACHE as _RADAR_CACHE
+        snap = _RADAR_CACHE.get_snapshot(kind, ident)
+        is_fresh = _RADAR_CACHE.is_fresh(kind, ident)
+    except Exception as e:  # noqa: BLE001
+        print(f'[radar/api] preview read failed: {type(e).__name__}: {e}')
+        snap, is_fresh = None, False
+
+    # Cold cache + crypto → trigger a one-off fetch so the dashboard isn't
+    # blank on first load. Other kinds just return null until their adapter
+    # ships.
+    if not snap and kind == 'crypto':
+        try:
+            from services.radar.adapters import ADAPTERS_BY_KIND
+            from services.radar.cache    import CACHE as _RADAR_CACHE
+            adapter = ADAPTERS_BY_KIND.get('crypto')
+            if adapter:
+                fresh = await adapter.fetch_one(ident)
+                if fresh:
+                    _RADAR_CACHE.put('crypto', fresh['identifier'], fresh)
+                    snap, is_fresh = fresh, True
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] preview cold-fetch failed: {type(e).__name__}: {e}')
+
+    return {
+        'kind':       kind,
+        'identifier': ident,
+        'snapshot':   snap,
+        'fresh':      is_fresh,
+    }
+
+
+@app.get('/api/servers/{server_id}/radar/alerts/recent')
+async def radar_alerts_recent(
+    server_id: int,
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'radar')
+    rows = db_list_recent_radar_alerts(server_id, limit=max(1, min(int(limit), 200)))
+    out = []
+    for r in rows:
+        try:
+            payload = json.loads(r.get('payload_json') or '{}')
+        except (TypeError, ValueError):
+            payload = {}
+        out.append({
+            'id':               int(r['id']),
+            'asset_kind':       r.get('asset_kind'),
+            'asset_identifier': r.get('asset_identifier'),
+            'alert_type':       r.get('alert_type'),
+            'payload':          payload,
+            'sent_at':          r.get('sent_at'),
+        })
+    return {'alerts': out}
 
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
