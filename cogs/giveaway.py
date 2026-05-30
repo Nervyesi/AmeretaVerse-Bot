@@ -84,6 +84,29 @@ def _allowed_role_ids(g: dict) -> list[str]:
     return out
 
 
+def _mention_role_ids(g: dict) -> list[str]:
+    """Pinged-on-post role ids. Prefer the new mention_role_ids JSON list;
+    fall back to wrapping the legacy single mention_role_id for older draft
+    rows so back-compat holds."""
+    raw = g.get('mention_role_ids') or '[]'
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        data = []
+    if not isinstance(data, list):
+        data = []
+    out: list[str] = []
+    for v in data:
+        s = str(v).strip()
+        if s:
+            out.append(s)
+    if not out and g.get('mention_role_id'):
+        legacy = str(g['mention_role_id']).strip()
+        if legacy:
+            out.append(legacy)
+    return out
+
+
 def _winner_ids(g: dict) -> list[str]:
     raw = g.get('winners_json') or '[]'
     try:

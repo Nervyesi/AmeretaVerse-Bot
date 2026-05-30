@@ -60,6 +60,23 @@ def _normalize_domain(s: str) -> str:
     return s
 
 
+def _parse_role_id_set(raw: str) -> set[str]:
+    """Tolerant role-id parser: split on any combination of commas,
+    whitespace, and newlines. Drops empties and non-numeric tokens. Returns
+    a set of id strings so membership checks are O(1)."""
+    if not raw:
+        return set()
+    out: set[str] = set()
+    for tok in re.split(r"[,\s]+", str(raw)):
+        s = tok.strip()
+        if not s:
+            continue
+        if not s.isdigit() or not (17 <= len(s) <= 20):
+            continue
+        out.add(s)
+    return out
+
+
 # ── Per-guild config helpers ──────────────────────────────────────────────────
 
 def cfg_get(guild_id: int, key: str, default: str = "") -> str:
@@ -347,10 +364,29 @@ class ProtectionCog(commands.Cog):
                     await send_mod_log(message.guild, embed)
                     return
 
-        # 2. General link detection — whitelist check ALWAYS runs first so a
-        # listed domain never reaches delete/warn/strike.
+        # 2. General link detection — checks run in this priority order:
+        #    a) role-whitelist (e.g. team and mods exempt)
+        #    b) domain-whitelist (allowed_domains)
+        #    c) delete + DM + optional kick/ban per protection_link_action
         if not cfg_bool(guild_id, "protection_link_detection"):
             return
+
+        # a) Role whitelist: if the author has any role in the configured
+        # list, the message is left alone regardless of domain. Useful for
+        # team / mod / partner roles posting marketing links.
+        role_whitelist_raw = cfg_get(guild_id, "protection_link_role_whitelist", "")
+        role_whitelist = _parse_role_id_set(role_whitelist_raw)
+        if role_whitelist:
+            author_role_ids = {str(r.id) for r in getattr(message.author, "roles", [])}
+            matched_roles = role_whitelist & author_role_ids
+            if matched_roles:
+                for d in domains:
+                    print(
+                        f"[protection] link allowed: role_whitelist "
+                        f"guild={guild_id} user={message.author.id} "
+                        f"role_ids={sorted(matched_roles)} domain={d}"
+                    )
+                return  # skip every deletion path for this message
 
         whitelist_raw = cfg_get(guild_id, "protection_link_whitelist",
                                 "twitter.com,x.com,discord.gg,youtube.com")

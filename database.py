@@ -486,6 +486,10 @@ def init_db():
             "ALTER TABLE engage_pools ADD COLUMN allowed_role_ids TEXT DEFAULT '[]'",
             "ALTER TABLE engage_pools ADD COLUMN auto_reset_daily INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE engage_pools ADD COLUMN embed_footer_icon_url TEXT",
+            # giveaway: multi-role mention support. mention_role_id (single id,
+            # legacy) is kept for back-compat; readers prefer mention_role_ids
+            # when set, otherwise fall back to wrapping the legacy id.
+            "ALTER TABLE giveaways ADD COLUMN mention_role_ids TEXT NOT NULL DEFAULT '[]'",
             # bot profile columns
             "ALTER TABLE guild_settings ADD COLUMN bot_display_name TEXT",
             "ALTER TABLE guild_settings ADD COLUMN bot_avatar_url TEXT",
@@ -1507,7 +1511,8 @@ _GIVEAWAY_EDITABLE = (
     'channel_id', 'message_id', 'title', 'description', 'prize',
     'image_url', 'thumbnail_url', 'color', 'duration_seconds', 'ends_at',
     'winner_count', 'entry_cost_points', 'allowed_role_ids',
-    'mention_role_id', 'status', 'started_at', 'ended_at',
+    'mention_role_id', 'mention_role_ids',
+    'status', 'started_at', 'ended_at',
     'winners_json', 'random_seed',
 )
 

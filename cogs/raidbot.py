@@ -872,7 +872,18 @@ def build_raid_panel_view(raid_id: int) -> discord.ui.View:
 class RaidPostModal(discord.ui.Modal, title='Post New Raid'):
     tweet_url    = discord.ui.TextInput(label='Tweet URL', placeholder='https://x.com/user/status/123456789', max_length=200)
     total_points = discord.ui.TextInput(label='Total Points', placeholder='100', max_length=10)
-    mode         = discord.ui.TextInput(label='Mode', placeholder='partial  (or: all)', default='partial', max_length=10)
+    # Modals don't support choice dropdowns, so the field is free-form. The
+    # previous max_length=10 was tight enough to fit 'partial' and 'all' but
+    # not user-typed phrases like 'all required', so users couldn't pick the
+    # all-required mode. Cap is now generous; on_submit normalizes common
+    # variants ('all', 'all required', 'every', etc.) and returns a friendly
+    # error on truly invalid input rather than silently defaulting.
+    mode         = discord.ui.TextInput(
+        label='Mode (partial or all)',
+        placeholder='partial   OR   all',
+        default='partial',
+        max_length=30,
+    )
     tasks        = discord.ui.TextInput(label='Tasks (comma-separated)', placeholder='like,comment,retweet', default='like,comment,retweet', max_length=50)
 
     def __init__(self, bot):
@@ -918,9 +929,35 @@ class RaidPostModal(discord.ui.Modal, title='Post New Raid'):
             )
             return
 
-        mode_val   = self.mode.value.strip().lower()
-        if mode_val not in ('all', 'partial'):
-            mode_val = 'partial'
+        # Normalize mode: accept the obvious variants for both modes so the
+        # free-form modal is forgiving. Silent-default-to-partial used to hide
+        # typos and made the "all" mode effectively unselectable for some
+        # users — now we either pick a valid mode or refuse with a clear
+        # message.
+        raw_mode = (self.mode.value or '').strip().lower()
+        _mode_aliases = {
+            'all':            'all',
+            'a':              'all',
+            'every':          'all',
+            'every task':     'all',
+            'all required':   'all',
+            'all-required':   'all',
+            'allrequired':    'all',
+            'required':       'all',
+            'partial':        'partial',
+            'p':              'partial',
+            'any':            'partial',
+            'any task':       'partial',
+            'partial mode':   'partial',
+        }
+        mode_val = _mode_aliases.get(raw_mode)
+        if mode_val is None:
+            await interaction.response.send_message(
+                f'❌ Mode must be `partial` (any task earns points) or '
+                f'`all` (every task required). Got: `{self.mode.value!s}`',
+                ephemeral=True,
+            )
+            return
         raw_tasks  = [t.strip().lower() for t in self.tasks.value.split(',') if t.strip()]
         valid_set  = {'like', 'comment', 'retweet'}
         task_list  = [t for t in raw_tasks if t in valid_set] or ['like', 'comment', 'retweet']
@@ -1412,7 +1449,51 @@ class RaidsCog(commands.Cog, name='Raids'):
 
         now = datetime.now(timezone.utc)
 
-        # Cooldown disabled for testing — re-enable later if abuse seen
+        # 7-day cooldown per user. Persisted across restarts via the existing
+        # x_username_set_at column on the users table. Prevents handle-swap
+        # abuse (e.g. faking comment authorship by re-linking to a different
+        # account between checks).
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT x_username, x_username_set_at FROM users WHERE user_id=?",
+                (interaction.user.id,),
+            ).fetchone()
+
+        if row and row['x_username_set_at']:
+            try:
+                raw = str(row['x_username_set_at']).replace('Z', '+00:00')
+                last = datetime.fromisoformat(raw)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                last = None
+            if last is not None:
+                elapsed  = now - last
+                cooldown = timedelta(days=7)
+                if elapsed < cooldown:
+                    remaining = cooldown - elapsed
+                    days_left  = remaining.days
+                    hours_left = remaining.seconds // 3600
+                    if days_left > 0 and hours_left > 0:
+                        when = (f'{days_left} day{"s" if days_left != 1 else ""} '
+                                f'{hours_left} hour{"s" if hours_left != 1 else ""}')
+                    elif days_left > 0:
+                        when = f'{days_left} day{"s" if days_left != 1 else ""}'
+                    elif hours_left > 0:
+                        when = f'{hours_left} hour{"s" if hours_left != 1 else ""}'
+                    else:
+                        minutes_left = max(1, remaining.seconds // 60)
+                        when = f'{minutes_left} minute{"s" if minutes_left != 1 else ""}'
+                    print(f'[setx] skipped user={interaction.user.id} '
+                          f'reason=cooldown remaining={when} '
+                          f'current_handle=@{row["x_username"]}')
+                    current = row['x_username'] or '(unset)'
+                    await interaction.response.send_message(
+                        f'⏳ You linked **@{current}** less than 7 days ago.\n'
+                        f'You can change your X handle again in **{when}**.',
+                        ephemeral=True,
+                    )
+                    return
 
         with get_connection() as conn:
             conn.execute(
@@ -1427,7 +1508,8 @@ class RaidsCog(commands.Cog, name='Raids'):
 
         await interaction.response.send_message(
             f'✅ X account linked: **@{clean}**\n\n'
-            'The bot will check your Twitter activity against this username when you join raids or engage.',
+            'The bot will check your Twitter activity against this username when you join raids or engage.\n'
+            'You can change your X handle again in 7 days.',
             ephemeral=True,
         )
 

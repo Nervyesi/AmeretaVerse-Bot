@@ -2841,7 +2841,7 @@ async def embeds_delete(
 # color stay editable so a typo can be corrected mid-flight.
 _GIVEAWAY_LOCKED_WHEN_ACTIVE = {
     'duration_seconds', 'winner_count', 'entry_cost_points',
-    'allowed_role_ids', 'mention_role_id', 'channel_id',
+    'allowed_role_ids', 'mention_role_id', 'mention_role_ids', 'channel_id',
 }
 
 _GIVEAWAY_TITLE_MAX        = 256
@@ -2862,8 +2862,14 @@ class _GiveawayCreate(BaseModel):
     duration_seconds: Optional[int] = 3600
     winner_count: Optional[int] = 1
     entry_cost_points: Optional[int] = 0
-    allowed_role_ids: Optional[list] = None   # list of role-id strings
-    mention_role_id: Optional[str] = None
+    # allowed_role_ids and mention_role_ids accept EITHER a list (each item
+    # may itself be a comma/space-separated string) OR a single string —
+    # _normalize_role_id_list reduces both shapes to a canonical JSON array.
+    # mention_role_id (singular, str) is kept for back-compat with older
+    # clients; the backend folds it into mention_role_ids on save.
+    allowed_role_ids: Optional[object] = None
+    mention_role_ids: Optional[object] = None
+    mention_role_id:  Optional[str]    = None
     channel_id: Optional[str] = ''
 
 
@@ -2877,8 +2883,9 @@ class _GiveawayUpdate(BaseModel):
     duration_seconds: Optional[int] = None
     winner_count: Optional[int] = None
     entry_cost_points: Optional[int] = None
-    allowed_role_ids: Optional[list] = None
-    mention_role_id: Optional[str] = None
+    allowed_role_ids: Optional[object] = None
+    mention_role_ids: Optional[object] = None
+    mention_role_id:  Optional[str]    = None
     channel_id: Optional[str] = None
 
 
@@ -2920,21 +2927,61 @@ def _validate_giveaway_url(url: str, field: str) -> str:
     return u
 
 
-def _validate_role_id_list(values) -> str:
-    if values is None:
+import re as _gw_re
+# Discord snowflakes are 17-19 digits today; 20-digit allows headroom for
+# future ID-space growth without rejecting legitimate IDs.
+_ROLE_ID_DIGIT_RE = _gw_re.compile(r'^\d{17,20}$')
+
+
+def _normalize_role_id_list(values, *, field: str = 'role_ids') -> str:
+    """Tolerant parser: accept either a list (items may themselves be
+    strings containing several ids) OR a single string. Split on any
+    combination of commas, whitespace, and newlines. Trim each token,
+    drop empties, validate each remaining token is a 17–20-digit numeric
+    Discord ID. Return a canonical JSON-array string."""
+    if values is None or values == '':
         return '[]'
-    if not isinstance(values, list):
-        raise HTTPException(status_code=400, detail='allowed_role_ids must be a list')
+
+    if isinstance(values, str):
+        raw_tokens = _gw_re.split(r'[,\s]+', values)
+    elif isinstance(values, (list, tuple)):
+        raw_tokens: list[str] = []
+        for v in values:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if not s:
+                continue
+            raw_tokens.extend(_gw_re.split(r'[,\s]+', s))
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f'{field} must be a list or a comma-separated string',
+        )
+
     out: list[str] = []
-    for v in values:
-        s = str(v).strip()
+    seen: set = set()
+    for tok in raw_tokens:
+        s = (tok or '').strip()
         if not s:
             continue
-        if not s.isdigit() or len(s) > 32:
-            raise HTTPException(status_code=400,
-                detail='allowed_role_ids must be a list of numeric role ids')
+        if not _ROLE_ID_DIGIT_RE.match(s):
+            raise HTTPException(
+                status_code=400,
+                detail=(f'{field} entry "{s}" is not a valid Discord role id '
+                        f'(expected 17-20 digits)'),
+            )
+        if s in seen:
+            continue
+        seen.add(s)
         out.append(s)
     return json.dumps(out)
+
+
+def _validate_role_id_list(values) -> str:
+    """Back-compat alias for the previous name. New code should call
+    _normalize_role_id_list with an explicit field= for cleaner errors."""
+    return _normalize_role_id_list(values, field='allowed_role_ids')
 
 
 def _validate_giveaway_payload(
@@ -2979,6 +3026,18 @@ def _giveaway_row_to_dict(g: dict) -> dict:
             winners = []
     except (ValueError, TypeError):
         winners = []
+    # mention_role_ids (new) is the source of truth; if a giveaway predates
+    # the column (NULL) or was written without it, fall back to wrapping the
+    # legacy single mention_role_id so the response shape stays consistent.
+    try:
+        mentions = json.loads(g.get('mention_role_ids') or '[]')
+        if not isinstance(mentions, list):
+            mentions = []
+    except (ValueError, TypeError):
+        mentions = []
+    if not mentions and g.get('mention_role_id'):
+        mentions = [str(g['mention_role_id'])]
+    mentions = [str(m) for m in mentions if str(m).strip()]
     color_int = g.get('color')
     color_hex = f'#{int(color_int):06x}' if color_int is not None else None
     return {
@@ -2997,7 +3056,8 @@ def _giveaway_row_to_dict(g: dict) -> dict:
         'winner_count':      int(g.get('winner_count') or 1),
         'entry_cost_points': int(g.get('entry_cost_points') or 0),
         'allowed_role_ids':  [str(r) for r in roles],
-        'mention_role_id':   str(g['mention_role_id']) if g.get('mention_role_id') else None,
+        'mention_role_id':   (mentions[0] if mentions else None),
+        'mention_role_ids':  mentions,
         'status':            g.get('status') or 'draft',
         'created_by':        str(g.get('created_by')) if g.get('created_by') else None,
         'created_at':        g.get('created_at'),
@@ -3033,10 +3093,23 @@ async def giveaways_create(
     color_int = _coerce_giveaway_color(body.color)
     image_url = _validate_giveaway_url(body.image_url     or '', 'image_url')
     thumb_url = _validate_giveaway_url(body.thumbnail_url or '', 'thumbnail_url')
-    roles_str = _validate_role_id_list(body.allowed_role_ids)
-    mention   = (body.mention_role_id or '').strip() or None
-    if mention and (not mention.isdigit() or len(mention) > 32):
-        raise HTTPException(status_code=400, detail='mention_role_id must be a numeric role id')
+    roles_str = _normalize_role_id_list(body.allowed_role_ids, field='allowed_role_ids')
+
+    # Multi-mention: new mention_role_ids takes precedence; legacy single
+    # mention_role_id is folded in for back-compat.
+    if body.mention_role_ids is not None:
+        mention_list_str = _normalize_role_id_list(body.mention_role_ids, field='mention_role_ids')
+    elif body.mention_role_id:
+        mention_list_str = _normalize_role_id_list(body.mention_role_id, field='mention_role_id')
+    else:
+        mention_list_str = '[]'
+    # Keep the legacy single field populated with the first id (or None) so
+    # any older read path that hasn't switched over still works.
+    try:
+        _first = json.loads(mention_list_str)
+        mention_single = _first[0] if isinstance(_first, list) and _first else None
+    except (TypeError, ValueError):
+        mention_single = None
 
     gid = db_create_giveaway(
         server_id,
@@ -3050,9 +3123,12 @@ async def giveaways_create(
         winner_count=int(body.winner_count or 1),
         entry_cost_points=int(body.entry_cost_points or 0),
         allowed_role_ids=roles_str,
-        mention_role_id=mention,
+        mention_role_id=mention_single,
         channel_id=(body.channel_id or '').strip(),
     )
+    # Persist the canonical multi-role list (create helper doesn't take it).
+    if mention_list_str != '[]':
+        db_update_giveaway(gid, server_id, mention_role_ids=mention_list_str)
 
     log_event(
         server_id, 'admin_action', 'giveaway_created',
@@ -3120,12 +3196,28 @@ async def giveaways_update(
     if 'entry_cost_points' in payload:
         updates['entry_cost_points'] = int(payload['entry_cost_points'])
     if 'allowed_role_ids' in payload:
-        updates['allowed_role_ids'] = _validate_role_id_list(payload['allowed_role_ids'])
-    if 'mention_role_id' in payload:
-        m = (payload['mention_role_id'] or '').strip() or None
-        if m and (not m.isdigit() or len(m) > 32):
-            raise HTTPException(status_code=400, detail='mention_role_id must be a numeric role id')
-        updates['mention_role_id'] = m
+        updates['allowed_role_ids'] = _normalize_role_id_list(
+            payload['allowed_role_ids'], field='allowed_role_ids',
+        )
+    # Multi-mention update. Either field can be supplied; mention_role_ids
+    # is the source of truth. The legacy mention_role_id stays mirrored to
+    # the first id (or None) so old readers don't break.
+    if 'mention_role_ids' in payload or 'mention_role_id' in payload:
+        if 'mention_role_ids' in payload:
+            mention_list_str = _normalize_role_id_list(
+                payload['mention_role_ids'], field='mention_role_ids',
+            )
+        else:
+            raw = payload.get('mention_role_id') or ''
+            mention_list_str = _normalize_role_id_list(
+                raw, field='mention_role_id',
+            )
+        updates['mention_role_ids'] = mention_list_str
+        try:
+            _first = json.loads(mention_list_str)
+            updates['mention_role_id'] = _first[0] if isinstance(_first, list) and _first else None
+        except (TypeError, ValueError):
+            updates['mention_role_id'] = None
     if 'channel_id' in payload:
         updates['channel_id'] = (payload['channel_id'] or '').strip() or None
 
@@ -3226,9 +3318,18 @@ async def giveaways_start(
     embed = build_giveaway_embed(server_id, primed, entry_count)
     view  = build_giveaway_view(primed)
 
-    content = None
-    if primed.get('mention_role_id'):
-        content = f'<@&{primed["mention_role_id"]}>'
+    # Multi-role mention. Prefer mention_role_ids (new); fall back to wrapping
+    # the legacy single id for older draft rows.
+    try:
+        _mentions = json.loads(primed.get('mention_role_ids') or '[]')
+        if not isinstance(_mentions, list):
+            _mentions = []
+    except (TypeError, ValueError):
+        _mentions = []
+    if not _mentions and primed.get('mention_role_id'):
+        _mentions = [str(primed['mention_role_id'])]
+    _mentions = [str(m).strip() for m in _mentions if str(m).strip()]
+    content = ' '.join(f'<@&{r}>' for r in _mentions) if _mentions else None
 
     try:
         msg = await channel.send(
