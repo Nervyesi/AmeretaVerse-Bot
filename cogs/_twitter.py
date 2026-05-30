@@ -292,6 +292,10 @@ _REPLY_HINT_FIELDS = (
     'isReply', 'is_reply',
     'inReplyToUserId', 'in_reply_to_user_id', 'in_reply_to_user_id_str',
     'in_reply_to_screen_name', 'inReplyToScreenName',
+    # Production payloads have also been observed to carry inReplyToUsername
+    # on threaded/nested replies — add it so the conversation_id fallback
+    # treats nested replies as legitimate participation in the target thread.
+    'inReplyToUsername', 'in_reply_to_username',
 )
 _RETWEET_REF_ID_FIELDS = (
     'retweetedStatusId', 'retweeted_status_id', 'retweeted_status_id_str',
@@ -820,131 +824,158 @@ async def _api_get(path: str, params: dict, timeout: float = 30.0) -> Optional[d
         return None
 
 
+def _log_verify_summary(
+    fn_name: str, tweet_id: str, target: str, *,
+    primary_via: str, primary_result: str,
+    fallback_via: str, fallback_result: str,
+    api_calls: int, result: str,
+) -> None:
+    """One-line per-verify summary. Matches the diagnostic shape requested
+    so log scrapers can grep a single line for the verdict path."""
+    print(
+        f'[twitter] {fn_name}: tweet={tweet_id} target={target} '
+        f'primary={primary_via} primary_result={primary_result} '
+        f'fallback={fallback_via} fallback_result={fallback_result} '
+        f'api_calls={api_calls} result={result}'
+    )
+
+
 async def check_comment(tweet_id: str, target_username: str) -> dict:
     """Verify @target_username replied to tweet_id.
 
-    Order: TWEET-SIDE FIRST, USER-SIDE FALLBACK (only if a working
-    replies-bearing user endpoint exists). Production proved
-    /twitter/user/last_tweets EXCLUDES replies — scanning 239 tweets for a
-    reply via that endpoint found nothing while tweet-side hit on page 1 in
-    1 second. So the cheap and reliable path is tweet-side first; user-side
-    is only worth running when tweet-side returns 0 replies AND a probe has
-    discovered an endpoint that does carry user replies.
+    Order: USER-SIDE FIRST via a probed replies-bearing endpoint, TWEET-SIDE
+    as safety-net fallback. The probe runs ONCE per process at the first
+    comment verify; the winner is cached. Production proved:
+      • /twitter/user/last_tweets with includeReplies=true returns user replies
+        reliably; the cached winner is used as primary going forward.
+      • /twitter/tweet/replies returns inconsistent slices on identical
+        consecutive calls — so it's only used as a safety net, never as a
+        confident-no source.
 
-    Result rules (signature unchanged: dict with 'verified' and 'reason'):
-      tweet_side True                                                   -> True
-      tweet_side False, scanned ≥ _TWEETSIDE_CONFIDENT_FALSE_MIN        -> False (no fallback — trust)
-      tweet_side False/None, scanned < confident_min, replies endpoint AVAILABLE:
-          probe_match  True                                              -> True
-          probe_match  False                                              -> False
-      tweet_side False/None, scanned < confident_min, NO replies endpoint:
-          tweet_side False                                                -> False (best we have)
-          tweet_side None                                                 -> None  (inconclusive)
+    Threaded/nested replies (user replied to another reply inside the target's
+    conversation) are matched via conversation_id + a reply hint in
+    _tweet_replies_to — see that helper for the exact rules.
+
+    Result rules (signature unchanged):
+      user_side True                                          -> True
+      user_side False, tweet_side True                        -> True
+      user_side False, tweet_side False                       -> False (no_comment_both_sides)
+      user_side False, tweet_side None (api_error)            -> False (userside is the strong signal)
+      probe unavailable, tweet_side True                      -> True
+      probe unavailable, tweet_side False                     -> False (no_comment_tweetside_only)
+      probe unavailable, tweet_side None                      -> None  (inconclusive)
     """
     print(f'[twitter] check_comment: tweet={tweet_id} target={target_username} '
-          f'order=tweetside_first')
+          f'order=userside_first(probe_eager)')
     target = normalize_username(target_username)
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
     target_id_s = _id_str(tweet_id)
 
-    # ── PRIMARY: tweet-side replies scan ─────────────────────────────────────
+    api_calls       = 0
+    primary_via     = 'user_side_unavailable'
+    primary_result  = 'skipped'
+    fallback_via    = 'skipped'
+    fallback_result = 'skipped'
+
+    # ── EAGER probe (cached per process). At the first comment verify this
+    # spends 1+ API calls to find a replies-capable endpoint; every later
+    # verify reads the cached winner instantly.
+    probe = await _probe_replies_endpoint(target)
+
+    # ── PRIMARY: user-side via probed endpoint ───────────────────────────
+    if probe is not None:
+        primary_via = f'user_side_via_{probe["name"]}'
+        tweets = await _fetch_user_recent_tweets(
+            target,
+            endpoint=probe['path'],
+            extra_params=probe['extra_params'],
+            max_pages=_USER_TWEETS_MAX_PAGES,
+        )
+        # Approximate per-page cost: ~20 tweets per page.
+        api_calls += max(1, (len(tweets) + 19) // 20)
+        matched_tweet_id: Optional[str] = None
+        for tw in tweets:
+            if _tweet_replies_to(tw, target_id_s):
+                matched_tweet_id = _id_str(tw.get('id') or tw.get('id_str'))
+                break
+
+        if matched_tweet_id is not None:
+            print(f'[twitter] check_comment: USERSIDE MATCH @{target} '
+                  f'reply_tweet={matched_tweet_id} target_tweet={target_id_s} '
+                  f'(scanned={len(tweets)})')
+            _log_verify_summary(
+                'check_comment', tweet_id, target,
+                primary_via=primary_via, primary_result='match',
+                fallback_via='skipped', fallback_result='skipped',
+                api_calls=api_calls, result='match',
+            )
+            return {'verified': True,
+                    'reason': f'found_comment_userside_via_{probe["name"]}'}
+
+        primary_result = 'no_match'
+        print(f'[twitter] check_comment: userside no match in {len(tweets)} '
+              f'tweets @{target} via {probe["name"]} — running tweet-side safety net')
+
+    # ── FALLBACK: tweet-side replies scan ────────────────────────────────
+    fallback_via = 'tweet_side'
     ts = await _check_comment_tweetside(tweet_id, target)
     ts_verified = ts.get('verified')
-    ts_seen     = int(ts.get('seen')      or 0)
-    ts_pages    = int(ts.get('pages')     or 0)
-    ts_calls    = int(ts.get('api_calls') or ts_pages)
+    api_calls += int(ts.get('api_calls') or ts.get('pages') or 0)
 
     if ts_verified is True:
-        print(f'[twitter] check_comment: matched_side=tweet_side '
-              f'tweetside_seen={ts_seen} pages={ts_pages} api_calls={ts_calls}')
+        fallback_result = 'match'
+        _log_verify_summary(
+            'check_comment', tweet_id, target,
+            primary_via=primary_via, primary_result=primary_result,
+            fallback_via=fallback_via, fallback_result=fallback_result,
+            api_calls=api_calls, result='match',
+        )
         return {'verified': True, 'reason': 'found_comment_tweetside'}
 
-    # Tweet-side ran healthy (lots of replies seen) AND user wasn't there.
-    # Trust the False — the user genuinely did not reply from this handle.
-    # No user-side fallback in this branch: it would cost ~12 API calls and
-    # ~20 seconds for nothing on every legitimate "didn't comment" case.
-    if ts_verified is False and ts_seen >= _TWEETSIDE_CONFIDENT_FALSE_MIN:
-        print(f'[twitter] check_comment: matched_side=none '
-              f'tweetside_seen={ts_seen} (confident no-match — '
-              f'skipping userside fallback) api_calls={ts_calls}')
+    # Tweet-side did NOT match. The production evidence shows /tweet/replies
+    # returns inconsistent single-reply snapshots on identical calls — so
+    # tweet-side "no match" is NOT a confident signal on its own. Trust it
+    # only when the user-side primary also returned no match (or wasn't
+    # available because no probe winner exists for this process).
+    if ts_verified is False:
+        fallback_result = 'no_match'
+    else:  # None — api_error
+        fallback_result = 'error'
+
+    if probe is not None:
+        # We had a strong user-side primary that returned no match. Plus
+        # tweet-side also didn't find them. Verdict: False.
+        verdict_reason = ('no_comment_both_sides' if ts_verified is False
+                          else 'no_comment_userside_then_tweetside_error')
+        _log_verify_summary(
+            'check_comment', tweet_id, target,
+            primary_via=primary_via, primary_result=primary_result,
+            fallback_via=fallback_via, fallback_result=fallback_result,
+            api_calls=api_calls, result='no_match',
+        )
+        return {'verified': False, 'reason': verdict_reason}
+
+    # No probe winner at all — tweet-side was the only signal we have. Since
+    # it can't be trusted to be confidently complete (random snapshots), and
+    # we have nothing else, surface what it said but mark it honestly.
+    if ts_verified is False:
+        _log_verify_summary(
+            'check_comment', tweet_id, target,
+            primary_via=primary_via, primary_result=primary_result,
+            fallback_via=fallback_via, fallback_result=fallback_result,
+            api_calls=api_calls, result='no_match',
+        )
         return {'verified': False,
-                'reason': f'no_comment_tweetside({ts_seen}_replies_scanned)'}
+                'reason': 'no_comment_tweetside_only_no_probe_endpoint'}
 
-    # Tweet-side returned 0 / very-few replies or hit an api_error. This is
-    # the "broken /tweet/replies endpoint" signature. Try user-side IFF a
-    # replies-bearing endpoint can be found.
-    print(f'[twitter] check_comment: tweetside={ts_verified} seen={ts_seen} '
-          f'pages={ts_pages} — running probe + userside fallback')
-
-    fallback = await _comment_userside_fallback(target, target_id_s)
-    fb_match    = fallback.get('matched', False)
-    fb_scanned  = int(fallback.get('scanned')   or 0)
-    fb_endpoint = fallback.get('endpoint')
-    fb_calls    = int(fallback.get('api_calls') or 0)
-
-    total_calls = ts_calls + fb_calls
-
-    if fb_match:
-        print(f'[twitter] check_comment: matched_side=user_side via {fb_endpoint!r} '
-              f'tweetside_seen={ts_seen} userside_scanned={fb_scanned} '
-              f'api_calls={total_calls}')
-        return {'verified': True,
-                'reason': f'found_comment_userside_via_{fb_endpoint or "unknown"}'}
-
-    if fb_endpoint is None:
-        # No replies endpoint available. We're back to whatever tweet-side
-        # said. If it said False (even with 0 replies seen), surface that;
-        # if it said None (api_error), surface inconclusive.
-        if ts_verified is False:
-            print(f'[twitter] check_comment: matched_side=none '
-                  f'tweetside_seen={ts_seen} userside=unavailable api_calls={total_calls}')
-            return {'verified': False,
-                    'reason': f'no_comment_tweetside_only(seen={ts_seen})_no_userside_endpoint'}
-        print(f'[twitter] check_comment: matched_side=none '
-              f'tweetside=inconclusive userside=unavailable api_calls={total_calls}')
-        return {'verified': None,
-                'reason': 'tweetside_inconclusive_no_userside_endpoint'}
-
-    # Replies endpoint exists, user-side ran, no match.
-    confident_userside_no = fb_scanned >= _USERSIDE_CONFIDENT_FALSE_MIN
-    if confident_userside_no or ts_verified is False:
-        print(f'[twitter] check_comment: matched_side=none '
-              f'tweetside_seen={ts_seen} userside_scanned={fb_scanned} '
-              f'api_calls={total_calls}')
-        return {'verified': False,
-                'reason': f'no_comment_both_sides(ts={ts_seen},us={fb_scanned})'}
-    print(f'[twitter] check_comment: matched_side=none '
-          f'tweetside_seen={ts_seen} userside_scanned={fb_scanned} '
-          f'(both shallow) api_calls={total_calls}')
-    return {'verified': None,
-            'reason': f'both_sides_shallow(ts={ts_seen},us={fb_scanned})'}
-
-
-async def _comment_userside_fallback(target: str, target_id_s: str) -> dict:
-    """Probe (once per process) for a replies-bearing user endpoint and, if
-    one exists, scan the target's recent tweets via that endpoint for a
-    reply to target_id. Returns {'matched', 'endpoint', 'scanned', 'api_calls'}.
-    'endpoint' is None when no candidate returned replies."""
-    probe = await _probe_replies_endpoint(target)
-    if probe is None:
-        # The probe itself may have made up to len(candidates) calls.
-        # We don't track them here precisely; the probe logs each.
-        return {'matched': False, 'endpoint': None, 'scanned': 0, 'api_calls': 0}
-
-    tweets = await _fetch_user_recent_tweets(
-        target,
-        endpoint=probe['path'],
-        extra_params=probe['extra_params'],
-        max_pages=_USER_TWEETS_MAX_PAGES,
+    _log_verify_summary(
+        'check_comment', tweet_id, target,
+        primary_via=primary_via, primary_result=primary_result,
+        fallback_via=fallback_via, fallback_result=fallback_result,
+        api_calls=api_calls, result='inconclusive',
     )
-    scanned = len(tweets)
-    for tw in tweets:
-        if _tweet_replies_to(tw, target_id_s):
-            return {'matched': True, 'endpoint': probe['name'],
-                    'scanned': scanned, 'api_calls': scanned // 20 + 1}
-    return {'matched': False, 'endpoint': probe['name'],
-            'scanned': scanned, 'api_calls': scanned // 20 + 1}
+    return {'verified': None, 'reason': 'all_sides_inconclusive'}
 
 
 async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
@@ -1083,59 +1114,100 @@ async def check_retweet(tweet_id: str, target_username: str) -> dict:
         return {'verified': None, 'reason': 'missing_input'}
     target_id_s = _id_str(tweet_id)
 
+    api_calls       = 0
+    primary_via     = f'user_side_via_last_tweets(cap={_USER_TWEETS_RETWEET_MAX_PAGES})'
+    primary_result  = 'skipped'
+    fallback_via    = 'skipped'
+    fallback_result = 'skipped'
+
     # ── PRIMARY: user-side (cheap, low cap) ──────────────────────────────────
     user_tweets = await _fetch_user_recent_tweets(
         target, max_pages=_USER_TWEETS_RETWEET_MAX_PAGES,
     )
     us_count = len(user_tweets)
+    api_calls += max(1, (us_count + 19) // 20)
     if us_count:
         for tw in user_tweets:
             if _tweet_retweets(tw, target_id_s):
                 rt_id = _id_str(tw.get('id') or tw.get('id_str'))
-                print(f'[twitter] check_retweet: matched_side=user_side @{target} '
+                print(f'[twitter] check_retweet: USERSIDE MATCH @{target} '
                       f'retweeted {target_id_s} (rt_tweet={rt_id}, '
-                      f'scanned={us_count}) api_calls≈{us_count // 20 + 1}')
+                      f'scanned={us_count})')
+                _log_verify_summary(
+                    'check_retweet', tweet_id, target,
+                    primary_via=primary_via, primary_result='match',
+                    fallback_via='skipped', fallback_result='skipped',
+                    api_calls=api_calls, result='match',
+                )
                 return {'verified': True, 'reason': 'found_retweet_userside'}
+        primary_result = 'no_match'
         print(f'[twitter] check_retweet: userside no match in {us_count} tweets '
               f'@{target} — running tweet-side retweeters fallback')
     else:
+        primary_result = 'no_match'
         print(f'[twitter] check_retweet: userside returned 0 tweets @{target} '
               f'— running tweet-side retweeters fallback')
 
     # ── SECONDARY: tweet-side retweeters scan ────────────────────────────────
+    fallback_via = 'tweet_side'
     ts = await _check_retweet_tweetside(tweet_id, target)
     ts_verified = ts.get('verified')
     ts_seen     = int(ts.get('seen')      or 0)
     ts_calls    = int(ts.get('api_calls') or ts.get('pages') or 0)
-    total_calls = (us_count // 20 + 1) + ts_calls
+    api_calls += ts_calls
 
     if ts_verified is True:
-        print(f'[twitter] check_retweet: matched_side=tweet_side '
-              f'tweetside_seen={ts_seen} api_calls={total_calls}')
+        fallback_result = 'match'
+        _log_verify_summary(
+            'check_retweet', tweet_id, target,
+            primary_via=primary_via, primary_result=primary_result,
+            fallback_via=fallback_via, fallback_result=fallback_result,
+            api_calls=api_calls, result='match',
+        )
         return {'verified': True, 'reason': 'found_retweet_tweetside'}
 
     if ts_verified is False:
-        print(f'[twitter] check_retweet: matched_side=none '
-              f'userside_scanned={us_count} tweetside_seen={ts_seen} '
-              f'api_calls={total_calls}')
+        fallback_result = 'no_match'
         reason = ('no_retweet_found_both_sides' if us_count
                   else 'no_retweet_found_tweetside_only')
+        _log_verify_summary(
+            'check_retweet', tweet_id, target,
+            primary_via=primary_via, primary_result=primary_result,
+            fallback_via=fallback_via, fallback_result=fallback_result,
+            api_calls=api_calls, result='no_match',
+        )
         return {'verified': False, 'reason': reason}
 
-    # ts_verified is None
+    # ts_verified is None — tweet-side api_error
+    fallback_result = 'error'
     if us_count >= _USERSIDE_CONFIDENT_FALSE_MIN:
-        print(f'[twitter] check_retweet: matched_side=none '
-              f'userside_scanned={us_count}(confident) tweetside=inconclusive '
-              f'api_calls={total_calls}')
+        _log_verify_summary(
+            'check_retweet', tweet_id, target,
+            primary_via=primary_via, primary_result=primary_result,
+            fallback_via=fallback_via, fallback_result=fallback_result,
+            api_calls=api_calls, result='no_match',
+        )
         return {
             'verified': False,
             'reason':  f'no_retweet_userside({us_count}_scanned)_tweetside_inconclusive',
         }
     if us_count:
+        _log_verify_summary(
+            'check_retweet', tweet_id, target,
+            primary_via=primary_via, primary_result=primary_result,
+            fallback_via=fallback_via, fallback_result=fallback_result,
+            api_calls=api_calls, result='inconclusive',
+        )
         return {
             'verified': None,
             'reason':  f'userside_shallow({us_count})_tweetside_inconclusive',
         }
+    _log_verify_summary(
+        'check_retweet', tweet_id, target,
+        primary_via=primary_via, primary_result=primary_result,
+        fallback_via=fallback_via, fallback_result=fallback_result,
+        api_calls=api_calls, result='inconclusive',
+    )
     return {'verified': None, 'reason': 'both_sides_inconclusive'}
 
 
