@@ -99,7 +99,20 @@ else:
 _REPLIES_MAX_PAGES      = max(1, int(os.getenv('TWITTER_REPLIES_MAX_PAGES',     '20') or 20))
 _RETWEETERS_MAX_PAGES   = max(1, int(os.getenv('TWITTER_RETWEETERS_MAX_PAGES', '20') or 20))
 _USER_TWEETS_MAX_PAGES  = max(1, int(os.getenv('TWITTER_USER_TWEETS_MAX_PAGES', '12') or 12))
+# The retweet user-side path uses a low cap because a recent retweet is at the
+# top of the user's timeline; scanning deep is wasted spend. Default 3 pages
+# (~60 tweets), enough for any recent retweet. Comment fallback (if a working
+# replies endpoint is discovered) uses the full _USER_TWEETS_MAX_PAGES cap.
+_USER_TWEETS_RETWEET_MAX_PAGES = max(
+    1, int(os.getenv('TWITTER_USER_TWEETS_RETWEET_MAX_PAGES', '3') or 3)
+)
 _PAGINATION_BUDGET_S    = max(5.0, float(os.getenv('TWITTER_PAGINATION_BUDGET_S', '120') or 120))
+# Minimum replies tweet-side must have scanned before we trust its "no match"
+# as conclusive (and skip the user-side fallback). When tweet-side returns
+# 0-few replies, that's the "broken endpoint" signature and we fall back.
+_TWEETSIDE_CONFIDENT_FALSE_MIN = max(
+    1, int(os.getenv('TWITTER_TWEETSIDE_CONFIDENT_FALSE_MIN', '5') or 5)
+)
 # Short-TTL process-level cache for a user's recent tweets. One engage finalize
 # verifies many submissions for the same user — we'd hit /user/last_tweets
 # once per submission without this. 60s is plenty for one finalize batch and
@@ -115,8 +128,10 @@ _USERSIDE_CONFIDENT_FALSE_MIN = max(
 print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'retweeters cap={_RETWEETERS_MAX_PAGES} '
       f'user_tweets cap={_USER_TWEETS_MAX_PAGES} '
+      f'rt_userside cap={_USER_TWEETS_RETWEET_MAX_PAGES} '
       f'cache_ttl={_USER_TWEETS_CACHE_TTL}s '
-      f'time budget={_PAGINATION_BUDGET_S}s')
+      f'time budget={_PAGINATION_BUDGET_S}s '
+      f'tweetside_confident_min={_TWEETSIDE_CONFIDENT_FALSE_MIN}')
 
 
 # ── User-tweets cache (single fetch reused across one finalize batch) ────────
@@ -480,24 +495,145 @@ def _log_first_tweet_keys_once(tw) -> None:
         print(f'[twitter] user_tweets first tweet reply/retweet fields: {compact}')
 
 
-async def _fetch_user_recent_tweets(username: str) -> list:
-    """Return the user's recent tweets via /twitter/user/last_tweets.
+# ── "Is this a reply?" / "Is this a retweet?" tests for diagnostics ─────────
+# Used to count replies_in_timeline / retweets_in_timeline so we can SEE,
+# directly in the log line, whether the endpoint in use actually returns
+# user replies. Production proved /user/last_tweets does NOT — every scanned
+# tweet shows isReply=False, inReplyToId=None — which is why the user-side
+# comment scan was a long wasted spend.
 
-    Cached for _USER_TWEETS_CACHE_TTL seconds keyed by normalized username so
-    one engage finalize batch (same user, many submissions) makes a single
-    network roundtrip. Returns [] on any failure — caller decides whether
-    that's inconclusive or "fall back".
+def _is_reply_tweet(tw: dict) -> bool:
+    if not isinstance(tw, dict):
+        return False
+    if tw.get('isReply') is True or tw.get('is_reply') is True:
+        return True
+    for f in _REPLY_TO_ID_FIELDS:
+        v = tw.get(f)
+        if v not in (None, '', 0, '0'):
+            return True
+    refs = tw.get('referenced_tweets')
+    if isinstance(refs, list):
+        for r in refs:
+            if isinstance(r, dict) and str(r.get('type', '')) == 'replied_to':
+                return True
+    return False
+
+
+def _is_retweet_tweet(tw: dict) -> bool:
+    if not isinstance(tw, dict):
+        return False
+    if tw.get('isRetweet') is True or tw.get('is_retweet') is True:
+        return True
+    for f in _RETWEET_REF_ID_FIELDS:
+        v = tw.get(f)
+        if v not in (None, '', 0, '0'):
+            return True
+    for key in _RETWEET_NESTED_KEYS:
+        nested = tw.get(key)
+        if isinstance(nested, dict) and nested:
+            return True
+    refs = tw.get('referenced_tweets')
+    if isinstance(refs, list):
+        for r in refs:
+            if isinstance(r, dict) and str(r.get('type', '')) == 'retweeted':
+                return True
+    return False
+
+
+# ── Candidate endpoints that MIGHT return user replies ─────────────────────
+# /user/last_tweets is confirmed in production to exclude replies. These are
+# probed once per process, lazily, the first time check_comment needs a
+# fallback (i.e. tweet-side returned 0 replies — the "broken endpoint" path).
+# The probe makes one call per candidate against the user being verified, so
+# the spend is bounded and the first response can also double-serve as the
+# first scan page.
+
+_REPLIES_ENDPOINT_CANDIDATES = (
+    # (path, extra_params_dict, short_name)
+    ('/twitter/user/last_tweets',           {'includeReplies':    'true'}, 'last_tweets+includeReplies'),
+    ('/twitter/user/last_tweets',           {'include_replies':   'true'}, 'last_tweets+include_replies'),
+    ('/twitter/user/last_tweets',           {'withReplies':       'true'}, 'last_tweets+withReplies'),
+    ('/twitter/user/last_tweets',           {'include_rts_and_replies': 'true'}, 'last_tweets+include_rts_and_replies'),
+    ('/twitter/user/last_tweets_and_replies', {},                          'last_tweets_and_replies'),
+    ('/twitter/user/replies',               {},                            'user/replies'),
+    ('/twitter/user/with_replies',          {},                            'user/with_replies'),
+    ('/twitter/user/tweets_and_replies',    {},                            'tweets_and_replies'),
+)
+
+# None = not probed yet. Dict = probe found a working endpoint. 'unavailable'
+# = probe ran, nothing returned replies. Cached for the process lifetime so
+# the spend (up to len(_REPLIES_ENDPOINT_CANDIDATES) calls) happens at most
+# once.
+_replies_endpoint_probe_result = None
+_replies_endpoint_probe_lock   = asyncio.Lock()
+
+
+async def _probe_replies_endpoint(test_username: str) -> Optional[dict]:
+    """Try each candidate ONCE per process. Returns the winning endpoint
+    dict {'path', 'extra_params', 'name'} or None if no candidate exposed
+    replies. Subsequent calls return the cached result without spending."""
+    global _replies_endpoint_probe_result
+    async with _replies_endpoint_probe_lock:
+        if isinstance(_replies_endpoint_probe_result, dict):
+            return _replies_endpoint_probe_result
+        if _replies_endpoint_probe_result == 'unavailable':
+            return None
+
+        print(f'[twitter] probe_replies: starting one-shot probe with @{test_username} '
+              f'({len(_REPLIES_ENDPOINT_CANDIDATES)} candidates)')
+
+        for path, extra, name in _REPLIES_ENDPOINT_CANDIDATES:
+            params = {'userName': test_username, **extra}
+            data = await _api_get(path, params, timeout=20.0)
+            if data is None:
+                print(f'[twitter] probe_replies {name}: api_error/4xx/5xx — skipping')
+                continue
+            tweets, extract_path = _extract_tweets_from_payload(data)
+            reply_count = sum(1 for tw in tweets if _is_reply_tweet(tw))
+            print(f'[twitter] probe_replies {name}: tweets={len(tweets)} '
+                  f'replies={reply_count} extract_path={extract_path!r}')
+            if reply_count > 0:
+                winner = {'path': path, 'extra_params': extra, 'name': name}
+                _replies_endpoint_probe_result = winner
+                print(f'[twitter] probe_replies: WINNER={name} '
+                      f'(this will be used for comment user-side from now on)')
+                return winner
+
+        _replies_endpoint_probe_result = 'unavailable'
+        print('[twitter] probe_replies: NO candidate returned replies — '
+              'comment verification will rely on tweet-side only')
+        return None
+
+
+async def _fetch_user_recent_tweets(
+    username: str,
+    *,
+    endpoint: str = '/twitter/user/last_tweets',
+    extra_params: Optional[dict] = None,
+    max_pages: Optional[int] = None,
+) -> list:
+    """Return the user's recent tweets, paginated.
+
+    endpoint / extra_params let the caller route to a replies-bearing endpoint
+    discovered via _probe_replies_endpoint. The cache is keyed by
+    (endpoint, normalized_username, frozen(extra_params)) so different
+    endpoint requests for the same user don't poison each other.
+    max_pages overrides the module default for cheap user-side retweet checks.
     """
     target = normalize_username(username)
     if not target:
         return []
+    if extra_params is None:
+        extra_params = {}
+    cache_key = (endpoint, target, frozenset((k, str(v)) for k, v in extra_params.items()))
+    max_pages = max_pages if max_pages is not None else _USER_TWEETS_MAX_PAGES
 
     # Cache check — under the lock so two concurrent verifies share the result.
     async with _user_tweets_lock:
-        cached = _user_tweets_cache.get(target)
+        cached = _user_tweets_cache.get(cache_key)
         if cached and (time.monotonic() - cached[0]) < _USER_TWEETS_CACHE_TTL:
             age = time.monotonic() - cached[0]
-            print(f'[twitter] user_tweets cache HIT @{target} '
+            print(f'[twitter] user_tweets cache HIT key=({endpoint},@{target},{dict(extra_params) or "{}"}) '
                   f'age={age:.1f}s tweets={len(cached[1])}')
             return cached[1]
 
@@ -507,19 +643,21 @@ async def _fetch_user_recent_tweets(username: str) -> list:
     deadline   = started_at + _PAGINATION_BUDGET_S
     pages = 0
     prev_empty = False   # tolerate one empty page when the cursor is advancing
-    break_reason = f'page_cap({_USER_TWEETS_MAX_PAGES})'
+    break_reason = f'page_cap({max_pages})'
+    replies_seen   = 0   # diagnostic: how many tweets in the timeline are replies
+    retweets_seen  = 0   # diagnostic: how many are retweets
 
-    for page_idx0 in range(_USER_TWEETS_MAX_PAGES):
+    for page_idx0 in range(max_pages):
         page_idx = page_idx0 + 1
         if time.monotonic() > deadline:
             break_reason = f'time_budget({_PAGINATION_BUDGET_S}s)'
             break
 
-        params: dict = {'userName': target}
+        params: dict = {'userName': target, **extra_params}
         if sent_cursor:
             params['cursor'] = sent_cursor
 
-        data = await _api_get('/twitter/user/last_tweets', params, timeout=30.0)
+        data = await _api_get(endpoint, params, timeout=30.0)
         if data is None:
             break_reason = 'api_error_first_page' if pages == 0 else 'api_error_midstream'
             break
@@ -537,6 +675,13 @@ async def _fetch_user_recent_tweets(username: str) -> list:
         if tweets:
             _log_first_tweet_keys_once(tweets[0])
 
+        # Count reply / retweet tweets in this page (cumulative on all_tweets).
+        for tw in tweets:
+            if _is_reply_tweet(tw):
+                replies_seen += 1
+            if _is_retweet_tweet(tw):
+                retweets_seen += 1
+
         all_tweets.extend(tweets)
 
         raw_has_next = data.get('has_next_page')
@@ -550,8 +695,9 @@ async def _fetch_user_recent_tweets(username: str) -> list:
         )
 
         print(
-            f'[twitter] user_tweets p{page_idx} @{target}: '
+            f'[twitter] user_tweets p{page_idx} @{target} via {endpoint}: '
             f'got={len(tweets)} total={len(all_tweets)} '
+            f'replies_so_far={replies_seen} retweets_so_far={retweets_seen} '
             f'path={extract_path!r} '
             f'has_next_raw={raw_has_next!r} has_next_parsed={parsed_has_next} '
             f'next_cursor={_cursor_preview(new_cursor)} src={cursor_src!r} '
@@ -594,12 +740,13 @@ async def _fetch_user_recent_tweets(username: str) -> list:
         sent_cursor = new_cursor
 
     elapsed = time.monotonic() - started_at
-    print(f'[twitter] user_tweets done @{target}: '
+    print(f'[twitter] user_tweets done @{target} via {endpoint}: '
           f'tweets={len(all_tweets)} pages={pages} '
+          f'replies_in_timeline={replies_seen} retweets_in_timeline={retweets_seen} '
           f'reason={break_reason} {elapsed:.1f}s')
 
     async with _user_tweets_lock:
-        _user_tweets_cache[target] = (time.monotonic(), all_tweets)
+        _user_tweets_cache[cache_key] = (time.monotonic(), all_tweets)
         # Opportunistic prune so the cache never grows without bound under
         # heavy churn — drop entries older than 2× TTL.
         if len(_user_tweets_cache) > 256:
@@ -676,74 +823,128 @@ async def _api_get(path: str, params: dict, timeout: float = 30.0) -> Optional[d
 async def check_comment(tweet_id: str, target_username: str) -> dict:
     """Verify @target_username replied to tweet_id.
 
-    Primary strategy: USER-SIDE — fetch the user's recent tweets ONCE (cached
-    across the finalize batch) and check whether any of them is a reply
-    whose in-reply-to id equals tweet_id. This is independent of how popular
-    the target tweet is and unaffected by /twitter/tweet/replies returning
-    intermittent zeros.
+    Order: TWEET-SIDE FIRST, USER-SIDE FALLBACK (only if a working
+    replies-bearing user endpoint exists). Production proved
+    /twitter/user/last_tweets EXCLUDES replies — scanning 239 tweets for a
+    reply via that endpoint found nothing while tweet-side hit on page 1 in
+    1 second. So the cheap and reliable path is tweet-side first; user-side
+    is only worth running when tweet-side returns 0 replies AND a probe has
+    discovered an endpoint that does carry user replies.
 
-    Secondary fallback: TWEET-SIDE — paginate /twitter/tweet/replies as
-    before. Kept so a true reply that fell outside the user's recent-tweets
-    window can still be caught when the replies endpoint is healthy.
-
-    Hybrid result rules (no regression vs the old behavior):
-      user_side True                                              -> True
-      user_side False (any depth) + tweet_side True               -> True
-      user_side False (≥ N scanned) + tweet_side False            -> False
-      user_side False (≥ N scanned) + tweet_side None             -> False  (trust user-side)
-      user_side False (< N scanned) + tweet_side False            -> False
-      user_side False (< N scanned) + tweet_side None             -> None
-      user_side fetched 0 tweets    + tweet_side <any>            -> whatever tweet_side said
+    Result rules (signature unchanged: dict with 'verified' and 'reason'):
+      tweet_side True                                                   -> True
+      tweet_side False, scanned ≥ _TWEETSIDE_CONFIDENT_FALSE_MIN        -> False (no fallback — trust)
+      tweet_side False/None, scanned < confident_min, replies endpoint AVAILABLE:
+          probe_match  True                                              -> True
+          probe_match  False                                              -> False
+      tweet_side False/None, scanned < confident_min, NO replies endpoint:
+          tweet_side False                                                -> False (best we have)
+          tweet_side None                                                 -> None  (inconclusive)
     """
-    print(f'[twitter] check_comment: tweet={tweet_id} target={target_username}')
+    print(f'[twitter] check_comment: tweet={tweet_id} target={target_username} '
+          f'order=tweetside_first')
     target = normalize_username(target_username)
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
     target_id_s = _id_str(tweet_id)
 
-    # ── PRIMARY: user-side ───────────────────────────────────────────────────
-    user_tweets = await _fetch_user_recent_tweets(target)
-    us_count    = len(user_tweets)
-    if us_count:
-        for tw in user_tweets:
-            if _tweet_replies_to(tw, target_id_s):
-                reply_id = _id_str(tw.get('id') or tw.get('id_str'))
-                print(f'[twitter] check_comment: USERSIDE MATCH @{target} '
-                      f'replied to {target_id_s} (reply_tweet={reply_id}, '
-                      f'scanned={us_count})')
-                return {'verified': True, 'reason': 'found_comment_userside'}
-        print(f'[twitter] check_comment: userside no match in {us_count} tweets '
-              f'@{target} — running tweet-side fallback')
-    else:
-        print(f'[twitter] check_comment: userside returned 0 tweets @{target} '
-              f'— running tweet-side fallback')
-
-    # ── SECONDARY: tweet-side replies scan (legacy behavior, kept verbatim) ──
-    ts_result   = await _check_comment_tweetside(tweet_id, target)
-    ts_verified = ts_result.get('verified')
+    # ── PRIMARY: tweet-side replies scan ─────────────────────────────────────
+    ts = await _check_comment_tweetside(tweet_id, target)
+    ts_verified = ts.get('verified')
+    ts_seen     = int(ts.get('seen')      or 0)
+    ts_pages    = int(ts.get('pages')     or 0)
+    ts_calls    = int(ts.get('api_calls') or ts_pages)
 
     if ts_verified is True:
+        print(f'[twitter] check_comment: matched_side=tweet_side '
+              f'tweetside_seen={ts_seen} pages={ts_pages} api_calls={ts_calls}')
         return {'verified': True, 'reason': 'found_comment_tweetside'}
 
-    confident_userside_no = us_count >= _USERSIDE_CONFIDENT_FALSE_MIN
+    # Tweet-side ran healthy (lots of replies seen) AND user wasn't there.
+    # Trust the False — the user genuinely did not reply from this handle.
+    # No user-side fallback in this branch: it would cost ~12 API calls and
+    # ~20 seconds for nothing on every legitimate "didn't comment" case.
+    if ts_verified is False and ts_seen >= _TWEETSIDE_CONFIDENT_FALSE_MIN:
+        print(f'[twitter] check_comment: matched_side=none '
+              f'tweetside_seen={ts_seen} (confident no-match — '
+              f'skipping userside fallback) api_calls={ts_calls}')
+        return {'verified': False,
+                'reason': f'no_comment_tweetside({ts_seen}_replies_scanned)'}
 
-    if ts_verified is False:
-        reason = ('no_comment_found_both_sides' if us_count
-                  else 'no_comment_found_tweetside_only')
-        return {'verified': False, 'reason': reason}
+    # Tweet-side returned 0 / very-few replies or hit an api_error. This is
+    # the "broken /tweet/replies endpoint" signature. Try user-side IFF a
+    # replies-bearing endpoint can be found.
+    print(f'[twitter] check_comment: tweetside={ts_verified} seen={ts_seen} '
+          f'pages={ts_pages} — running probe + userside fallback')
 
-    # ts_verified is None
-    if confident_userside_no:
-        return {
-            'verified': False,
-            'reason':  f'no_comment_userside({us_count}_scanned)_tweetside_inconclusive',
-        }
-    if us_count:
-        return {
-            'verified': None,
-            'reason':  f'userside_shallow({us_count})_tweetside_inconclusive',
-        }
-    return {'verified': None, 'reason': 'both_sides_inconclusive'}
+    fallback = await _comment_userside_fallback(target, target_id_s)
+    fb_match    = fallback.get('matched', False)
+    fb_scanned  = int(fallback.get('scanned')   or 0)
+    fb_endpoint = fallback.get('endpoint')
+    fb_calls    = int(fallback.get('api_calls') or 0)
+
+    total_calls = ts_calls + fb_calls
+
+    if fb_match:
+        print(f'[twitter] check_comment: matched_side=user_side via {fb_endpoint!r} '
+              f'tweetside_seen={ts_seen} userside_scanned={fb_scanned} '
+              f'api_calls={total_calls}')
+        return {'verified': True,
+                'reason': f'found_comment_userside_via_{fb_endpoint or "unknown"}'}
+
+    if fb_endpoint is None:
+        # No replies endpoint available. We're back to whatever tweet-side
+        # said. If it said False (even with 0 replies seen), surface that;
+        # if it said None (api_error), surface inconclusive.
+        if ts_verified is False:
+            print(f'[twitter] check_comment: matched_side=none '
+                  f'tweetside_seen={ts_seen} userside=unavailable api_calls={total_calls}')
+            return {'verified': False,
+                    'reason': f'no_comment_tweetside_only(seen={ts_seen})_no_userside_endpoint'}
+        print(f'[twitter] check_comment: matched_side=none '
+              f'tweetside=inconclusive userside=unavailable api_calls={total_calls}')
+        return {'verified': None,
+                'reason': 'tweetside_inconclusive_no_userside_endpoint'}
+
+    # Replies endpoint exists, user-side ran, no match.
+    confident_userside_no = fb_scanned >= _USERSIDE_CONFIDENT_FALSE_MIN
+    if confident_userside_no or ts_verified is False:
+        print(f'[twitter] check_comment: matched_side=none '
+              f'tweetside_seen={ts_seen} userside_scanned={fb_scanned} '
+              f'api_calls={total_calls}')
+        return {'verified': False,
+                'reason': f'no_comment_both_sides(ts={ts_seen},us={fb_scanned})'}
+    print(f'[twitter] check_comment: matched_side=none '
+          f'tweetside_seen={ts_seen} userside_scanned={fb_scanned} '
+          f'(both shallow) api_calls={total_calls}')
+    return {'verified': None,
+            'reason': f'both_sides_shallow(ts={ts_seen},us={fb_scanned})'}
+
+
+async def _comment_userside_fallback(target: str, target_id_s: str) -> dict:
+    """Probe (once per process) for a replies-bearing user endpoint and, if
+    one exists, scan the target's recent tweets via that endpoint for a
+    reply to target_id. Returns {'matched', 'endpoint', 'scanned', 'api_calls'}.
+    'endpoint' is None when no candidate returned replies."""
+    probe = await _probe_replies_endpoint(target)
+    if probe is None:
+        # The probe itself may have made up to len(candidates) calls.
+        # We don't track them here precisely; the probe logs each.
+        return {'matched': False, 'endpoint': None, 'scanned': 0, 'api_calls': 0}
+
+    tweets = await _fetch_user_recent_tweets(
+        target,
+        endpoint=probe['path'],
+        extra_params=probe['extra_params'],
+        max_pages=_USER_TWEETS_MAX_PAGES,
+    )
+    scanned = len(tweets)
+    for tw in tweets:
+        if _tweet_replies_to(tw, target_id_s):
+            return {'matched': True, 'endpoint': probe['name'],
+                    'scanned': scanned, 'api_calls': scanned // 20 + 1}
+    return {'matched': False, 'endpoint': probe['name'],
+            'scanned': scanned, 'api_calls': scanned // 20 + 1}
 
 
 async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
@@ -777,7 +978,8 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
         data = await _api_get('/twitter/tweet/replies', params, timeout=30.0)
         if data is None:
             if not api_call_succeeded:
-                return {'verified': None, 'reason': 'api_error'}
+                return {'verified': None, 'reason': 'api_error',
+                        'seen': 0, 'pages': 0, 'api_calls': 1}
             break_reason = 'api_error_midstream'
             break
 
@@ -824,7 +1026,9 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
             if _matches_target(t, target):
                 print(f'[twitter] check_comment tweetside: MATCH for @{target} on page {page_idx} '
                       f'(scanned {seen + len(tweets)} replies)')
-                return {'verified': True, 'reason': 'found_comment'}
+                return {'verified': True, 'reason': 'found_comment',
+                        'seen': seen + len(tweets), 'pages': page_idx,
+                        'api_calls': page_idx}
 
         scanned_usernames.extend(page_handles)
         seen_handles |= page_handle_set
@@ -859,55 +1063,70 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
             f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]} '
             f'total={len(scanned_usernames)} unique={len(seen_handles)}'
         )
-    return {'verified': False, 'reason': 'no_comment_found'}
+    return {'verified': False, 'reason': 'no_comment_found',
+            'seen': seen, 'pages': pages, 'api_calls': pages}
 
 
 async def check_retweet(tweet_id: str, target_username: str) -> dict:
     """Verify @target_username retweeted tweet_id.
 
-    Same hybrid pattern as check_comment: user-side primary (scan the user's
-    recent tweets for a retweet that references tweet_id), with the existing
-    /twitter/tweet/retweeters scan as a secondary fallback. Same combine
-    rules — see check_comment for the result table."""
-    print(f'[twitter] check_retweet: tweet={tweet_id} target={target_username}')
+    Order: USER-SIDE FIRST with a LOW page cap, TWEET-SIDE FALLBACK. Unlike
+    replies, retweets ARE in /twitter/user/last_tweets (the production log
+    confirms: retweeted_tweet.id appears on tweet objects). A recent retweet
+    sits at the top of the timeline, so scanning ~3 pages (~60 tweets)
+    finds it cheaply. If user-side misses, fall back to the slower
+    /twitter/tweet/retweeters scan."""
+    print(f'[twitter] check_retweet: tweet={tweet_id} target={target_username} '
+          f'order=userside_first cap={_USER_TWEETS_RETWEET_MAX_PAGES}')
     target = normalize_username(target_username)
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
     target_id_s = _id_str(tweet_id)
 
-    # ── PRIMARY: user-side ───────────────────────────────────────────────────
-    user_tweets = await _fetch_user_recent_tweets(target)
-    us_count    = len(user_tweets)
+    # ── PRIMARY: user-side (cheap, low cap) ──────────────────────────────────
+    user_tweets = await _fetch_user_recent_tweets(
+        target, max_pages=_USER_TWEETS_RETWEET_MAX_PAGES,
+    )
+    us_count = len(user_tweets)
     if us_count:
         for tw in user_tweets:
             if _tweet_retweets(tw, target_id_s):
                 rt_id = _id_str(tw.get('id') or tw.get('id_str'))
-                print(f'[twitter] check_retweet: USERSIDE MATCH @{target} '
+                print(f'[twitter] check_retweet: matched_side=user_side @{target} '
                       f'retweeted {target_id_s} (rt_tweet={rt_id}, '
-                      f'scanned={us_count})')
+                      f'scanned={us_count}) api_calls≈{us_count // 20 + 1}')
                 return {'verified': True, 'reason': 'found_retweet_userside'}
         print(f'[twitter] check_retweet: userside no match in {us_count} tweets '
-              f'@{target} — running retweeters fallback')
+              f'@{target} — running tweet-side retweeters fallback')
     else:
         print(f'[twitter] check_retweet: userside returned 0 tweets @{target} '
-              f'— running retweeters fallback')
+              f'— running tweet-side retweeters fallback')
 
     # ── SECONDARY: tweet-side retweeters scan ────────────────────────────────
-    ts_result   = await _check_retweet_tweetside(tweet_id, target)
-    ts_verified = ts_result.get('verified')
+    ts = await _check_retweet_tweetside(tweet_id, target)
+    ts_verified = ts.get('verified')
+    ts_seen     = int(ts.get('seen')      or 0)
+    ts_calls    = int(ts.get('api_calls') or ts.get('pages') or 0)
+    total_calls = (us_count // 20 + 1) + ts_calls
 
     if ts_verified is True:
+        print(f'[twitter] check_retweet: matched_side=tweet_side '
+              f'tweetside_seen={ts_seen} api_calls={total_calls}')
         return {'verified': True, 'reason': 'found_retweet_tweetside'}
 
-    confident_userside_no = us_count >= _USERSIDE_CONFIDENT_FALSE_MIN
-
     if ts_verified is False:
+        print(f'[twitter] check_retweet: matched_side=none '
+              f'userside_scanned={us_count} tweetside_seen={ts_seen} '
+              f'api_calls={total_calls}')
         reason = ('no_retweet_found_both_sides' if us_count
                   else 'no_retweet_found_tweetside_only')
         return {'verified': False, 'reason': reason}
 
     # ts_verified is None
-    if confident_userside_no:
+    if us_count >= _USERSIDE_CONFIDENT_FALSE_MIN:
+        print(f'[twitter] check_retweet: matched_side=none '
+              f'userside_scanned={us_count}(confident) tweetside=inconclusive '
+              f'api_calls={total_calls}')
         return {
             'verified': False,
             'reason':  f'no_retweet_userside({us_count}_scanned)_tweetside_inconclusive',
@@ -951,7 +1170,8 @@ async def _check_retweet_tweetside(tweet_id: str, target: str) -> dict:
         data = await _api_get('/twitter/tweet/retweeters', params, timeout=30.0)
         if data is None:
             if not api_call_succeeded:
-                return {'verified': None, 'reason': 'api_error'}
+                return {'verified': None, 'reason': 'api_error',
+                        'seen': 0, 'pages': 0, 'api_calls': 1}
             break_reason = 'api_error_midstream'
             break
 
@@ -995,7 +1215,9 @@ async def _check_retweet_tweetside(tweet_id: str, target: str) -> dict:
             if _matches_target(u, target):
                 print(f'[twitter] check_retweet tweetside: MATCH for @{target} on page {page_idx} '
                       f'(scanned {seen + len(users)} retweeters)')
-                return {'verified': True, 'reason': 'found_retweet'}
+                return {'verified': True, 'reason': 'found_retweet',
+                        'seen': seen + len(users), 'pages': page_idx,
+                        'api_calls': page_idx}
 
         scanned_usernames.extend(page_handles)
         seen_handles |= page_handle_set
@@ -1025,7 +1247,8 @@ async def _check_retweet_tweetside(tweet_id: str, target: str) -> dict:
             f'first={scanned_usernames[:5]} last={scanned_usernames[-5:]} '
             f'total={len(scanned_usernames)} unique={len(seen_handles)}'
         )
-    return {'verified': False, 'reason': 'no_retweet_found'}
+    return {'verified': False, 'reason': 'no_retweet_found',
+            'seen': seen, 'pages': pages, 'api_calls': pages}
 
 
 async def lookup_twitter_user_by_login(username: str) -> Optional[dict]:
