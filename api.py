@@ -3613,6 +3613,29 @@ _RADAR_TZ_OFFSET_RANGE      = (-12 * 60, 14 * 60)  # minutes; UTC-12 .. UTC+14
 _RADAR_MANUAL_DIGEST_DAILY_CAP = 5         # per guild, per UTC day
 _RADAR_MANUAL_DIGEST_COOLDOWN_S = 300.0    # 5 minutes between manual sends
 
+# Digest template input bounds (FIX 5 round 2).
+_RADAR_DIGEST_TITLE_MAX   = 256
+_RADAR_DIGEST_INTRO_MAX   = 1000
+_RADAR_DIGEST_FOOTER_MAX  = 2048
+_RADAR_DIGEST_THUMB_MODES = {'brand', 'first_coin', 'off'}
+_RADAR_DIGEST_COLOR_RE    = _gw_re.compile(r'^#?[0-9a-fA-F]{6}$')
+
+
+def _radar_normalize_hex_color(s: str) -> str:
+    """Return canonical '#RRGGBB' lowercase or '' for empty. 400s on
+    anything that looks set but isn't valid hex."""
+    if s is None:
+        return ''
+    raw = str(s).strip()
+    if not raw:
+        return ''
+    if not _RADAR_DIGEST_COLOR_RE.match(raw):
+        raise HTTPException(
+            status_code=400,
+            detail='digest_color must be a 6-character hex color (e.g. #C8A84E)',
+        )
+    return '#' + raw.lstrip('#').lower()
+
 
 class _RadarSettingsUpdate(BaseModel):
     timezone_offset:              Optional[int]    = None
@@ -3637,6 +3660,13 @@ class _RadarSettingsUpdate(BaseModel):
     # such; digest.py / alerts.py json.loads on read.
     digest_mention_role_ids:      Optional[object] = None
     alerts_mention_role_ids:      Optional[object] = None
+    # Digest template overrides. Empty string = use the news-y default in
+    # services.radar.digest. Validated below.
+    digest_title:                 Optional[str]    = None
+    digest_intro:                 Optional[str]    = None
+    digest_color:                 Optional[str]    = None   # '#RRGGBB' or 'RRGGBB' or ''
+    digest_footer:                Optional[str]    = None
+    digest_thumbnail_mode:        Optional[str]    = None   # 'brand'|'first_coin'|'off'
 
 
 class _RadarWatchlistCreate(BaseModel):
@@ -3797,6 +3827,44 @@ async def radar_settings_patch(
         updates['alerts_mention_role_ids'] = _normalize_role_id_list(
             payload['alerts_mention_role_ids'], field='alerts_mention_role_ids',
         )
+
+    # Digest template overrides. Empty string is meaningful (= use default),
+    # so we trim but do NOT skip on empty.
+    if 'digest_title' in payload:
+        val = (payload['digest_title'] or '').strip()
+        if len(val) > _RADAR_DIGEST_TITLE_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f'digest_title too long (max {_RADAR_DIGEST_TITLE_MAX})',
+            )
+        updates['digest_title'] = val
+    if 'digest_intro' in payload:
+        val = (payload['digest_intro'] or '').strip()
+        if len(val) > _RADAR_DIGEST_INTRO_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f'digest_intro too long (max {_RADAR_DIGEST_INTRO_MAX})',
+            )
+        updates['digest_intro'] = val
+    if 'digest_color' in payload:
+        updates['digest_color'] = _radar_normalize_hex_color(payload['digest_color'])
+    if 'digest_footer' in payload:
+        val = (payload['digest_footer'] or '').strip()
+        if len(val) > _RADAR_DIGEST_FOOTER_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f'digest_footer too long (max {_RADAR_DIGEST_FOOTER_MAX})',
+            )
+        updates['digest_footer'] = val
+    if 'digest_thumbnail_mode' in payload:
+        val = (payload['digest_thumbnail_mode'] or 'brand').strip().lower()
+        if val not in _RADAR_DIGEST_THUMB_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f'digest_thumbnail_mode must be one of: '
+                       f'{", ".join(sorted(_RADAR_DIGEST_THUMB_MODES))}',
+            )
+        updates['digest_thumbnail_mode'] = val
 
     fresh = db_update_radar_settings(server_id, **updates)
 

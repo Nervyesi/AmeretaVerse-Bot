@@ -137,8 +137,7 @@ def _alert_movement_embed(guild_id: int, snap: dict, change_pct: float) -> disco
         desc_lines.append(f'**24h change:** {ch24:+.2f}%')
     if vol_24h:
         desc_lines.append(f'**24h volume:** ${vol_24h:,.0f}')
-    if snap.get('page_url'):
-        desc_lines.append(f'[Open on CoinGecko]({snap["page_url"]})')
+    # No upstream-source attribution link — brand footer is the only credit.
 
     e = build_branded_embed(
         int(guild_id),
@@ -170,8 +169,7 @@ def _alert_volume_embed(guild_id: int, snap: dict) -> discord.Embed:
     ch24 = snap.get('change_24h_pct')
     if ch24 is not None:
         desc.append(f'**24h change:** {ch24:+.2f}%')
-    if snap.get('page_url'):
-        desc.append(f'[Open on CoinGecko]({snap["page_url"]})')
+    # No upstream-source attribution link.
 
     e = build_branded_embed(
         int(guild_id),

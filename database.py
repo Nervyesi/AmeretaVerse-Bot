@@ -499,6 +499,14 @@ def init_db():
             "ALTER TABLE radar_settings ADD COLUMN manual_digests_used_today INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE radar_settings ADD COLUMN manual_digests_reset_date TEXT",
             "ALTER TABLE radar_settings ADD COLUMN last_manual_digest_at TIMESTAMP",
+            # Digest template (Phase 1 polish round 2). Empty title/intro/color/
+            # footer => use the news-y default in digest.py. Thumbnail mode
+            # picks brand / first-coin / off. Idempotent on existing guilds.
+            "ALTER TABLE radar_settings ADD COLUMN digest_title TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE radar_settings ADD COLUMN digest_intro TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE radar_settings ADD COLUMN digest_color TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE radar_settings ADD COLUMN digest_footer TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE radar_settings ADD COLUMN digest_thumbnail_mode TEXT NOT NULL DEFAULT 'brand'",
             # bot profile columns
             "ALTER TABLE guild_settings ADD COLUMN bot_display_name TEXT",
             "ALTER TABLE guild_settings ADD COLUMN bot_avatar_url TEXT",
@@ -1886,6 +1894,8 @@ _RADAR_SETTINGS_EDITABLE = (
     'digest_mention_role_ids', 'alerts_mention_role_ids',
     'manual_digests_used_today', 'manual_digests_reset_date',
     'last_manual_digest_at',
+    'digest_title', 'digest_intro', 'digest_color', 'digest_footer',
+    'digest_thumbnail_mode',
 )
 
 

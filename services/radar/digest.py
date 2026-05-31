@@ -90,19 +90,35 @@ def _format_price(v) -> str:
     return f'${n:.6f}'
 
 
-def _build_digest_embed(guild_id: int, settings: dict) -> Optional[discord.Embed]:
-    """Compose the per-guild crypto digest from cache. Returns None if
-    there's nothing useful to show (empty watchlist AND no top-10 cache)."""
-    top_section: list[dict] = []
-    for cs in CACHE.all_for_kind('crypto'):
-        snap = cs.snapshot
-        rank = snap.get('rank')
-        if rank is None:
-            continue
-        top_section.append(snap)
-    top_section.sort(key=lambda s: int(s.get('rank') or 9999))
-    top_section = top_section[:10]
+# News-y defaults — used when the per-guild override field is empty.
+# Pick one Discord-renderable glyph for the title prefix and stick with it
+# (📊 is a standard emoji; Discord renders it natively). Phrasing is
+# market-beat style, not "snapshot" / technical wording.
+DEFAULT_DIGEST_TITLE  = "Today's Market Beat"
+DEFAULT_DIGEST_INTRO  = "Here's how your tracked assets are moving today."
+THUMBNAIL_MODES       = ('brand', 'first_coin', 'off')
 
+
+def _parse_hex_color(s: str) -> Optional[int]:
+    """Accept '#RRGGBB' or 'RRGGBB' (case-insensitive); return int or None."""
+    if not s:
+        return None
+    v = str(s).strip().lstrip('#')
+    if len(v) != 6:
+        return None
+    try:
+        return int(v, 16) & 0xFFFFFF
+    except ValueError:
+        return None
+
+
+def _build_digest_embed(guild_id: int, settings: dict) -> Optional[discord.Embed]:
+    """Compose the per-guild crypto digest from cache.
+
+    Content rule (FIX 2): if the watchlist is non-empty, show ONLY the
+    watchlist tokens — no Top 10. If the watchlist is empty, fall back to
+    the Top 10 leaderboard so the post isn't blank. Returns None when even
+    the fallback has nothing useful (cold cache + empty watchlist)."""
     watchlist_rows = list_radar_watchlist(guild_id, asset_kind='crypto')
     watch_section: list[tuple[dict, dict]] = []
     for row in watchlist_rows:
@@ -111,7 +127,18 @@ def _build_digest_embed(guild_id: int, settings: dict) -> Optional[discord.Embed
         if snap:
             watch_section.append((row, snap))
 
-    if not top_section and not watch_section:
+    fallback_section: list[dict] = []
+    if not watch_section:
+        for cs in CACHE.all_for_kind('crypto'):
+            snap = cs.snapshot
+            rank = snap.get('rank')
+            if rank is None:
+                continue
+            fallback_section.append(snap)
+        fallback_section.sort(key=lambda s: int(s.get('rank') or 9999))
+        fallback_section = fallback_section[:10]
+
+    if not watch_section and not fallback_section:
         return None
 
     tz_offset = int(settings.get('timezone_offset') or 0)
@@ -121,34 +148,50 @@ def _build_digest_embed(guild_id: int, settings: dict) -> Optional[discord.Embed
     mm   = abs(tz_offset) % 60
     tz_label = f'UTC{sign}{hh:02d}:{mm:02d}'
 
-    title = f'📊 Daily Market — {local_now.strftime("%b %d")} ({tz_label})'
+    # Custom title / intro / color / footer / thumbnail-mode overrides.
+    custom_title    = (settings.get('digest_title')  or '').strip()
+    custom_intro    = (settings.get('digest_intro')  or '').strip()
+    custom_color    = _parse_hex_color(settings.get('digest_color') or '')
+    custom_footer   = (settings.get('digest_footer') or '').strip()
+    thumb_mode      = (settings.get('digest_thumbnail_mode') or 'brand').strip().lower()
+    if thumb_mode not in THUMBNAIL_MODES:
+        thumb_mode = 'brand'
+
+    title = f'📊 {custom_title or DEFAULT_DIGEST_TITLE} — {local_now.strftime("%b %d")} ({tz_label})'
+    intro = (custom_intro or DEFAULT_DIGEST_INTRO)
 
     e = build_branded_embed(
         int(guild_id),
         title=title,
-        description='Crypto snapshot from your Radar configuration.',
+        description=intro,
         cog_prefix='',
-        use_thumbnail=True,
+        use_thumbnail=(thumb_mode == 'brand'),  # brand thumbnail only when asked
         use_image=False,
-        use_footer=True,
+        use_footer=not bool(custom_footer),     # brand footer only when no custom
     )
 
-    if top_section:
-        lines: list[str] = []
-        for snap in top_section:
-            sym  = (snap.get('symbol_display') or snap.get('identifier') or '').upper()
-            price = _format_price(snap.get('price_usd'))
-            ch24  = _format_pct(snap.get('change_24h_pct'))
-            lines.append(f'`{sym:<6}` {price:<13} {ch24}')
-        e.add_field(
-            name=f'Crypto Top {len(top_section)}',
-            value='\n'.join(lines)[:1024],
-            inline=False,
-        )
+    if custom_color is not None:
+        e.color = discord.Color(custom_color)
 
+    if thumb_mode == 'first_coin':
+        first_img = ''
+        if watch_section:
+            first_img = (watch_section[0][1].get('image_url') or '').strip()
+        elif fallback_section:
+            first_img = (fallback_section[0].get('image_url') or '').strip()
+        if first_img:
+            e.set_thumbnail(url=first_img)
+    elif thumb_mode == 'off':
+        # build_branded_embed didn't set a thumbnail because use_thumbnail=False
+        pass
+
+    if custom_footer:
+        e.set_footer(text=custom_footer[:2048])
+
+    # ── List body ───────────────────────────────────────────────────────
     if watch_section:
-        lines = []
-        for row, snap in watch_section[:20]:
+        lines: list[str] = []
+        for row, snap in watch_section[:25]:
             sym  = (snap.get('symbol_display') or row.get('display_name')
                     or row.get('asset_identifier') or '').upper()
             price = _format_price(snap.get('price_usd'))
@@ -156,6 +199,19 @@ def _build_digest_embed(guild_id: int, settings: dict) -> Optional[discord.Embed
             lines.append(f'`{sym:<8}` {price:<13} {ch24}')
         e.add_field(
             name='Your Watchlist',
+            value='\n'.join(lines)[:1024],
+            inline=False,
+        )
+    else:
+        # Fallback only — guilds with no watchlist still get something useful.
+        lines = []
+        for snap in fallback_section:
+            sym  = (snap.get('symbol_display') or snap.get('identifier') or '').upper()
+            price = _format_price(snap.get('price_usd'))
+            ch24  = _format_pct(snap.get('change_24h_pct'))
+            lines.append(f'`{sym:<6}` {price:<13} {ch24}')
+        e.add_field(
+            name=f'Top {len(fallback_section)} by Market Cap',
             value='\n'.join(lines)[:1024],
             inline=False,
         )

@@ -79,8 +79,7 @@ def build_price_embed(guild_id: int, snap: dict) -> discord.Embed:
     rank = snap.get('rank')
     if rank:
         desc.append(f'**Rank:** #{rank}')
-    if snap.get('page_url'):
-        desc.append(f'\n[Open on CoinGecko]({snap["page_url"]})')
+    # No upstream-source attribution link — brand footer is the only credit.
 
     e = build_branded_embed(
         int(guild_id),
