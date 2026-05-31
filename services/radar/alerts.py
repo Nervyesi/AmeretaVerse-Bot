@@ -77,6 +77,18 @@ def _change_1h_pct(snap: dict, kind: str, identifier: str) -> Optional[float]:
         except (TypeError, ValueError):
             pass
 
+    # Forex is daily-cadence (Frankfurter) so a "1h" change is never
+    # meaningful — fall back to the 24h delta directly so movement alerts
+    # still work on currency pairs.
+    if kind == 'forex':
+        v24 = snap.get('change_24h_pct')
+        if v24 is not None:
+            try:
+                return float(v24)
+            except (TypeError, ValueError):
+                pass
+        return None
+
     older = CACHE.snapshot_about(kind, identifier, _HISTORY_LOOKBACK_S)
     if not older:
         return None
@@ -273,7 +285,7 @@ async def dispatch_alerts(bot) -> dict:
         alert_mentions = _parse_role_id_list(settings.get('alerts_mention_role_ids'))
 
         try:
-            watchlist = list_radar_watchlist(gid, asset_kind='crypto')
+            watchlist = list_radar_watchlist(gid)   # all kinds
         except Exception as e:  # noqa: BLE001
             print(f'[radar/alerts] watchlist read failed g={gid}: '
                   f'{type(e).__name__}: {e}')
@@ -281,15 +293,18 @@ async def dispatch_alerts(bot) -> dict:
 
         sent = 0
         for row in watchlist:
+            kind = (row.get('asset_kind') or '').lower()
             identifier = (row.get('asset_identifier') or '').lower()
-            if not identifier:
+            # Only kinds with a live snapshot ever produce alerts. Stocks
+            # has no adapter yet; forex skips volume spikes.
+            if not identifier or kind not in ('crypto', 'nft', 'meme', 'forex'):
                 continue
-            snap = CACHE.get_snapshot('crypto', identifier)
+            snap = CACHE.get_snapshot(kind, identifier)
             if not snap:
                 continue
 
-            # Movement
-            ch1h = _change_1h_pct(snap, 'crypto', identifier)
+            # Movement (1h preferred; forex falls back to 24h via _change_1h_pct)
+            ch1h = _change_1h_pct(snap, kind, identifier)
             if ch1h is not None and move_thr > 0:
                 if ch1h >= move_thr:
                     if not _cooled_down(gid, identifier, 'movement_up', _COOLDOWN_MOVEMENT_S):
@@ -297,7 +312,7 @@ async def dispatch_alerts(bot) -> dict:
                         if await _send_alert(bot, gid, int(ch_id), embed,
                                              mention_role_ids=alert_mentions):
                             record_radar_alert(
-                                gid, 'crypto', identifier, 'movement_up',
+                                gid, kind, identifier, 'movement_up',
                                 {'change_1h_pct': ch1h,
                                  'price_usd':     snap.get('price_usd'),
                                  'volume_24h_usd': snap.get('volume_24h_usd')},
@@ -309,21 +324,23 @@ async def dispatch_alerts(bot) -> dict:
                         if await _send_alert(bot, gid, int(ch_id), embed,
                                              mention_role_ids=alert_mentions):
                             record_radar_alert(
-                                gid, 'crypto', identifier, 'movement_down',
+                                gid, kind, identifier, 'movement_down',
                                 {'change_1h_pct': ch1h,
                                  'price_usd':     snap.get('price_usd'),
                                  'volume_24h_usd': snap.get('volume_24h_usd')},
                             )
                             sent += 1
 
-            # Volume spike
-            if vol_mul > 1.0 and _volume_spike(snap, 'crypto', identifier, vol_mul):
+            # Volume spike — skipped for forex (no liquidity metric).
+            if kind == 'forex':
+                continue
+            if vol_mul > 1.0 and _volume_spike(snap, kind, identifier, vol_mul):
                 if not _cooled_down(gid, identifier, 'volume_spike', _COOLDOWN_VOLUME_S):
                     embed = _alert_volume_embed(gid, snap)
                     if await _send_alert(bot, gid, int(ch_id), embed,
                                          mention_role_ids=alert_mentions):
                         record_radar_alert(
-                            gid, 'crypto', identifier, 'volume_spike',
+                            gid, kind, identifier, 'volume_spike',
                             {'volume_24h_usd': snap.get('volume_24h_usd'),
                              'price_usd':      snap.get('price_usd')},
                         )

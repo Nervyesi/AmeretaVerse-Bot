@@ -3600,8 +3600,8 @@ async def giveaways_entries(
 # fetcher / alerts / digest loops run elsewhere; this file just exposes
 # config and reads from the cache.
 
-_RADAR_SUPPORTED_KINDS  = ('crypto',)             # phase-1 only
-_RADAR_FUTURE_KINDS     = ('nft', 'meme', 'forex', 'stocks')
+_RADAR_SUPPORTED_KINDS  = ('crypto', 'nft', 'meme', 'forex')  # phase-2 live
+_RADAR_FUTURE_KINDS     = ('stocks',)
 _RADAR_ALL_KINDS        = _RADAR_SUPPORTED_KINDS + _RADAR_FUTURE_KINDS
 
 # Threshold bounds — protect users from setting absurd values that would
@@ -3618,6 +3618,7 @@ _RADAR_DIGEST_TITLE_MAX   = 256
 _RADAR_DIGEST_INTRO_MAX   = 1000
 _RADAR_DIGEST_FOOTER_MAX  = 2048
 _RADAR_DIGEST_THUMB_MODES = {'brand', 'first_coin', 'off'}
+_RADAR_DIGEST_DATE_MODES  = {'off', 'date_only', 'date_tz'}
 _RADAR_DIGEST_COLOR_RE    = _gw_re.compile(r'^#?[0-9a-fA-F]{6}$')
 
 
@@ -3667,6 +3668,7 @@ class _RadarSettingsUpdate(BaseModel):
     digest_color:                 Optional[str]    = None   # '#RRGGBB' or 'RRGGBB' or ''
     digest_footer:                Optional[str]    = None
     digest_thumbnail_mode:        Optional[str]    = None   # 'brand'|'first_coin'|'off'
+    digest_date_mode:             Optional[str]    = None   # 'off'|'date_only'|'date_tz'
 
 
 class _RadarWatchlistCreate(BaseModel):
@@ -3708,9 +3710,11 @@ def _radar_hhmm(s: str) -> str:
         )
 
 
-def _radar_channel(value, *, field: str) -> int | None:
+def _radar_channel(value, *, field: str) -> str | None:
     """Coerce an optional channel id. Empty/None → None. Otherwise must be
-    a numeric Discord snowflake."""
+    a 17-20 digit numeric Discord snowflake. Returns a STRING so it
+    survives the JS Number.MAX_SAFE_INTEGER round-trip without precision
+    loss — the dashboard sends strings and reads strings."""
     if value is None or value == '':
         return None
     s = str(value).strip()
@@ -3719,7 +3723,7 @@ def _radar_channel(value, *, field: str) -> int | None:
     if not s.isdigit() or not (17 <= len(s) <= 20):
         raise HTTPException(status_code=400,
             detail=f'{field} must be a numeric Discord channel id')
-    return int(s)
+    return s
 
 
 def _radar_mask_settings(s: dict) -> dict:
@@ -3741,6 +3745,16 @@ def _radar_mask_settings(s: dict) -> dict:
         except (TypeError, ValueError):
             arr = []
         out[col] = [str(v).strip() for v in arr if str(v).strip()]
+
+    # Channel-id columns: ALWAYS string on the wire. JS Number.MAX_SAFE_INTEGER
+    # silently truncates 17-19 digit Discord snowflakes; stringifying here
+    # protects every legacy row that was stored as INTEGER.
+    for col in ('daily_channel_crypto', 'daily_channel_nft',
+                'daily_channel_meme', 'daily_channel_forex',
+                'daily_channel_stocks', 'alerts_channel',
+                'liquidation_channel'):
+        v = out.get(col)
+        out[col] = str(v) if (v is not None and v != '') else None
 
     # Manual-digest quota: show remaining alongside used so the dashboard
     # doesn't need to compute it. Quota resets on UTC date change.
@@ -3865,6 +3879,15 @@ async def radar_settings_patch(
                        f'{", ".join(sorted(_RADAR_DIGEST_THUMB_MODES))}',
             )
         updates['digest_thumbnail_mode'] = val
+    if 'digest_date_mode' in payload:
+        val = (payload['digest_date_mode'] or 'date_tz').strip().lower()
+        if val not in _RADAR_DIGEST_DATE_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f'digest_date_mode must be one of: '
+                       f'{", ".join(sorted(_RADAR_DIGEST_DATE_MODES))}',
+            )
+        updates['digest_date_mode'] = val
 
     fresh = db_update_radar_settings(server_id, **updates)
 
@@ -3925,29 +3948,31 @@ async def radar_watchlist_add(
     rate_limit(f'radar_watchlist:{server_id}', 30, 60.0)
 
     kind  = (body.asset_kind or '').strip().lower()
-    ident = (body.asset_identifier or '').strip().lower()
+    # Crypto / nft slugs get lower-cased; forex pairs stay upper-cased
+    # (BASE/QUOTE). Memecoin identifiers keep their chain prefix lower and
+    # the address case-sensitive (Solana addresses are base58 with mixed case).
+    raw_ident = (body.asset_identifier or '').strip()
+    if not raw_ident:
+        raise HTTPException(status_code=400, detail='asset_identifier is required')
     if kind not in _RADAR_ALL_KINDS:
         raise HTTPException(status_code=400, detail=f'unknown asset_kind: {kind}')
-    if not ident:
-        raise HTTPException(status_code=400, detail='asset_identifier is required')
-
-    if kind in _RADAR_FUTURE_KINDS:
-        # Phase 1: reject non-crypto additions with a clear message. The
-        # schema accepts them, but only crypto data is live, so misleading
-        # the admin with a silent "saved" would be a mistake.
+    if kind == 'liquidation':
+        raise HTTPException(status_code=400, detail='Not a watchlist kind.')
+    if kind == 'stocks':
         raise HTTPException(
             status_code=400,
-            detail=(f'{kind} watchlist support ships in a later phase. '
-                    'Only crypto entries are accepted right now.'),
+            detail='Stocks ship in a later phase.',
         )
 
+    ident = raw_ident.lower() if kind in ('crypto', 'nft') else raw_ident
     display_name = (body.display_name or '').strip() or ident
 
-    # Resolve crypto via CoinGecko so we store the canonical id, not a typo.
+    from services.radar.adapters import ADAPTERS_BY_KIND
+    from services.radar.cache    import CACHE as _RADAR_CACHE
+
     if kind == 'crypto':
+        # Resolve CoinGecko id; fall back to search → first result.
         try:
-            from services.radar.adapters import ADAPTERS_BY_KIND
-            from services.radar.cache    import CACHE as _RADAR_CACHE
             adapter = ADAPTERS_BY_KIND.get('crypto')
             snap = None
             if adapter:
@@ -3959,12 +3984,123 @@ async def radar_watchlist_add(
                         snap = await adapter.fetch_one(ident)
             if snap:
                 _RADAR_CACHE.put('crypto', snap['identifier'], snap)
-                if display_name == body.asset_identifier or display_name == ident:
+                if display_name == raw_ident.lower() or display_name == ident:
                     display_name = (snap.get('symbol_display')
                                     or snap.get('raw', {}).get('name')
                                     or ident).upper()
         except Exception as e:  # noqa: BLE001
-            print(f'[radar/api] resolve failed for {ident}: {type(e).__name__}: {e}')
+            print(f'[radar/api] resolve crypto failed for {ident}: '
+                  f'{type(e).__name__}: {e}')
+
+    elif kind == 'nft':
+        adapter = ADAPTERS_BY_KIND.get('nft')
+        if adapter is None or getattr(adapter, 'disabled_reason', None):
+            raise HTTPException(
+                status_code=503,
+                detail=getattr(adapter, 'disabled_reason', None)
+                       or 'NFT adapter not configured.',
+            )
+        try:
+            snap = await adapter.fetch_one(ident)
+            if snap is None:
+                # Last-chance: search for the slug; first match wins.
+                sugg = await adapter.search(ident, limit=1)
+                if sugg:
+                    ident = (sugg[0].get('identifier') or ident).lower()
+                    snap = await adapter.fetch_one(ident)
+            if snap is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f'NFT collection not found: {raw_ident}',
+                )
+            _RADAR_CACHE.put('nft', snap['identifier'], snap)
+            if display_name == raw_ident.lower() or display_name == ident:
+                display_name = (snap.get('symbol_display') or ident)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] resolve nft failed: {type(e).__name__}: {e}')
+            raise HTTPException(status_code=503,
+                detail='NFT lookup unavailable. Try again shortly.')
+
+    elif kind == 'meme':
+        # Accept either 'chain:address' or a dexscreener URL via the
+        # adapter's parse_meme_input helper.
+        from services.radar.adapters.dexscreener import (
+            parse_meme_input, address_looks_valid, SUPPORTED_CHAINS,
+        )
+        parsed = parse_meme_input(raw_ident)
+        if not parsed:
+            raise HTTPException(
+                status_code=400,
+                detail='Memecoin identifier must be "chain:address" or a '
+                       'dexscreener.com URL.',
+            )
+        chain, address = parsed
+        if chain not in SUPPORTED_CHAINS:
+            raise HTTPException(
+                status_code=400,
+                detail=f'Chain "{chain}" is not supported. Use one of: '
+                       f'{", ".join(SUPPORTED_CHAINS)}.',
+            )
+        if not address_looks_valid(chain, address):
+            raise HTTPException(
+                status_code=400,
+                detail=f'Address does not look valid for chain "{chain}".',
+            )
+        adapter = ADAPTERS_BY_KIND.get('meme')
+        try:
+            snap = await adapter.fetch_one(f'{chain}:{address}')
+            if snap is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail='No active DEX pair found for that address.',
+                )
+            ident = snap['identifier']
+            _RADAR_CACHE.put('meme', ident, snap)
+            if display_name == raw_ident or display_name == ident:
+                display_name = (snap.get('symbol_display')
+                                or snap.get('raw', {}).get('name')
+                                or address[:8])
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] resolve meme failed: {type(e).__name__}: {e}')
+            raise HTTPException(status_code=503,
+                detail='Memecoin lookup unavailable. Try again shortly.')
+
+    elif kind == 'forex':
+        from services.radar.adapters.frankfurter import split_pair
+        parsed = split_pair(raw_ident)
+        if not parsed:
+            raise HTTPException(
+                status_code=400,
+                detail='Forex identifier must be "BASE/QUOTE" with two 3-letter codes.',
+            )
+        base, quote = parsed
+        if base == quote:
+            raise HTTPException(status_code=400,
+                detail='Base and quote currencies must differ.')
+        adapter = ADAPTERS_BY_KIND.get('forex')
+        try:
+            currencies = await adapter.currencies()
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] forex currencies failed: {type(e).__name__}: {e}')
+            currencies = {}
+        if currencies and (base not in currencies or quote not in currencies):
+            raise HTTPException(
+                status_code=400,
+                detail=f'Unknown currency code in {base}/{quote}.',
+            )
+        ident = f'{base}/{quote}'
+        try:
+            snap = await adapter.fetch_one(ident)
+            if snap is not None:
+                _RADAR_CACHE.put('forex', ident, snap)
+                if display_name == raw_ident:
+                    display_name = ident
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] forex prefetch failed: {type(e).__name__}: {e}')
 
     try:
         entry_id = db_add_radar_watchlist_entry(
@@ -4015,6 +4151,75 @@ async def radar_watchlist_delete(
     return {'ok': True}
 
 
+@app.post('/api/servers/{server_id}/radar/watchlist/resolve')
+async def radar_watchlist_resolve(
+    server_id: int,
+    body: dict,
+    user: dict = Depends(get_current_user),
+):
+    """Memecoin paste-and-resolve preview. Takes either a chain:address
+    string or a dexscreener.com URL; returns a snapshot preview so the
+    admin can confirm before saving via POST /watchlist."""
+    require_module_access(user, server_id, 'radar')
+    rate_limit(f'radar_resolve:{server_id}', 30, 60.0)
+
+    kind = (body.get('kind') or 'meme').strip().lower()
+    if kind != 'meme':
+        raise HTTPException(
+            status_code=400,
+            detail='resolve currently only supports kind=meme',
+        )
+    raw = str(body.get('input') or '').strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail='input is required')
+
+    from services.radar.adapters import ADAPTERS_BY_KIND
+    from services.radar.adapters.dexscreener import (
+        parse_meme_input, address_looks_valid, SUPPORTED_CHAINS,
+    )
+    parsed = parse_meme_input(raw)
+    if not parsed:
+        raise HTTPException(
+            status_code=400,
+            detail='Could not parse a chain:address or dexscreener.com URL.',
+        )
+    chain, address = parsed
+    if chain not in SUPPORTED_CHAINS:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Chain "{chain}" is not supported. Use one of: '
+                   f'{", ".join(SUPPORTED_CHAINS)}.',
+        )
+    if not address_looks_valid(chain, address):
+        raise HTTPException(
+            status_code=400,
+            detail=f'Address does not look valid for chain "{chain}".',
+        )
+    adapter = ADAPTERS_BY_KIND.get('meme')
+    try:
+        snap = await adapter.fetch_one(f'{chain}:{address}')
+    except Exception as e:  # noqa: BLE001
+        print(f'[radar/api] resolve meme failed: {type(e).__name__}: {e}')
+        raise HTTPException(status_code=503,
+            detail='Memecoin lookup unavailable. Try again shortly.')
+    if snap is None:
+        raise HTTPException(status_code=404,
+            detail='No active DEX pair found for that address.')
+    return {
+        'kind':              'meme',
+        'identifier':        snap['identifier'],
+        'chain':             chain,
+        'address':           address,
+        'symbol':            snap.get('symbol_display'),
+        'name':              snap.get('raw', {}).get('name'),
+        'price_usd':         snap.get('price_usd'),
+        'change_24h_pct':    snap.get('change_24h_pct'),
+        'volume_24h_usd':    snap.get('volume_24h_usd'),
+        'image_url':         snap.get('image_url'),
+        'page_url':          snap.get('page_url'),
+    }
+
+
 @app.get('/api/servers/{server_id}/radar/search-asset')
 async def radar_search_asset(
     server_id: int,
@@ -4022,24 +4227,59 @@ async def radar_search_asset(
     q: str = '',
     user: dict = Depends(get_current_user),
 ):
-    """Autocomplete for the dashboard add UI. Phase 1: crypto via CoinGecko
-    /search. Other kinds return an empty list with a clear note."""
+    """Autocomplete for the dashboard add UI. Crypto via CoinGecko /search;
+    NFT via Reservoir search; Forex via Frankfurter /currencies (filtered).
+    Memecoin uses paste-and-resolve (see /watchlist/resolve)."""
     require_module_access(user, server_id, 'radar')
     rate_limit(f'radar_search:{server_id}', 30, 60.0)
     kind = (kind or 'crypto').strip().lower()
     query = (q or '').strip()
-    if not query:
-        return {'kind': kind, 'q': '', 'suggestions': [], 'note': None}
+
+    from services.radar.adapters import ADAPTERS_BY_KIND
 
     if kind == 'crypto':
+        if not query:
+            return {'kind': kind, 'q': '', 'suggestions': [], 'note': None}
         try:
-            from services.radar.adapters import ADAPTERS_BY_KIND
             adapter = ADAPTERS_BY_KIND.get('crypto')
             results = await adapter.search(query, limit=10) if adapter else []
         except Exception as e:  # noqa: BLE001
-            print(f'[radar/api] search failed: {type(e).__name__}: {e}')
+            print(f'[radar/api] crypto search failed: {type(e).__name__}: {e}')
             results = []
         return {'kind': kind, 'q': query, 'suggestions': results, 'note': None}
+
+    if kind == 'nft':
+        adapter = ADAPTERS_BY_KIND.get('nft')
+        if adapter is None or getattr(adapter, 'disabled_reason', None):
+            return {'kind': kind, 'q': query, 'suggestions': [],
+                    'note': getattr(adapter, 'disabled_reason', None)
+                            or 'NFT adapter not configured.'}
+        if not query:
+            return {'kind': kind, 'q': '', 'suggestions': [], 'note': None}
+        try:
+            results = await adapter.search(query, limit=8)
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] nft search failed: {type(e).__name__}: {e}')
+            results = []
+        return {'kind': kind, 'q': query, 'suggestions': results, 'note': None}
+
+    if kind == 'forex':
+        adapter = ADAPTERS_BY_KIND.get('forex')
+        if adapter is None:
+            return {'kind': kind, 'q': query, 'suggestions': [],
+                    'note': 'Forex adapter not configured.'}
+        try:
+            results = await adapter.search(query, limit=40)
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] forex search failed: {type(e).__name__}: {e}')
+            results = []
+        return {'kind': kind, 'q': query, 'suggestions': results, 'note': None}
+
+    if kind == 'meme':
+        return {
+            'kind': kind, 'q': query, 'suggestions': [],
+            'note': 'Paste a DEXScreener URL or chain:address and click Resolve.',
+        }
 
     return {
         'kind':        kind,

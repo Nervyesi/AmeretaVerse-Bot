@@ -76,7 +76,10 @@ class RateLimiter:
         }
 
 
-# Singleton + Phase-1 defaults. Other Phase-2 adapters can call
-# LIMITER.configure(...) when they're wired in.
+# Singleton + per-adapter defaults. Buckets are independent — exhausting
+# one source's per-minute does not pause the others.
 LIMITER = RateLimiter()
-LIMITER.configure('coingecko', per_minute=25)
+LIMITER.configure('coingecko',    per_minute=25)
+LIMITER.configure('reservoir',    per_minute=30)
+LIMITER.configure('dexscreener',  per_minute=60)
+LIMITER.configure('frankfurter',  per_minute=30)

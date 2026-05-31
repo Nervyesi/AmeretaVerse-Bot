@@ -21,7 +21,7 @@ import asyncio
 from typing import Iterable
 
 from database import list_all_radar_watchlists
-from .adapters import ADAPTERS_BY_KIND, SUPPORTED_KINDS_PHASE_1
+from .adapters import ADAPTERS_BY_KIND, SUPPORTED_KINDS
 from .cache import CACHE
 
 
@@ -47,26 +47,22 @@ async def fetch_once() -> dict:
     """Single fetcher tick. Returns a small per-kind summary for logging.
 
     Caller wraps this in a loop OR triggers it on demand (the slash
-    commands fall back to triggering a fetch when the cache is cold)."""
+    commands fall back to triggering a fetch when the cache is cold).
+    One kind failing never stops the others — each block is independently
+    guarded by try/except."""
     summary: dict = {}
 
-    # ── crypto via CoinGecko ────────────────────────────────────────────
-    if 'crypto' in SUPPORTED_KINDS_PHASE_1:
-        try:
-            adapter = ADAPTERS_BY_KIND['crypto']
-
-            # Leaderboard (top-100). Counts as one API call.
+    # ── Crypto: leaderboard + watchlist extras ──────────────────────────
+    try:
+        adapter = ADAPTERS_BY_KIND.get('crypto')
+        if adapter is not None:
             try:
                 top = await adapter.fetch_top(per_page=_LEADERBOARD_SIZE)
-            except Exception as e:  # noqa: BLE001 — never let fetcher crash
-                print(f'[radar/fetcher] crypto top fetch failed: {type(e).__name__}: {e}')
+            except Exception as e:  # noqa: BLE001
+                print(f'[radar/fetcher] crypto top failed: {type(e).__name__}: {e}')
                 top = []
             for snap in top:
                 CACHE.put('crypto', snap['identifier'], snap)
-
-            # Per-guild watchlist union. If every requested id is already in
-            # the leaderboard response we just refreshed, we skip the extra
-            # call entirely.
             wanted = _watchlist_union('crypto')
             already = {snap['identifier'] for snap in top}
             extras = sorted(wanted - already)
@@ -74,17 +70,40 @@ async def fetch_once() -> dict:
                 try:
                     rows = await adapter.fetch_batch(extras)
                 except Exception as e:  # noqa: BLE001
-                    print(f'[radar/fetcher] crypto extras fetch failed: '
-                          f'{type(e).__name__}: {e}')
+                    print(f'[radar/fetcher] crypto extras failed: {type(e).__name__}: {e}')
                     rows = []
                 for snap in rows:
                     CACHE.put('crypto', snap['identifier'], snap)
                 summary['crypto_extras'] = len(rows)
-
             summary['crypto_top'] = len(top)
             summary['crypto_wanted'] = len(wanted)
-        except Exception as e:  # noqa: BLE001 — keep loop alive
-            print(f'[radar/fetcher] crypto block crashed: {type(e).__name__}: {e}')
+    except Exception as e:  # noqa: BLE001
+        print(f'[radar/fetcher] crypto block crashed: {type(e).__name__}: {e}')
+
+    # ── NFT, Memecoin, Forex: one batched fetch per registered adapter ──
+    for kind in ('nft', 'meme', 'forex'):
+        try:
+            adapter = ADAPTERS_BY_KIND.get(kind)
+            if adapter is None:
+                continue
+            if getattr(adapter, 'disabled_reason', None):
+                # e.g. Reservoir without RESERVOIR_API_KEY
+                continue
+            wanted = _watchlist_union(kind)
+            if not wanted:
+                summary[f'{kind}_wanted'] = 0
+                continue
+            try:
+                rows = await adapter.fetch_batch(sorted(wanted))
+            except Exception as e:  # noqa: BLE001
+                print(f'[radar/fetcher] {kind} fetch failed: {type(e).__name__}: {e}')
+                rows = []
+            for snap in rows:
+                CACHE.put(kind, snap['identifier'], snap)
+            summary[f'{kind}_wanted'] = len(wanted)
+            summary[f'{kind}_got']    = len(rows)
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/fetcher] {kind} block crashed: {type(e).__name__}: {e}')
 
     return summary
 

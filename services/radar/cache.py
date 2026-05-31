@@ -20,11 +20,11 @@ from typing import Optional
 # Alpha Vantage free tier punishes frequent calls; NFT is cheap to recheck.
 _TTL_DEFAULT = 300.0       # seconds; CoinGecko-friendly default
 TTL_BY_KIND = {
-    'crypto':  300.0,      # 5 min
-    'nft':     300.0,      # 5 min (Phase 2)
-    'meme':    300.0,      # 5 min (Phase 2)
-    'forex':   600.0,      # 10 min (Phase 2)
-    'stocks': 1800.0,      # 30 min (Phase 2; Alpha Vantage free tier is 25/day)
+    'crypto':  300.0,      # 5 min   — CoinGecko
+    'nft':     600.0,      # 10 min  — Reservoir
+    'meme':    300.0,      # 5 min   — DEXScreener
+    'forex':  1800.0,      # 30 min  — Frankfurter (daily-cadence rates)
+    'stocks': 1800.0,      # 30 min  — Alpha Vantage (Phase 4 reservation)
 }
 
 # Per-identifier history length. ~24 samples × 5 min ≈ 2h, which is enough

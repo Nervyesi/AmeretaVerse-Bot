@@ -23,9 +23,13 @@ def common_snapshot(
     image_url:         str | None   = None,
     page_url:          str | None   = None,
     raw:               dict | None  = None,
+    price_display_symbol: str = '$',
 ) -> dict:
     """Constructor for the normalized snapshot. Adapter modules call this
-    so we never accidentally drift on field names."""
+    so we never accidentally drift on field names.
+
+    `price_display_symbol` lets the digest/dashboard format forex (e.g.
+    'USD' or '€') differently from crypto/NFT/meme (all '$')."""
     return {
         'identifier':     str(identifier),
         'kind':           str(kind),
@@ -39,6 +43,7 @@ def common_snapshot(
         'image_url':      image_url,
         'page_url':       page_url,
         'raw':            raw or {},
+        'price_display_symbol': str(price_display_symbol or '$'),
     }
 
 

@@ -507,6 +507,8 @@ def init_db():
             "ALTER TABLE radar_settings ADD COLUMN digest_color TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE radar_settings ADD COLUMN digest_footer TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE radar_settings ADD COLUMN digest_thumbnail_mode TEXT NOT NULL DEFAULT 'brand'",
+            # Date display mode in the digest title. {'off','date_only','date_tz'}.
+            "ALTER TABLE radar_settings ADD COLUMN digest_date_mode TEXT NOT NULL DEFAULT 'date_tz'",
             # bot profile columns
             "ALTER TABLE guild_settings ADD COLUMN bot_display_name TEXT",
             "ALTER TABLE guild_settings ADD COLUMN bot_avatar_url TEXT",
@@ -1895,7 +1897,7 @@ _RADAR_SETTINGS_EDITABLE = (
     'manual_digests_used_today', 'manual_digests_reset_date',
     'last_manual_digest_at',
     'digest_title', 'digest_intro', 'digest_color', 'digest_footer',
-    'digest_thumbnail_mode',
+    'digest_thumbnail_mode', 'digest_date_mode',
 )
 
 

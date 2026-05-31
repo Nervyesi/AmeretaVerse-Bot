@@ -91,12 +91,42 @@ def _format_price(v) -> str:
 
 
 # News-y defaults — used when the per-guild override field is empty.
-# Pick one Discord-renderable glyph for the title prefix and stick with it
-# (📊 is a standard emoji; Discord renders it natively). Phrasing is
-# market-beat style, not "snapshot" / technical wording.
 DEFAULT_DIGEST_TITLE  = "Today's Market Beat"
 DEFAULT_DIGEST_INTRO  = "Here's how your tracked assets are moving today."
 THUMBNAIL_MODES       = ('brand', 'first_coin', 'off')
+DATE_MODES            = ('off', 'date_only', 'date_tz')
+
+# Per-kind section headings in fixed display order.
+_KIND_ORDER  = ('crypto', 'nft', 'meme', 'forex')
+_KIND_LABELS = {
+    'crypto': 'Crypto',
+    'nft':    'NFT',
+    'meme':   'Memecoin',
+    'forex':  'Forex',
+}
+
+
+def _format_snap_price(snap: dict) -> str:
+    """Format a snapshot price using its price_display_symbol (e.g. '$', 'USD',
+    'EUR'). Forex pairs use the quote currency code as their symbol."""
+    p = snap.get('price_usd')
+    if p is None:
+        return '—'
+    try:
+        n = float(p)
+    except (TypeError, ValueError):
+        return '—'
+    sym = snap.get('price_display_symbol') or '$'
+    # Currency-code symbols ('USD', 'EUR') render as a 3-letter suffix;
+    # single-glyph symbols ('$', '€') stay as a prefix.
+    if len(sym) == 1 or sym in ('$', '€', '£', '¥'):
+        if n >= 1000:  return f'{sym}{n:,.2f}'
+        if n >= 1:     return f'{sym}{n:,.4f}'
+        return f'{sym}{n:.6f}'
+    # 3-letter currency code (forex): "1.0934 USD"
+    if n >= 1000:  return f'{n:,.2f} {sym}'
+    if n >= 1:     return f'{n:.4f} {sym}'
+    return f'{n:.6f} {sym}'
 
 
 def _parse_hex_color(s: str) -> Optional[int]:
@@ -112,43 +142,104 @@ def _parse_hex_color(s: str) -> Optional[int]:
         return None
 
 
-def _build_digest_embed(guild_id: int, settings: dict) -> Optional[discord.Embed]:
-    """Compose the per-guild crypto digest from cache.
-
-    Content rule (FIX 2): if the watchlist is non-empty, show ONLY the
-    watchlist tokens — no Top 10. If the watchlist is empty, fall back to
-    the Top 10 leaderboard so the post isn't blank. Returns None when even
-    the fallback has nothing useful (cold cache + empty watchlist)."""
-    watchlist_rows = list_radar_watchlist(guild_id, asset_kind='crypto')
-    watch_section: list[tuple[dict, dict]] = []
-    for row in watchlist_rows:
-        ident = (row.get('asset_identifier') or '').lower()
-        snap  = CACHE.get_snapshot('crypto', ident)
-        if snap:
-            watch_section.append((row, snap))
-
-    fallback_section: list[dict] = []
-    if not watch_section:
-        for cs in CACHE.all_for_kind('crypto'):
-            snap = cs.snapshot
-            rank = snap.get('rank')
-            if rank is None:
-                continue
-            fallback_section.append(snap)
-        fallback_section.sort(key=lambda s: int(s.get('rank') or 9999))
-        fallback_section = fallback_section[:10]
-
-    if not watch_section and not fallback_section:
-        return None
-
+def _format_date_suffix(settings: dict) -> str:
+    """Return the title's date/timezone suffix or '' depending on the
+    per-guild digest_date_mode setting."""
+    mode = (settings.get('digest_date_mode') or 'date_tz').strip().lower()
+    if mode not in DATE_MODES:
+        mode = 'date_tz'
+    if mode == 'off':
+        return ''
     tz_offset = int(settings.get('timezone_offset') or 0)
     local_now = _local_now(tz_offset)
+    date_label = local_now.strftime('%b %d')
+    if mode == 'date_only':
+        return f' — {date_label}'
     sign = '+' if tz_offset >= 0 else '-'
     hh   = abs(tz_offset) // 60
     mm   = abs(tz_offset) % 60
     tz_label = f'UTC{sign}{hh:02d}:{mm:02d}'
+    return f' — {date_label} ({tz_label})'
 
-    # Custom title / intro / color / footer / thumbnail-mode overrides.
+
+def _section_lines_watchlist(rows_snaps: list[tuple[dict, dict]]) -> list[str]:
+    out: list[str] = []
+    for row, snap in rows_snaps[:25]:
+        sym = (snap.get('symbol_display') or row.get('display_name')
+               or row.get('asset_identifier') or '').upper()
+        price = _format_snap_price(snap)
+        ch24  = _format_pct(snap.get('change_24h_pct'))
+        out.append(f'`{sym:<10}` {price:<16} {ch24}')
+    return out
+
+
+def _section_lines_top(snaps: list[dict]) -> list[str]:
+    out: list[str] = []
+    for snap in snaps:
+        sym  = (snap.get('symbol_display') or snap.get('identifier') or '').upper()
+        price = _format_snap_price(snap)
+        ch24  = _format_pct(snap.get('change_24h_pct'))
+        out.append(f'`{sym:<6}` {price:<16} {ch24}')
+    return out
+
+
+def _watch_sections_by_kind(guild_id: int, kinds: tuple[str, ...]) -> dict:
+    """For each requested kind, return [(row, snapshot), ...] in the order
+    the user added them. Empty kinds are omitted from the result."""
+    out: dict = {}
+    rows_all = list_radar_watchlist(guild_id)
+    for k in kinds:
+        items: list[tuple[dict, dict]] = []
+        for row in rows_all:
+            if (row.get('asset_kind') or '').lower() != k:
+                continue
+            ident = (row.get('asset_identifier') or '').lower()
+            snap  = CACHE.get_snapshot(k, ident)
+            if snap:
+                items.append((row, snap))
+        if items:
+            out[k] = items
+    return out
+
+
+def _crypto_top10_fallback() -> list[dict]:
+    """Top-10 crypto by market cap, sorted from the leaderboard cache. Used
+    only when the guild has NO watchlist entries in any kind."""
+    rows: list[dict] = []
+    for cs in CACHE.all_for_kind('crypto'):
+        snap = cs.snapshot
+        if snap.get('rank') is None:
+            continue
+        rows.append(snap)
+    rows.sort(key=lambda s: int(s.get('rank') or 9999))
+    return rows[:10]
+
+
+def _build_digest_embed(
+    guild_id: int, settings: dict,
+    *,
+    kinds: tuple[str, ...] = _KIND_ORDER,
+) -> Optional[discord.Embed]:
+    """Compose the per-guild market-update embed from cache.
+
+    `kinds` lets the topic-channel router request a single-kind embed (e.g.
+    a guild routes NFT-only to daily_channel_nft). The default value covers
+    every supported kind, and the per-kind sections are emitted in fixed
+    display order. Empty kinds are silently skipped.
+
+    Content rule: if any of the requested kinds has watchlist content, the
+    embed shows only those sections — NO Top-10 leaderboard. If every
+    requested kind is empty AND the requested set contains crypto, fall
+    back to the crypto Top-10 by market cap so the post is never blank.
+    Returns None when nothing useful can be assembled."""
+    watch_by_kind = _watch_sections_by_kind(guild_id, kinds)
+    fallback_top: list[dict] = []
+    if not watch_by_kind and 'crypto' in kinds:
+        fallback_top = _crypto_top10_fallback()
+    if not watch_by_kind and not fallback_top:
+        return None
+
+    # Custom template overrides.
     custom_title    = (settings.get('digest_title')  or '').strip()
     custom_intro    = (settings.get('digest_intro')  or '').strip()
     custom_color    = _parse_hex_color(settings.get('digest_color') or '')
@@ -157,7 +248,8 @@ def _build_digest_embed(guild_id: int, settings: dict) -> Optional[discord.Embed
     if thumb_mode not in THUMBNAIL_MODES:
         thumb_mode = 'brand'
 
-    title = f'📊 {custom_title or DEFAULT_DIGEST_TITLE} — {local_now.strftime("%b %d")} ({tz_label})'
+    date_suffix = _format_date_suffix(settings)
+    title = f'📊 {custom_title or DEFAULT_DIGEST_TITLE}{date_suffix}'
     intro = (custom_intro or DEFAULT_DIGEST_INTRO)
 
     e = build_branded_embed(
@@ -165,53 +257,48 @@ def _build_digest_embed(guild_id: int, settings: dict) -> Optional[discord.Embed
         title=title,
         description=intro,
         cog_prefix='',
-        use_thumbnail=(thumb_mode == 'brand'),  # brand thumbnail only when asked
+        use_thumbnail=(thumb_mode == 'brand'),
         use_image=False,
-        use_footer=not bool(custom_footer),     # brand footer only when no custom
+        use_footer=not bool(custom_footer),
     )
-
     if custom_color is not None:
         e.color = discord.Color(custom_color)
 
     if thumb_mode == 'first_coin':
         first_img = ''
-        if watch_section:
-            first_img = (watch_section[0][1].get('image_url') or '').strip()
-        elif fallback_section:
-            first_img = (fallback_section[0].get('image_url') or '').strip()
+        for k in _KIND_ORDER:
+            items = watch_by_kind.get(k)
+            if items:
+                first_img = (items[0][1].get('image_url') or '').strip()
+                if first_img:
+                    break
+        if not first_img and fallback_top:
+            first_img = (fallback_top[0].get('image_url') or '').strip()
         if first_img:
             e.set_thumbnail(url=first_img)
-    elif thumb_mode == 'off':
-        # build_branded_embed didn't set a thumbnail because use_thumbnail=False
-        pass
 
     if custom_footer:
         e.set_footer(text=custom_footer[:2048])
 
-    # ── List body ───────────────────────────────────────────────────────
-    if watch_section:
-        lines: list[str] = []
-        for row, snap in watch_section[:25]:
-            sym  = (snap.get('symbol_display') or row.get('display_name')
-                    or row.get('asset_identifier') or '').upper()
-            price = _format_price(snap.get('price_usd'))
-            ch24  = _format_pct(snap.get('change_24h_pct'))
-            lines.append(f'`{sym:<8}` {price:<13} {ch24}')
-        e.add_field(
-            name='Your Watchlist',
-            value='\n'.join(lines)[:1024],
-            inline=False,
-        )
+    # ── Per-kind sections in fixed display order ────────────────────────
+    if watch_by_kind:
+        for k in _KIND_ORDER:
+            items = watch_by_kind.get(k)
+            if not items:
+                continue
+            lines = _section_lines_watchlist(items)
+            if not lines:
+                continue
+            e.add_field(
+                name=_KIND_LABELS.get(k, k.capitalize()),
+                value='\n'.join(lines)[:1024],
+                inline=False,
+            )
     else:
-        # Fallback only — guilds with no watchlist still get something useful.
-        lines = []
-        for snap in fallback_section:
-            sym  = (snap.get('symbol_display') or snap.get('identifier') or '').upper()
-            price = _format_price(snap.get('price_usd'))
-            ch24  = _format_pct(snap.get('change_24h_pct'))
-            lines.append(f'`{sym:<6}` {price:<13} {ch24}')
+        # Crypto-Top-10 leaderboard fallback.
+        lines = _section_lines_top(fallback_top)
         e.add_field(
-            name=f'Top {len(fallback_section)} by Market Cap',
+            name=f'Top {len(fallback_top)} by Market Cap',
             value='\n'.join(lines)[:1024],
             inline=False,
         )
@@ -224,62 +311,166 @@ class DigestSendError(Exception):
     so api.py can surface it directly. The string itself is also logged."""
 
 
-async def post_digest_now(bot, guild_id: int, settings: dict) -> dict:
-    """Build + send the crypto digest right now. Used by both the manual
-    send-now endpoint AND by the scheduled scheduler_loop after its window
-    check. Raises DigestSendError on any failure path — caller decides
-    whether that consumes a quota.
+_TOPIC_CHANNEL_KEYS = {
+    'crypto': 'daily_channel_crypto',
+    'nft':    'daily_channel_nft',
+    'meme':   'daily_channel_meme',
+    'forex':  'daily_channel_forex',
+}
 
-    Returns {'channel_id': int, 'message_id': int, 'watchlist_count': int}
-    on success.
-    """
+
+def _resolve_channel_id(value) -> Optional[int]:
+    """Channel ids may be stored as int (legacy) or str (polish-A path).
+    Coerce both shapes to int; empty/None → None."""
+    if value is None or value == '':
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+async def post_digest_now(bot, guild_id: int, settings: dict) -> dict:
+    """Build + send the market-update embeds right now. Routes to per-topic
+    channels when configured: each kind with a configured topic-channel gets
+    its own topic-scoped embed; kinds without a topic-channel but with
+    watchlist content go to the main daily_channel_crypto channel as a
+    combined embed. If neither path produces a send, raises DigestSendError.
+
+    Returns {'channel_id': int, 'message_id': int, 'watchlist_count': int,
+    'posts': int} — channel_id/message_id reference the first successful
+    post for backwards compatibility, and `posts` is the total count."""
     if not bot.is_ready():
         raise DigestSendError('Bot is starting up; try again in a moment.')
-
-    ch_id = settings.get('daily_channel_crypto')
-    if not ch_id:
-        raise DigestSendError('Configure a crypto digest channel first.')
-
-    embed = _build_digest_embed(guild_id, settings)
-    if embed is None:
-        raise DigestSendError(
-            'No data to post yet. Either the cache is cold (fetcher runs '
-            'every 5 minutes) or the watchlist is empty and the leaderboard '
-            'has not loaded.'
-        )
 
     guild = bot.get_guild(int(guild_id))
     if guild is None:
         raise DigestSendError('Bot is not in this server.')
 
-    try:
-        channel = guild.get_channel(int(ch_id))
-    except (TypeError, ValueError):
-        channel = None
-    if channel is None:
-        raise DigestSendError(f'Digest channel {ch_id} not found.')
+    main_ch_raw = settings.get('daily_channel_crypto')
+    main_ch_id  = _resolve_channel_id(main_ch_raw)
+
+    # Per-topic channel map. Drop entries with no channel id.
+    topic_channels: dict[str, int] = {}
+    for k, key in _TOPIC_CHANNEL_KEYS.items():
+        cid = _resolve_channel_id(settings.get(key))
+        if cid is not None:
+            topic_channels[k] = cid
+
+    if not topic_channels and main_ch_id is None:
+        raise DigestSendError('Configure a crypto digest channel first.')
+
+    # For routing decisions we need to know which kinds the guild has
+    # content for right now.
+    watch_by_kind = _watch_sections_by_kind(int(guild_id), _KIND_ORDER)
+
+    # Topics with their own channel → topic-scoped embed.
+    # Topics without their own channel but with content AND a main channel
+    # → folded into the combined embed sent to the main channel.
+    topic_posts: list[tuple[str, int, tuple]] = []   # (kind, channel_id, (kind,))
+    combined_kinds: list[str] = []
+    for k in _KIND_ORDER:
+        if k in topic_channels:
+            # Always post the topic embed for explicitly-routed kinds, even
+            # if their section ends up empty (the body will fall back to
+            # crypto top-10 for the crypto channel, or yield None for the
+            # other kinds — in that case we just skip the send).
+            topic_posts.append((k, topic_channels[k], (k,)))
+        elif k in watch_by_kind:
+            combined_kinds.append(k)
+
+    if combined_kinds and main_ch_id is None:
+        # Some kinds need posting but no main channel exists. They'd be
+        # silently dropped — note it but don't fail the whole send.
+        print(f'[radar/digest] g={guild_id} dropping kinds with no channel: '
+              f'{combined_kinds}')
 
     mentions = _parse_role_id_list(settings.get('digest_mention_role_ids'))
     content  = _mention_content(mentions)
+    allowed  = discord.AllowedMentions(roles=True, users=False, everyone=False)
 
-    try:
-        msg = await channel.send(
-            content=content,
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions(
-                roles=True, users=False, everyone=False,
-            ),
-        )
-    except discord.Forbidden as e:
-        raise DigestSendError('Bot lacks permission to post in that channel.') from e
-    except Exception as e:  # noqa: BLE001
-        raise DigestSendError(f'Discord error: {type(e).__name__}: {e}') from e
+    sent_posts: list[dict] = []
+    first_topic_skip_reason = None
 
-    rows = list_radar_watchlist(int(guild_id), asset_kind='crypto')
+    # Per-topic posts.
+    for kind, ch_id, ks in topic_posts:
+        try:
+            channel = guild.get_channel(int(ch_id))
+        except (TypeError, ValueError):
+            channel = None
+        if channel is None:
+            print(f'[radar/digest] g={guild_id} {kind} channel {ch_id} missing — skip')
+            continue
+        embed = _build_digest_embed(int(guild_id), settings, kinds=ks)
+        if embed is None:
+            print(f'[radar/digest] g={guild_id} {kind} embed empty — skip')
+            if first_topic_skip_reason is None:
+                first_topic_skip_reason = (
+                    f'No {kind} data to post yet. Either the cache is cold '
+                    '(fetcher runs every 5 minutes) or your watchlist is '
+                    'empty for that kind.'
+                )
+            continue
+        try:
+            msg = await channel.send(content=content, embed=embed,
+                                     allowed_mentions=allowed)
+            sent_posts.append({'kind': kind, 'channel_id': int(channel.id),
+                               'message_id': int(msg.id)})
+        except discord.Forbidden:
+            raise DigestSendError(
+                f'Bot lacks permission to post in #{getattr(channel, "name", ch_id)}.'
+            )
+        except Exception as e:  # noqa: BLE001
+            raise DigestSendError(f'Discord error: {type(e).__name__}: {e}') from e
+
+    # Combined embed for the main channel (covers kinds without explicit
+    # channels). Also fires when no per-topic channels were configured at
+    # all — in that case the main channel gets the full multi-kind digest.
+    main_kinds: tuple[str, ...] = ()
+    if main_ch_id is not None:
+        if not topic_channels:
+            # No per-topic routing at all — main channel gets the whole digest.
+            main_kinds = _KIND_ORDER
+        elif combined_kinds:
+            main_kinds = tuple(combined_kinds)
+
+    if main_kinds:
+        try:
+            channel = guild.get_channel(int(main_ch_id))
+        except (TypeError, ValueError):
+            channel = None
+        if channel is None:
+            print(f'[radar/digest] g={guild_id} main channel {main_ch_id} missing — skip')
+        else:
+            embed = _build_digest_embed(int(guild_id), settings, kinds=main_kinds)
+            if embed is not None:
+                try:
+                    msg = await channel.send(content=content, embed=embed,
+                                             allowed_mentions=allowed)
+                    sent_posts.append({'kind': 'combined',
+                                       'channel_id': int(channel.id),
+                                       'message_id': int(msg.id)})
+                except discord.Forbidden:
+                    raise DigestSendError(
+                        f'Bot lacks permission to post in #{getattr(channel, "name", main_ch_id)}.'
+                    )
+                except Exception as e:  # noqa: BLE001
+                    raise DigestSendError(f'Discord error: {type(e).__name__}: {e}') from e
+
+    if not sent_posts:
+        raise DigestSendError(first_topic_skip_reason or (
+            'No data to post yet. Either the cache is cold (fetcher runs '
+            'every 5 minutes) or every watchlist is empty.'
+        ))
+
+    rows = list_radar_watchlist(int(guild_id))
+    first = sent_posts[0]
     return {
-        'channel_id':      int(channel.id),
-        'message_id':      int(msg.id),
+        'channel_id':      first['channel_id'],
+        'message_id':      first['message_id'],
         'watchlist_count': len(rows),
+        'posts':           len(sent_posts),
+        'all_posts':       sent_posts,
     }
 
 
