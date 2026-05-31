@@ -16,6 +16,7 @@ a separate timer) so an alert never fires on stale data.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -189,12 +190,31 @@ def _alert_volume_embed(guild_id: int, snap: dict) -> discord.Embed:
 
 # ── Dispatcher ──────────────────────────────────────────────────────────────
 
+def _parse_role_id_list(raw) -> list[str]:
+    """Read the JSON-array role-id column. The canonical normalization
+    (commas/spaces/newlines → JSON string) happens on write in api.py via
+    _normalize_role_id_list; here we just decode and stringify."""
+    if raw is None or raw == '':
+        return []
+    try:
+        data = raw if isinstance(raw, list) else json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(v).strip() for v in data if str(v).strip()]
+
+
 async def _send_alert(
     bot, guild_id: int, channel_id: int, embed: discord.Embed,
+    *, mention_role_ids: Optional[list[str]] = None,
 ) -> bool:
     """Attempt to send a single alert embed. Returns True on success.
     Soft-fails on every Discord exception so an alert flood from one
-    misconfigured guild never breaks the dispatcher."""
+    misconfigured guild never breaks the dispatcher.
+
+    mention_role_ids → content becomes ' '.join(<@&id>). AllowedMentions
+    restricts pings to roles only (no users / everyone)."""
     try:
         guild = bot.get_guild(int(guild_id))
         if guild is None:
@@ -204,7 +224,16 @@ async def _send_alert(
         if channel is None:
             print(f'[radar/alerts] channel {channel_id} not found in guild {guild_id} — skip')
             return False
-        await channel.send(embed=embed)
+        content = None
+        if mention_role_ids:
+            content = ' '.join(f'<@&{rid}>' for rid in mention_role_ids[:25])
+        await channel.send(
+            content=content,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                roles=True, users=False, everyone=False,
+            ),
+        )
         return True
     except discord.Forbidden:
         print(f'[radar/alerts] forbidden in channel={channel_id} guild={guild_id}')
@@ -243,6 +272,8 @@ async def dispatch_alerts(bot) -> dict:
         except (TypeError, ValueError):
             move_thr, vol_mul = 5.0, 3.0
 
+        alert_mentions = _parse_role_id_list(settings.get('alerts_mention_role_ids'))
+
         try:
             watchlist = list_radar_watchlist(gid, asset_kind='crypto')
         except Exception as e:  # noqa: BLE001
@@ -265,7 +296,8 @@ async def dispatch_alerts(bot) -> dict:
                 if ch1h >= move_thr:
                     if not _cooled_down(gid, identifier, 'movement_up', _COOLDOWN_MOVEMENT_S):
                         embed = _alert_movement_embed(gid, snap, ch1h)
-                        if await _send_alert(bot, gid, int(ch_id), embed):
+                        if await _send_alert(bot, gid, int(ch_id), embed,
+                                             mention_role_ids=alert_mentions):
                             record_radar_alert(
                                 gid, 'crypto', identifier, 'movement_up',
                                 {'change_1h_pct': ch1h,
@@ -276,7 +308,8 @@ async def dispatch_alerts(bot) -> dict:
                 elif ch1h <= -move_thr:
                     if not _cooled_down(gid, identifier, 'movement_down', _COOLDOWN_MOVEMENT_S):
                         embed = _alert_movement_embed(gid, snap, ch1h)
-                        if await _send_alert(bot, gid, int(ch_id), embed):
+                        if await _send_alert(bot, gid, int(ch_id), embed,
+                                             mention_role_ids=alert_mentions):
                             record_radar_alert(
                                 gid, 'crypto', identifier, 'movement_down',
                                 {'change_1h_pct': ch1h,
@@ -289,7 +322,8 @@ async def dispatch_alerts(bot) -> dict:
             if vol_mul > 1.0 and _volume_spike(snap, 'crypto', identifier, vol_mul):
                 if not _cooled_down(gid, identifier, 'volume_spike', _COOLDOWN_VOLUME_S):
                     embed = _alert_volume_embed(gid, snap)
-                    if await _send_alert(bot, gid, int(ch_id), embed):
+                    if await _send_alert(bot, gid, int(ch_id), embed,
+                                         mention_role_ids=alert_mentions):
                         record_radar_alert(
                             gid, 'crypto', identifier, 'volume_spike',
                             {'volume_24h_usd': snap.get('volume_24h_usd'),

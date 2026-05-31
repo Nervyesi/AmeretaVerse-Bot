@@ -3610,6 +3610,8 @@ _RADAR_MOVE_PCT_RANGE       = (0.5, 50.0)
 _RADAR_VOL_MULT_RANGE       = (1.5, 20.0)
 _RADAR_LIQ_MIN_USD_RANGE    = (100_000, 1_000_000_000)
 _RADAR_TZ_OFFSET_RANGE      = (-12 * 60, 14 * 60)  # minutes; UTC-12 .. UTC+14
+_RADAR_MANUAL_DIGEST_DAILY_CAP = 5         # per guild, per UTC day
+_RADAR_MANUAL_DIGEST_COOLDOWN_S = 300.0    # 5 minutes between manual sends
 
 
 class _RadarSettingsUpdate(BaseModel):
@@ -3629,6 +3631,12 @@ class _RadarSettingsUpdate(BaseModel):
     liquidation_enabled:          Optional[int]    = None
     liquidation_min_usd:          Optional[int]    = None
     stocks_alpha_vantage_key:     Optional[str]    = None
+    # Mention-role lists: accept list OR comma/space/newline string OR a
+    # single id. _normalize_role_id_list (shared with giveaway/protection)
+    # reduces all shapes to a canonical JSON-array string. Persisted as
+    # such; digest.py / alerts.py json.loads on read.
+    digest_mention_role_ids:      Optional[object] = None
+    alerts_mention_role_ids:      Optional[object] = None
 
 
 class _RadarWatchlistCreate(BaseModel):
@@ -3686,12 +3694,34 @@ def _radar_channel(value, *, field: str) -> int | None:
 
 def _radar_mask_settings(s: dict) -> dict:
     """Redact the Alpha Vantage key in responses — clients can write it
-    via PATCH but never read it back."""
+    via PATCH but never read it back. Mention-role columns are decoded from
+    their JSON-array storage so the dashboard renders ready-to-edit lists."""
     out = dict(s)
     key = out.get('stocks_alpha_vantage_key')
     if key:
         out['stocks_alpha_vantage_key'] = f'••••{str(key)[-4:]}' if len(str(key)) > 4 else '••••'
     out['stocks_alpha_vantage_key_set'] = bool(key)
+
+    for col in ('digest_mention_role_ids', 'alerts_mention_role_ids'):
+        raw = out.get(col) or '[]'
+        try:
+            arr = raw if isinstance(raw, list) else json.loads(raw)
+            if not isinstance(arr, list):
+                arr = []
+        except (TypeError, ValueError):
+            arr = []
+        out[col] = [str(v).strip() for v in arr if str(v).strip()]
+
+    # Manual-digest quota: show remaining alongside used so the dashboard
+    # doesn't need to compute it. Quota resets on UTC date change.
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    used = int(out.get('manual_digests_used_today') or 0)
+    if str(out.get('manual_digests_reset_date') or '') != today_utc:
+        used = 0
+    cap = _RADAR_MANUAL_DIGEST_DAILY_CAP
+    out['manual_digests_used_today'] = used
+    out['manual_digests_remaining_today'] = max(0, cap - used)
+    out['manual_digests_daily_cap'] = cap
     return out
 
 
@@ -3759,6 +3789,14 @@ async def radar_settings_patch(
         new_key = (payload['stocks_alpha_vantage_key'] or '').strip()
         if new_key and not new_key.startswith('••'):
             updates['stocks_alpha_vantage_key'] = new_key[:128]
+    if 'digest_mention_role_ids' in payload:
+        updates['digest_mention_role_ids'] = _normalize_role_id_list(
+            payload['digest_mention_role_ids'], field='digest_mention_role_ids',
+        )
+    if 'alerts_mention_role_ids' in payload:
+        updates['alerts_mention_role_ids'] = _normalize_role_id_list(
+            payload['alerts_mention_role_ids'], field='alerts_mention_role_ids',
+        )
 
     fresh = db_update_radar_settings(server_id, **updates)
 
@@ -3985,6 +4023,163 @@ async def radar_preview(
         'identifier': ident,
         'snapshot':   snap,
         'fresh':      is_fresh,
+    }
+
+
+@app.post('/api/servers/{server_id}/radar/preview-refresh')
+async def radar_preview_refresh(
+    server_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """One-shot CoinGecko batch fetch for this guild's crypto watchlist.
+    Updates the global cache so the dashboard's 30s poll sees fresh prices.
+    Rate-limited per-user AND per-guild so the button can't be hammered."""
+    require_module_access(user, server_id, 'radar')
+    # Per-user 4/min — protects against accidental click spam.
+    uid = int(user.get('user_id') or user.get('id') or 0)
+    if uid:
+        rate_limit(f'radar_preview_refresh_u:{uid}', 4, 60.0)
+    # Per-guild 12/min — protects the CoinGecko free-tier budget across
+    # multiple admins in the same server.
+    rate_limit(f'radar_preview_refresh_g:{server_id}', 12, 60.0)
+
+    rows = db_list_radar_watchlist(server_id, asset_kind='crypto')
+    identifiers = sorted({
+        (r.get('asset_identifier') or '').strip().lower()
+        for r in rows
+        if (r.get('asset_identifier') or '').strip()
+    })
+    if not identifiers:
+        return {'ok': True, 'refreshed': 0, 'note': 'empty_watchlist'}
+
+    try:
+        from services.radar.adapters import ADAPTERS_BY_KIND
+        from services.radar.cache    import CACHE as _RADAR_CACHE
+        adapter = ADAPTERS_BY_KIND.get('crypto')
+        if adapter is None:
+            raise RuntimeError('crypto adapter not registered')
+        fetched = await adapter.fetch_batch(identifiers)
+    except Exception as e:  # noqa: BLE001
+        print(f'[radar/api] preview-refresh failed: {type(e).__name__}: {e}')
+        raise HTTPException(
+            status_code=503,
+            detail='Live price refresh is temporarily unavailable. Try again shortly.',
+        )
+
+    for snap in fetched:
+        _RADAR_CACHE.put('crypto', snap['identifier'], snap)
+
+    return {
+        'ok':         True,
+        'refreshed':  len(fetched),
+        'requested':  len(identifiers),
+    }
+
+
+@app.post('/api/servers/{server_id}/radar/digest/send-now')
+async def radar_digest_send_now(
+    server_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Admin-triggered immediate digest post to the configured crypto
+    channel. Per-guild 5/UTC-day cap + 5-min cooldown. Quota is consumed
+    ONLY on successful send so a misconfig doesn't burn the daily budget."""
+    require_guild_admin(user, server_id)
+    require_module_access(user, server_id, 'radar')
+
+    settings = db_get_radar_settings(server_id)
+
+    # Quota reset: a new UTC day clears the counter regardless of how high
+    # it got yesterday. Persisted via radar_settings so it survives restarts.
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    used = int(settings.get('manual_digests_used_today') or 0)
+    if str(settings.get('manual_digests_reset_date') or '') != today_utc:
+        used = 0
+        db_update_radar_settings(
+            server_id,
+            manual_digests_used_today=0,
+            manual_digests_reset_date=today_utc,
+        )
+        settings = db_get_radar_settings(server_id)
+
+    cap = _RADAR_MANUAL_DIGEST_DAILY_CAP
+    if used >= cap:
+        raise HTTPException(
+            status_code=429,
+            detail=(f'Daily cap reached ({cap} manual sends per UTC day). '
+                    'The scheduled daily digest still runs at your configured time.'),
+            headers={'Retry-After': '3600'},
+        )
+
+    # 5-minute cooldown between manual sends.
+    last_iso = settings.get('last_manual_digest_at')
+    if last_iso:
+        try:
+            last_dt = datetime.fromisoformat(str(last_iso).replace('Z', '+00:00'))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            if elapsed < _RADAR_MANUAL_DIGEST_COOLDOWN_S:
+                wait = int(_RADAR_MANUAL_DIGEST_COOLDOWN_S - elapsed) + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail=f'Manual digests are limited to one every 5 minutes. '
+                           f'Try again in {wait}s.',
+                    headers={'Retry-After': str(wait)},
+                )
+        except (TypeError, ValueError):
+            pass
+
+    if not settings.get('daily_channel_crypto'):
+        raise HTTPException(
+            status_code=400,
+            detail='Configure a crypto digest channel first.',
+        )
+
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+
+    try:
+        from services.radar.digest import post_digest_now, DigestSendError
+        result = await post_digest_now(bot, int(server_id), settings)
+    except DigestSendError as e:
+        # Quota NOT consumed on failure — admin can fix config + retry.
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        print(f'[radar/api] digest send-now crashed g={server_id}: '
+              f'{type(e).__name__}: {e}')
+        raise HTTPException(status_code=502, detail='Unexpected error sending digest.')
+
+    # Consume one quota unit + update timestamp ONLY after a confirmed post.
+    db_update_radar_settings(
+        server_id,
+        manual_digests_used_today=used + 1,
+        manual_digests_reset_date=today_utc,
+        last_manual_digest_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    log_event(
+        server_id, 'admin_action', 'radar_digest_send_now',
+        f'Manual Radar digest sent by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='radar', severity='info',
+        details={
+            'channel_id':         result.get('channel_id'),
+            'message_id':         result.get('message_id'),
+            'watchlist_count':    result.get('watchlist_count'),
+            'remaining_today':    max(0, cap - (used + 1)),
+        },
+    )
+
+    return {
+        'ok':                True,
+        'message_id':        str(result.get('message_id')),
+        'channel_id':        str(result.get('channel_id')),
+        'watchlist_count':   result.get('watchlist_count'),
+        'used_today':        used + 1,
+        'remaining_today':   max(0, cap - (used + 1)),
+        'daily_cap':         cap,
     }
 
 

@@ -490,6 +490,15 @@ def init_db():
             # legacy) is kept for back-compat; readers prefer mention_role_ids
             # when set, otherwise fall back to wrapping the legacy id.
             "ALTER TABLE giveaways ADD COLUMN mention_role_ids TEXT NOT NULL DEFAULT '[]'",
+            # Radar Phase 1 polish: per-guild role mentions for digest + alerts,
+            # plus manual-digest-send quota counters. JSON-array strings parsed
+            # via the existing tolerant role-id parser shared by giveaway /
+            # protection. Idempotent; existing rows default to '[]' / 0.
+            "ALTER TABLE radar_settings ADD COLUMN digest_mention_role_ids TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE radar_settings ADD COLUMN alerts_mention_role_ids TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE radar_settings ADD COLUMN manual_digests_used_today INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE radar_settings ADD COLUMN manual_digests_reset_date TEXT",
+            "ALTER TABLE radar_settings ADD COLUMN last_manual_digest_at TIMESTAMP",
             # bot profile columns
             "ALTER TABLE guild_settings ADD COLUMN bot_display_name TEXT",
             "ALTER TABLE guild_settings ADD COLUMN bot_avatar_url TEXT",
@@ -1874,6 +1883,9 @@ _RADAR_SETTINGS_EDITABLE = (
     'movement_threshold_pct', 'volume_multiplier_threshold',
     'liquidation_channel', 'liquidation_enabled', 'liquidation_min_usd',
     'stocks_alpha_vantage_key', 'last_daily_sent_date',
+    'digest_mention_role_ids', 'alerts_mention_role_ids',
+    'manual_digests_used_today', 'manual_digests_reset_date',
+    'last_manual_digest_at',
 )
 
 
