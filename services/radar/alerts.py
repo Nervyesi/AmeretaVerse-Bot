@@ -254,11 +254,15 @@ async def _send_alert(
         return False
 
 
+_TOPICS = ('crypto', 'nft', 'meme', 'forex')
+
+
 async def dispatch_alerts(bot) -> dict:
-    """Walk every guild with radar settings, evaluate each watchlist asset
-    against the latest cache snapshot, send alerts that aren't on
-    cooldown. Returns a small per-guild summary for logging.
-    """
+    """Per-(guild, topic) alert dispatcher. Each topic owns its own
+    alerts_channel, movement_threshold_pct, volume_multiplier_threshold,
+    and alerts_mention_role_ids — read from radar_topic_settings, not the
+    legacy guild-flat radar_settings."""
+    from database import get_radar_topic_settings
     summary: dict = {}
     if not bot.is_ready():
         print('[radar/alerts] bot not ready — skipping dispatch')
@@ -266,88 +270,95 @@ async def dispatch_alerts(bot) -> dict:
 
     for gid in list_guilds_with_radar():
         try:
-            settings = get_radar_settings(gid)
-        except Exception as e:  # noqa: BLE001
-            print(f'[radar/alerts] settings read failed g={gid}: {type(e).__name__}: {e}')
-            continue
-        if not int(settings.get('alerts_enabled') or 0):
-            continue
-        ch_id = settings.get('alerts_channel')
-        if not ch_id:
-            continue
-
-        try:
-            move_thr = float(settings.get('movement_threshold_pct') or 5.0)
-            vol_mul  = float(settings.get('volume_multiplier_threshold') or 3.0)
-        except (TypeError, ValueError):
-            move_thr, vol_mul = 5.0, 3.0
-
-        alert_mentions = _parse_role_id_list(settings.get('alerts_mention_role_ids'))
-
-        try:
-            watchlist = list_radar_watchlist(gid)   # all kinds
+            full_watchlist = list_radar_watchlist(gid)
         except Exception as e:  # noqa: BLE001
             print(f'[radar/alerts] watchlist read failed g={gid}: '
                   f'{type(e).__name__}: {e}')
             continue
 
-        sent = 0
-        for row in watchlist:
-            kind = (row.get('asset_kind') or '').lower()
-            identifier = (row.get('asset_identifier') or '').lower()
-            # Only kinds with a live snapshot ever produce alerts. Stocks
-            # has no adapter yet; forex skips volume spikes.
-            if not identifier or kind not in ('crypto', 'nft', 'meme', 'forex'):
-                continue
-            snap = CACHE.get_snapshot(kind, identifier)
-            if not snap:
-                continue
+        per_topic_summary: dict = {}
 
-            # Movement (1h preferred; forex falls back to 24h via _change_1h_pct)
-            ch1h = _change_1h_pct(snap, kind, identifier)
-            if ch1h is not None and move_thr > 0:
-                if ch1h >= move_thr:
-                    if not _cooled_down(gid, identifier, 'movement_up', _COOLDOWN_MOVEMENT_S):
-                        embed = _alert_movement_embed(gid, snap, ch1h)
+        for topic in _TOPICS:
+            try:
+                ts = get_radar_topic_settings(gid, topic)
+            except Exception as e:  # noqa: BLE001
+                print(f'[radar/alerts] g={gid} {topic} settings read failed: '
+                      f'{type(e).__name__}: {e}')
+                continue
+            if not int(ts.get('alerts_enabled') or 0):
+                continue
+            ch_id = ts.get('alerts_channel')
+            if not ch_id:
+                continue
+            try:
+                move_thr = float(ts.get('movement_threshold_pct') or 5.0)
+                vol_mul  = float(ts.get('volume_multiplier_threshold') or 3.0)
+            except (TypeError, ValueError):
+                move_thr, vol_mul = 5.0, 3.0
+            alert_mentions = _parse_role_id_list(ts.get('alerts_mention_role_ids'))
+
+            sent = 0
+            for row in full_watchlist:
+                if (row.get('asset_kind') or '').lower() != topic:
+                    continue
+                identifier_raw = (row.get('asset_identifier') or '')
+                if not identifier_raw:
+                    continue
+                # crypto/nft cache keys are lowercased; meme/forex preserve case.
+                ident = (identifier_raw.lower()
+                         if topic in ('crypto', 'nft')
+                         else identifier_raw)
+                snap = CACHE.get_snapshot(topic, ident)
+                if not snap:
+                    continue
+
+                ch1h = _change_1h_pct(snap, topic, ident)
+                if ch1h is not None and move_thr > 0:
+                    if ch1h >= move_thr:
+                        if not _cooled_down(gid, ident, 'movement_up', _COOLDOWN_MOVEMENT_S):
+                            embed = _alert_movement_embed(gid, snap, ch1h)
+                            if await _send_alert(bot, gid, int(ch_id), embed,
+                                                 mention_role_ids=alert_mentions):
+                                record_radar_alert(
+                                    gid, topic, ident, 'movement_up',
+                                    {'change_1h_pct': ch1h,
+                                     'price_usd':     snap.get('price_usd'),
+                                     'volume_24h_usd': snap.get('volume_24h_usd')},
+                                )
+                                sent += 1
+                    elif ch1h <= -move_thr:
+                        if not _cooled_down(gid, ident, 'movement_down', _COOLDOWN_MOVEMENT_S):
+                            embed = _alert_movement_embed(gid, snap, ch1h)
+                            if await _send_alert(bot, gid, int(ch_id), embed,
+                                                 mention_role_ids=alert_mentions):
+                                record_radar_alert(
+                                    gid, topic, ident, 'movement_down',
+                                    {'change_1h_pct': ch1h,
+                                     'price_usd':     snap.get('price_usd'),
+                                     'volume_24h_usd': snap.get('volume_24h_usd')},
+                                )
+                                sent += 1
+
+                # Volume spike — forex has no liquidity metric, skip.
+                if topic == 'forex':
+                    continue
+                if vol_mul > 1.0 and _volume_spike(snap, topic, ident, vol_mul):
+                    if not _cooled_down(gid, ident, 'volume_spike', _COOLDOWN_VOLUME_S):
+                        embed = _alert_volume_embed(gid, snap)
                         if await _send_alert(bot, gid, int(ch_id), embed,
                                              mention_role_ids=alert_mentions):
                             record_radar_alert(
-                                gid, kind, identifier, 'movement_up',
-                                {'change_1h_pct': ch1h,
-                                 'price_usd':     snap.get('price_usd'),
-                                 'volume_24h_usd': snap.get('volume_24h_usd')},
-                            )
-                            sent += 1
-                elif ch1h <= -move_thr:
-                    if not _cooled_down(gid, identifier, 'movement_down', _COOLDOWN_MOVEMENT_S):
-                        embed = _alert_movement_embed(gid, snap, ch1h)
-                        if await _send_alert(bot, gid, int(ch_id), embed,
-                                             mention_role_ids=alert_mentions):
-                            record_radar_alert(
-                                gid, kind, identifier, 'movement_down',
-                                {'change_1h_pct': ch1h,
-                                 'price_usd':     snap.get('price_usd'),
-                                 'volume_24h_usd': snap.get('volume_24h_usd')},
+                                gid, topic, ident, 'volume_spike',
+                                {'volume_24h_usd': snap.get('volume_24h_usd'),
+                                 'price_usd':      snap.get('price_usd')},
                             )
                             sent += 1
 
-            # Volume spike — skipped for forex (no liquidity metric).
-            if kind == 'forex':
-                continue
-            if vol_mul > 1.0 and _volume_spike(snap, kind, identifier, vol_mul):
-                if not _cooled_down(gid, identifier, 'volume_spike', _COOLDOWN_VOLUME_S):
-                    embed = _alert_volume_embed(gid, snap)
-                    if await _send_alert(bot, gid, int(ch_id), embed,
-                                         mention_role_ids=alert_mentions):
-                        record_radar_alert(
-                            gid, kind, identifier, 'volume_spike',
-                            {'volume_24h_usd': snap.get('volume_24h_usd'),
-                             'price_usd':      snap.get('price_usd')},
-                        )
-                        sent += 1
+            if sent:
+                per_topic_summary[topic] = sent
 
-        if sent:
-            summary[str(gid)] = sent
+        if per_topic_summary:
+            summary[str(gid)] = per_topic_summary
 
     if summary:
         print(f'[radar/alerts] dispatch sent={summary}')

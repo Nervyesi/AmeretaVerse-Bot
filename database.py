@@ -1132,7 +1132,115 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_radar_liq_ts ON radar_liquidations_window(ts);
             CREATE INDEX IF NOT EXISTS idx_radar_liq_sym ON radar_liquidations_window(symbol, ts);
+
+            -- Per-topic settings. Each (guild, topic) is independent: its
+            -- own toggles, channels, thresholds, digest style, mention
+            -- roles, manual-send quota, and once-per-day idempotency token.
+            -- radar_settings stays as guild-global (timezone_offset +
+            -- Phase-3 reserved fields). Legacy per-topic columns on
+            -- radar_settings are kept for back-compat but are deprecated:
+            -- they are read only by the one-time migration below.
+            CREATE TABLE IF NOT EXISTS radar_topic_settings (
+                guild_id                      INTEGER NOT NULL,
+                topic                         TEXT    NOT NULL,
+                daily_enabled                 INTEGER NOT NULL DEFAULT 0,
+                daily_channel                 TEXT,
+                daily_time                    TEXT    NOT NULL DEFAULT '08:00',
+                digest_mention_role_ids       TEXT    NOT NULL DEFAULT '[]',
+                alerts_enabled                INTEGER NOT NULL DEFAULT 0,
+                alerts_channel                TEXT,
+                movement_threshold_pct        REAL    NOT NULL DEFAULT 5.0,
+                volume_multiplier_threshold   REAL    NOT NULL DEFAULT 3.0,
+                alerts_mention_role_ids       TEXT    NOT NULL DEFAULT '[]',
+                digest_title                  TEXT    NOT NULL DEFAULT '',
+                digest_intro                  TEXT    NOT NULL DEFAULT '',
+                digest_color                  TEXT    NOT NULL DEFAULT '',
+                digest_footer                 TEXT    NOT NULL DEFAULT '',
+                digest_thumbnail_mode         TEXT    NOT NULL DEFAULT 'brand',
+                digest_date_mode              TEXT    NOT NULL DEFAULT 'date_tz',
+                manual_digests_used_today     INTEGER NOT NULL DEFAULT 0,
+                manual_digests_reset_date     TEXT    NOT NULL DEFAULT '',
+                last_daily_sent_date          TEXT    NOT NULL DEFAULT '',
+                created_at                    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at                    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (guild_id, topic)
+            );
+            CREATE INDEX IF NOT EXISTS idx_radar_topic_guild
+                ON radar_topic_settings(guild_id);
         """)
+
+        # ── One-time idempotent migration: legacy radar_settings → radar_topic_settings(crypto) ──
+        # Every existing guild had its per-topic config flattened on radar_settings.
+        # On first init after this refactor, copy the crypto fields into the new
+        # table. Other topics start with defaults (all disabled) the first time
+        # they're read via get_radar_topic_settings. We skip the migration when
+        # a (guild, 'crypto') row already exists, so this is safe to run on
+        # every boot.
+        try:
+            legacy_rows = conn.execute("""
+                SELECT guild_id,
+                       daily_enabled, daily_channel_crypto, daily_time,
+                       digest_mention_role_ids, alerts_enabled, alerts_channel,
+                       movement_threshold_pct, volume_multiplier_threshold,
+                       alerts_mention_role_ids,
+                       digest_title, digest_intro, digest_color, digest_footer,
+                       digest_thumbnail_mode, digest_date_mode,
+                       manual_digests_used_today, manual_digests_reset_date,
+                       last_daily_sent_date
+                FROM radar_settings
+            """).fetchall()
+        except sqlite3.OperationalError:
+            legacy_rows = []
+        migrated = 0
+        for r in legacy_rows:
+            gid = int(r['guild_id'])
+            exists = conn.execute(
+                "SELECT 1 FROM radar_topic_settings "
+                " WHERE guild_id=? AND topic='crypto' LIMIT 1",
+                (gid,),
+            ).fetchone()
+            if exists:
+                continue
+            ch = r['daily_channel_crypto']
+            ch_str = str(ch) if (ch is not None and ch != '') else None
+            ach = r['alerts_channel']
+            ach_str = str(ach) if (ach is not None and ach != '') else None
+            conn.execute(
+                """INSERT INTO radar_topic_settings (
+                       guild_id, topic,
+                       daily_enabled, daily_channel, daily_time,
+                       digest_mention_role_ids,
+                       alerts_enabled, alerts_channel,
+                       movement_threshold_pct, volume_multiplier_threshold,
+                       alerts_mention_role_ids,
+                       digest_title, digest_intro, digest_color, digest_footer,
+                       digest_thumbnail_mode, digest_date_mode,
+                       manual_digests_used_today, manual_digests_reset_date,
+                       last_daily_sent_date
+                   ) VALUES (?, 'crypto', ?,?,?, ?, ?,?, ?,?, ?, ?,?,?,?, ?,?, ?,?, ?)""",
+                (
+                    gid,
+                    int(r['daily_enabled'] or 0), ch_str,
+                    r['daily_time'] or '08:00',
+                    r['digest_mention_role_ids'] or '[]',
+                    int(r['alerts_enabled'] or 0), ach_str,
+                    float(r['movement_threshold_pct'] or 5.0),
+                    float(r['volume_multiplier_threshold'] or 3.0),
+                    r['alerts_mention_role_ids'] or '[]',
+                    r['digest_title']  or '',
+                    r['digest_intro']  or '',
+                    r['digest_color']  or '',
+                    r['digest_footer'] or '',
+                    (r['digest_thumbnail_mode'] or 'brand'),
+                    (r['digest_date_mode']      or 'date_tz'),
+                    int(r['manual_digests_used_today'] or 0),
+                    r['manual_digests_reset_date'] or '',
+                    r['last_daily_sent_date']      or '',
+                ),
+            )
+            migrated += 1
+        if migrated:
+            print(f'[migration] radar_topic_settings: migrated {migrated} legacy crypto rows')
 
     # Seed AmeretaVerse pools
     AMERETAVERSE_GUILD_ID = '1199707792706117642'
@@ -2045,6 +2153,137 @@ def last_radar_alert_at(
             (int(guild_id), asset_identifier, alert_type),
         ).fetchone()
     return row['sent_at'] if row else None
+
+
+# ── Per-topic radar settings ────────────────────────────────────────────────
+# Each (guild_id, topic) is independent. Defaults are materialized lazily on
+# first read so the dashboard can edit any topic without a separate "create"
+# step. Legacy guild-flat columns on radar_settings are read only by the
+# one-time migration in init_db.
+
+_RADAR_TOPICS = ('crypto', 'nft', 'meme', 'forex')
+_RADAR_TOPIC_EDITABLE = (
+    'daily_enabled', 'daily_channel', 'daily_time',
+    'digest_mention_role_ids',
+    'alerts_enabled', 'alerts_channel',
+    'movement_threshold_pct', 'volume_multiplier_threshold',
+    'alerts_mention_role_ids',
+    'digest_title', 'digest_intro', 'digest_color', 'digest_footer',
+    'digest_thumbnail_mode', 'digest_date_mode',
+    'manual_digests_used_today', 'manual_digests_reset_date',
+    'last_daily_sent_date',
+)
+
+
+def _radar_topic_default_row(guild_id: int, topic: str) -> dict:
+    return {
+        'guild_id':                   int(guild_id),
+        'topic':                      topic,
+        'daily_enabled':              0,
+        'daily_channel':              None,
+        'daily_time':                 '08:00',
+        'digest_mention_role_ids':    '[]',
+        'alerts_enabled':             0,
+        'alerts_channel':             None,
+        'movement_threshold_pct':     5.0,
+        'volume_multiplier_threshold':3.0,
+        'alerts_mention_role_ids':    '[]',
+        'digest_title':               '',
+        'digest_intro':               '',
+        'digest_color':               '',
+        'digest_footer':              '',
+        'digest_thumbnail_mode':      'brand',
+        'digest_date_mode':           'date_tz',
+        'manual_digests_used_today':  0,
+        'manual_digests_reset_date':  '',
+        'last_daily_sent_date':       '',
+    }
+
+
+def get_radar_topic_settings(guild_id, topic: str) -> dict:
+    """Read-or-insert per-(guild, topic) settings. Always returns a dict
+    with every default populated so callers never deal with None rows."""
+    t = (topic or '').strip().lower()
+    if t not in _RADAR_TOPICS:
+        return _radar_topic_default_row(int(guild_id), t)
+    gid = int(guild_id)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM radar_topic_settings WHERE guild_id=? AND topic=?",
+            (gid, t),
+        ).fetchone()
+        if row:
+            return dict(row)
+        conn.execute(
+            "INSERT OR IGNORE INTO radar_topic_settings (guild_id, topic) VALUES (?,?)",
+            (gid, t),
+        )
+        row = conn.execute(
+            "SELECT * FROM radar_topic_settings WHERE guild_id=? AND topic=?",
+            (gid, t),
+        ).fetchone()
+    return dict(row) if row else _radar_topic_default_row(gid, t)
+
+
+def update_radar_topic_settings(guild_id, topic: str, **fields) -> dict:
+    t = (topic or '').strip().lower()
+    if t not in _RADAR_TOPICS:
+        raise ValueError(f'unknown radar topic: {topic}')
+    sets = {k: v for k, v in fields.items() if k in _RADAR_TOPIC_EDITABLE}
+    get_radar_topic_settings(guild_id, t)   # ensure row exists
+    if sets:
+        cols = ', '.join(f'{k}=?' for k in sets) + ', updated_at=CURRENT_TIMESTAMP'
+        with get_connection() as conn:
+            conn.execute(
+                f"UPDATE radar_topic_settings SET {cols} "
+                "WHERE guild_id=? AND topic=?",
+                list(sets.values()) + [int(guild_id), t],
+            )
+    return get_radar_topic_settings(guild_id, t)
+
+
+def list_radar_topic_settings(guild_id) -> dict:
+    """Return all four topic rows for a guild, auto-creating defaults for
+    any topic that doesn't have a row yet. Result is a {topic: row} dict."""
+    out: dict = {}
+    for t in _RADAR_TOPICS:
+        out[t] = get_radar_topic_settings(guild_id, t)
+    return out
+
+
+def check_and_consume_topic_send_quota(
+    guild_id, topic: str, *, daily_cap: int = 5,
+) -> tuple[bool, int]:
+    """Atomic-ish UTC-day quota check + increment for the manual digest
+    send-now endpoint. Returns (allowed, used_after_increment). When
+    allowed=False the caller surfaces a 429 with the cap.
+
+    NOTE: SQLite under aiohttp/asyncio is process-serialized so a single
+    UPDATE-with-CASE is effectively atomic for our threading model."""
+    from datetime import datetime, timezone
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    settings = get_radar_topic_settings(guild_id, topic)
+    used = int(settings.get('manual_digests_used_today') or 0)
+    reset = str(settings.get('manual_digests_reset_date') or '')
+    if reset != today_utc:
+        used = 0
+    if used >= max(1, int(daily_cap)):
+        # Persist the reset date even when blocked, so next day's quota
+        # starts at 0 without waiting for a successful send.
+        if reset != today_utc:
+            update_radar_topic_settings(
+                guild_id, topic,
+                manual_digests_used_today=0,
+                manual_digests_reset_date=today_utc,
+            )
+        return False, used
+    # Increment + persist date.
+    update_radar_topic_settings(
+        guild_id, topic,
+        manual_digests_used_today=used + 1,
+        manual_digests_reset_date=today_utc,
+    )
+    return True, used + 1
 
 
 def list_recent_radar_alerts(guild_id, limit: int = 50) -> list:

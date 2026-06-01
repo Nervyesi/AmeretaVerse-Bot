@@ -1,13 +1,19 @@
 """
-Daily-digest scheduler.
+Per-topic daily-digest scheduler + manual send.
 
-Loops every 60s. For each guild with daily_enabled=1, computes the guild's
-local time using timezone_offset (minutes from UTC) and posts the digest
-ONCE per local day when local time crosses daily_time.
+Each (guild, topic) is independent: its own daily_enabled / daily_channel /
+daily_time / mention roles / digest style / manual-send quota / once-per-day
+idempotency. Topics covered: 'crypto' | 'nft' | 'meme' | 'forex'. Phase-3
+will add 'stocks' and 'liquidation'.
 
-State is persisted in radar_settings.last_daily_sent_date ('YYYY-MM-DD' in
-the guild's local timezone). That means a restart at 09:00 UTC won't
-re-send a digest that already went out today.
+The scheduler iterates every (guild, topic) pair every 60s and fires
+post_digest_now when local-time matches the topic's daily_time and the
+once-per-day token (`last_daily_sent_date`) hasn't been set for the
+guild-local date.
+
+post_digest_now is also called directly from the API's send-now endpoint.
+Both paths produce ONE embed scoped to a single topic — there is no longer
+a cross-topic combined embed.
 """
 from __future__ import annotations
 
@@ -19,20 +25,32 @@ from typing import Optional
 import discord
 
 from database import (
-    get_radar_settings,
+    get_radar_settings,             # guild-global (timezone, Phase-3 reservations)
+    get_radar_topic_settings,
     list_guilds_with_radar,
     list_radar_watchlist,
-    update_radar_settings,
+    update_radar_topic_settings,
 )
 from cogs._branding import build_branded_embed
 from .cache import CACHE
 
 
+_TOPICS = ('crypto', 'nft', 'meme', 'forex')
+_KIND_LABELS = {
+    'crypto': 'Crypto',
+    'nft':    'NFT',
+    'meme':   'Memecoin',
+    'forex':  'Forex',
+}
+
+# News-y defaults — used per topic when the override field is empty.
+DEFAULT_DIGEST_TITLE  = "Today's Market Beat"
+DEFAULT_DIGEST_INTRO  = "Here's how your tracked assets are moving today."
+THUMBNAIL_MODES       = ('brand', 'first_coin', 'off')
+DATE_MODES            = ('off', 'date_only', 'date_tz')
+
+
 def _parse_role_id_list(raw) -> list[str]:
-    """Module-internal helper to read the JSON-array role-id column. The
-    canonical normalization (commas/spaces/newlines → JSON string) is done
-    by api._normalize_role_id_list on write; here we only have to read a
-    well-formed JSON array."""
     if raw is None or raw == '':
         return []
     try:
@@ -45,8 +63,6 @@ def _parse_role_id_list(raw) -> list[str]:
 
 
 def _mention_content(role_ids: list[str]) -> Optional[str]:
-    """' '.join(<@&id>) — None when no roles. Caller pairs this with
-    AllowedMentions(roles=True) so Discord actually delivers the pings."""
     if not role_ids:
         return None
     return ' '.join(f'<@&{rid}>' for rid in role_ids[:25])
@@ -76,39 +92,7 @@ def _format_pct(v) -> str:
         return '—'
 
 
-def _format_price(v) -> str:
-    if v is None:
-        return '—'
-    try:
-        n = float(v)
-    except (TypeError, ValueError):
-        return '—'
-    if n >= 1000:
-        return f'${n:,.2f}'
-    if n >= 1:
-        return f'${n:,.4f}'
-    return f'${n:.6f}'
-
-
-# News-y defaults — used when the per-guild override field is empty.
-DEFAULT_DIGEST_TITLE  = "Today's Market Beat"
-DEFAULT_DIGEST_INTRO  = "Here's how your tracked assets are moving today."
-THUMBNAIL_MODES       = ('brand', 'first_coin', 'off')
-DATE_MODES            = ('off', 'date_only', 'date_tz')
-
-# Per-kind section headings in fixed display order.
-_KIND_ORDER  = ('crypto', 'nft', 'meme', 'forex')
-_KIND_LABELS = {
-    'crypto': 'Crypto',
-    'nft':    'NFT',
-    'meme':   'Memecoin',
-    'forex':  'Forex',
-}
-
-
 def _format_snap_price(snap: dict) -> str:
-    """Format a snapshot price using its price_display_symbol (e.g. '$', 'USD',
-    'EUR'). Forex pairs use the quote currency code as their symbol."""
     p = snap.get('price_usd')
     if p is None:
         return '—'
@@ -117,20 +101,16 @@ def _format_snap_price(snap: dict) -> str:
     except (TypeError, ValueError):
         return '—'
     sym = snap.get('price_display_symbol') or '$'
-    # Currency-code symbols ('USD', 'EUR') render as a 3-letter suffix;
-    # single-glyph symbols ('$', '€') stay as a prefix.
     if len(sym) == 1 or sym in ('$', '€', '£', '¥'):
         if n >= 1000:  return f'{sym}{n:,.2f}'
         if n >= 1:     return f'{sym}{n:,.4f}'
         return f'{sym}{n:.6f}'
-    # 3-letter currency code (forex): "1.0934 USD"
     if n >= 1000:  return f'{n:,.2f} {sym}'
     if n >= 1:     return f'{n:.4f} {sym}'
     return f'{n:.6f} {sym}'
 
 
 def _parse_hex_color(s: str) -> Optional[int]:
-    """Accept '#RRGGBB' or 'RRGGBB' (case-insensitive); return int or None."""
     if not s:
         return None
     v = str(s).strip().lstrip('#')
@@ -142,15 +122,22 @@ def _parse_hex_color(s: str) -> Optional[int]:
         return None
 
 
-def _format_date_suffix(settings: dict) -> str:
-    """Return the title's date/timezone suffix or '' depending on the
-    per-guild digest_date_mode setting."""
-    mode = (settings.get('digest_date_mode') or 'date_tz').strip().lower()
+def _resolve_channel_id(value) -> Optional[int]:
+    if value is None or value == '':
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_date_suffix(topic_settings: dict, global_settings: dict) -> str:
+    mode = (topic_settings.get('digest_date_mode') or 'date_tz').strip().lower()
     if mode not in DATE_MODES:
         mode = 'date_tz'
     if mode == 'off':
         return ''
-    tz_offset = int(settings.get('timezone_offset') or 0)
+    tz_offset = int(global_settings.get('timezone_offset') or 0)
     local_now = _local_now(tz_offset)
     date_label = local_now.strftime('%b %d')
     if mode == 'date_only':
@@ -158,53 +145,23 @@ def _format_date_suffix(settings: dict) -> str:
     sign = '+' if tz_offset >= 0 else '-'
     hh   = abs(tz_offset) // 60
     mm   = abs(tz_offset) % 60
-    tz_label = f'UTC{sign}{hh:02d}:{mm:02d}'
-    return f' — {date_label} ({tz_label})'
+    return f' — {date_label} (UTC{sign}{hh:02d}:{mm:02d})'
 
 
-def _section_lines_watchlist(rows_snaps: list[tuple[dict, dict]]) -> list[str]:
-    out: list[str] = []
-    for row, snap in rows_snaps[:25]:
-        sym = (snap.get('symbol_display') or row.get('display_name')
-               or row.get('asset_identifier') or '').upper()
-        price = _format_snap_price(snap)
-        ch24  = _format_pct(snap.get('change_24h_pct'))
-        out.append(f'`{sym:<10}` {price:<16} {ch24}')
-    return out
-
-
-def _section_lines_top(snaps: list[dict]) -> list[str]:
-    out: list[str] = []
-    for snap in snaps:
-        sym  = (snap.get('symbol_display') or snap.get('identifier') or '').upper()
-        price = _format_snap_price(snap)
-        ch24  = _format_pct(snap.get('change_24h_pct'))
-        out.append(f'`{sym:<6}` {price:<16} {ch24}')
-    return out
-
-
-def _watch_sections_by_kind(guild_id: int, kinds: tuple[str, ...]) -> dict:
-    """For each requested kind, return [(row, snapshot), ...] in the order
-    the user added them. Empty kinds are omitted from the result."""
-    out: dict = {}
-    rows_all = list_radar_watchlist(guild_id)
-    for k in kinds:
-        items: list[tuple[dict, dict]] = []
-        for row in rows_all:
-            if (row.get('asset_kind') or '').lower() != k:
-                continue
-            ident = (row.get('asset_identifier') or '').lower()
-            snap  = CACHE.get_snapshot(k, ident)
-            if snap:
-                items.append((row, snap))
-        if items:
-            out[k] = items
+def _topic_watchlist_with_snaps(guild_id: int, topic: str) -> list[tuple[dict, dict]]:
+    rows = list_radar_watchlist(int(guild_id), asset_kind=topic)
+    out: list[tuple[dict, dict]] = []
+    for r in rows:
+        ident = (r.get('asset_identifier') or '')
+        # NFT/crypto are lowercased, meme/forex are case-significant —
+        # cache keys match the saved identifier exactly.
+        snap = CACHE.get_snapshot(topic, ident if topic in ('meme', 'forex') else ident.lower())
+        if snap:
+            out.append((r, snap))
     return out
 
 
 def _crypto_top10_fallback() -> list[dict]:
-    """Top-10 crypto by market cap, sorted from the leaderboard cache. Used
-    only when the guild has NO watchlist entries in any kind."""
     rows: list[dict] = []
     for cs in CACHE.all_for_kind('crypto'):
         snap = cs.snapshot
@@ -215,42 +172,35 @@ def _crypto_top10_fallback() -> list[dict]:
     return rows[:10]
 
 
-def _build_digest_embed(
-    guild_id: int, settings: dict,
-    *,
-    kinds: tuple[str, ...] = _KIND_ORDER,
+def _build_topic_embed(
+    guild_id: int, topic: str,
+    topic_settings: dict, global_settings: dict,
 ) -> Optional[discord.Embed]:
-    """Compose the per-guild market-update embed from cache.
-
-    `kinds` lets the topic-channel router request a single-kind embed (e.g.
-    a guild routes NFT-only to daily_channel_nft). The default value covers
-    every supported kind, and the per-kind sections are emitted in fixed
-    display order. Empty kinds are silently skipped.
-
-    Content rule: if any of the requested kinds has watchlist content, the
-    embed shows only those sections — NO Top-10 leaderboard. If every
-    requested kind is empty AND the requested set contains crypto, fall
-    back to the crypto Top-10 by market cap so the post is never blank.
-    Returns None when nothing useful can be assembled."""
-    watch_by_kind = _watch_sections_by_kind(guild_id, kinds)
-    fallback_top: list[dict] = []
-    if not watch_by_kind and 'crypto' in kinds:
-        fallback_top = _crypto_top10_fallback()
-    if not watch_by_kind and not fallback_top:
+    """Single-topic embed. Returns None when the topic has no data to show
+    AND it isn't crypto (only crypto has a top-10 leaderboard fallback)."""
+    if topic not in _TOPICS:
         return None
 
-    # Custom template overrides.
-    custom_title    = (settings.get('digest_title')  or '').strip()
-    custom_intro    = (settings.get('digest_intro')  or '').strip()
-    custom_color    = _parse_hex_color(settings.get('digest_color') or '')
-    custom_footer   = (settings.get('digest_footer') or '').strip()
-    thumb_mode      = (settings.get('digest_thumbnail_mode') or 'brand').strip().lower()
+    watch_section = _topic_watchlist_with_snaps(int(guild_id), topic)
+    fallback_top: list[dict] = []
+    if not watch_section and topic == 'crypto':
+        fallback_top = _crypto_top10_fallback()
+    if not watch_section and not fallback_top:
+        return None
+
+    custom_title  = (topic_settings.get('digest_title')  or '').strip()
+    custom_intro  = (topic_settings.get('digest_intro')  or '').strip()
+    custom_color  = _parse_hex_color(topic_settings.get('digest_color') or '')
+    custom_footer = (topic_settings.get('digest_footer') or '').strip()
+    thumb_mode    = (topic_settings.get('digest_thumbnail_mode') or 'brand').strip().lower()
     if thumb_mode not in THUMBNAIL_MODES:
         thumb_mode = 'brand'
 
-    date_suffix = _format_date_suffix(settings)
-    title = f'📊 {custom_title or DEFAULT_DIGEST_TITLE}{date_suffix}'
-    intro = (custom_intro or DEFAULT_DIGEST_INTRO)
+    date_suffix = _format_date_suffix(topic_settings, global_settings)
+    topic_label = _KIND_LABELS.get(topic, topic.capitalize())
+    base_title  = custom_title or f"{topic_label} — {DEFAULT_DIGEST_TITLE}"
+    title       = f'📊 {base_title}{date_suffix}'
+    intro       = custom_intro or DEFAULT_DIGEST_INTRO
 
     e = build_branded_embed(
         int(guild_id),
@@ -263,40 +213,40 @@ def _build_digest_embed(
     )
     if custom_color is not None:
         e.color = discord.Color(custom_color)
-
     if thumb_mode == 'first_coin':
         first_img = ''
-        for k in _KIND_ORDER:
-            items = watch_by_kind.get(k)
-            if items:
-                first_img = (items[0][1].get('image_url') or '').strip()
-                if first_img:
-                    break
-        if not first_img and fallback_top:
+        if watch_section:
+            first_img = (watch_section[0][1].get('image_url') or '').strip()
+        elif fallback_top:
             first_img = (fallback_top[0].get('image_url') or '').strip()
         if first_img:
             e.set_thumbnail(url=first_img)
-
     if custom_footer:
         e.set_footer(text=custom_footer[:2048])
 
-    # ── Per-kind sections in fixed display order ────────────────────────
-    if watch_by_kind:
-        for k in _KIND_ORDER:
-            items = watch_by_kind.get(k)
-            if not items:
-                continue
-            lines = _section_lines_watchlist(items)
-            if not lines:
-                continue
-            e.add_field(
-                name=_KIND_LABELS.get(k, k.capitalize()),
-                value='\n'.join(lines)[:1024],
-                inline=False,
-            )
+    # Single section body. Watchlist is the primary content; crypto top-10
+    # only appears as a fallback when this topic's watchlist is empty.
+    if watch_section:
+        lines: list[str] = []
+        for row, snap in watch_section[:25]:
+            sym = (snap.get('symbol_display') or row.get('display_name')
+                   or row.get('asset_identifier') or '').upper()
+            price = _format_snap_price(snap)
+            ch24  = _format_pct(snap.get('change_24h_pct'))
+            lines.append(f'`{sym:<10}` {price:<16} {ch24}')
+        e.add_field(
+            name=f'Your {topic_label} watchlist',
+            value='\n'.join(lines)[:1024],
+            inline=False,
+        )
     else:
-        # Crypto-Top-10 leaderboard fallback.
-        lines = _section_lines_top(fallback_top)
+        # Crypto-only fallback.
+        lines = []
+        for snap in fallback_top:
+            sym  = (snap.get('symbol_display') or snap.get('identifier') or '').upper()
+            price = _format_snap_price(snap)
+            ch24  = _format_pct(snap.get('change_24h_pct'))
+            lines.append(f'`{sym:<6}` {price:<16} {ch24}')
         e.add_field(
             name=f'Top {len(fallback_top)} by Market Cap',
             value='\n'.join(lines)[:1024],
@@ -307,39 +257,18 @@ def _build_digest_embed(
 
 
 class DigestSendError(Exception):
-    """Raised when a digest cannot be posted. The message is admin-friendly
-    so api.py can surface it directly. The string itself is also logged."""
+    """Raised when a topic-scoped digest cannot be posted."""
 
 
-_TOPIC_CHANNEL_KEYS = {
-    'crypto': 'daily_channel_crypto',
-    'nft':    'daily_channel_nft',
-    'meme':   'daily_channel_meme',
-    'forex':  'daily_channel_forex',
-}
+async def post_digest_now(bot, guild_id: int, topic: str) -> dict:
+    """Build + send a single-topic digest immediately. Used by both the
+    manual send-now endpoint and the scheduled scheduler_loop (per topic).
+    Raises DigestSendError on any failure — quota consumption / scheduler
+    bookkeeping is the caller's responsibility."""
+    t = (topic or '').strip().lower()
+    if t not in _TOPICS:
+        raise DigestSendError(f'Unknown topic "{topic}".')
 
-
-def _resolve_channel_id(value) -> Optional[int]:
-    """Channel ids may be stored as int (legacy) or str (polish-A path).
-    Coerce both shapes to int; empty/None → None."""
-    if value is None or value == '':
-        return None
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
-async def post_digest_now(bot, guild_id: int, settings: dict) -> dict:
-    """Build + send the market-update embeds right now. Routes to per-topic
-    channels when configured: each kind with a configured topic-channel gets
-    its own topic-scoped embed; kinds without a topic-channel but with
-    watchlist content go to the main daily_channel_crypto channel as a
-    combined embed. If neither path produces a send, raises DigestSendError.
-
-    Returns {'channel_id': int, 'message_id': int, 'watchlist_count': int,
-    'posts': int} — channel_id/message_id reference the first successful
-    post for backwards compatibility, and `posts` is the total count."""
     if not bot.is_ready():
         raise DigestSendError('Bot is starting up; try again in a moment.')
 
@@ -347,195 +276,126 @@ async def post_digest_now(bot, guild_id: int, settings: dict) -> dict:
     if guild is None:
         raise DigestSendError('Bot is not in this server.')
 
-    main_ch_raw = settings.get('daily_channel_crypto')
-    main_ch_id  = _resolve_channel_id(main_ch_raw)
+    topic_settings  = get_radar_topic_settings(int(guild_id), t)
+    global_settings = get_radar_settings(int(guild_id))
 
-    # Per-topic channel map. Drop entries with no channel id.
-    topic_channels: dict[str, int] = {}
-    for k, key in _TOPIC_CHANNEL_KEYS.items():
-        cid = _resolve_channel_id(settings.get(key))
-        if cid is not None:
-            topic_channels[k] = cid
+    ch_id = _resolve_channel_id(topic_settings.get('daily_channel'))
+    if ch_id is None:
+        raise DigestSendError(
+            f'Configure a daily channel for {_KIND_LABELS.get(t, t)} first.'
+        )
 
-    if not topic_channels and main_ch_id is None:
-        raise DigestSendError('Configure a crypto digest channel first.')
+    try:
+        channel = guild.get_channel(int(ch_id))
+    except (TypeError, ValueError):
+        channel = None
+    if channel is None:
+        raise DigestSendError(f'Daily channel for {_KIND_LABELS.get(t, t)} not found.')
 
-    # For routing decisions we need to know which kinds the guild has
-    # content for right now.
-    watch_by_kind = _watch_sections_by_kind(int(guild_id), _KIND_ORDER)
+    embed = _build_topic_embed(int(guild_id), t, topic_settings, global_settings)
+    if embed is None:
+        raise DigestSendError(
+            f'No {_KIND_LABELS.get(t, t)} data to post yet. Either the '
+            'cache is cold (fetcher runs every 5 minutes) or the '
+            f'{_KIND_LABELS.get(t, t)} watchlist is empty.'
+        )
 
-    # Topics with their own channel → topic-scoped embed.
-    # Topics without their own channel but with content AND a main channel
-    # → folded into the combined embed sent to the main channel.
-    topic_posts: list[tuple[str, int, tuple]] = []   # (kind, channel_id, (kind,))
-    combined_kinds: list[str] = []
-    for k in _KIND_ORDER:
-        if k in topic_channels:
-            # Always post the topic embed for explicitly-routed kinds, even
-            # if their section ends up empty (the body will fall back to
-            # crypto top-10 for the crypto channel, or yield None for the
-            # other kinds — in that case we just skip the send).
-            topic_posts.append((k, topic_channels[k], (k,)))
-        elif k in watch_by_kind:
-            combined_kinds.append(k)
-
-    if combined_kinds and main_ch_id is None:
-        # Some kinds need posting but no main channel exists. They'd be
-        # silently dropped — note it but don't fail the whole send.
-        print(f'[radar/digest] g={guild_id} dropping kinds with no channel: '
-              f'{combined_kinds}')
-
-    mentions = _parse_role_id_list(settings.get('digest_mention_role_ids'))
+    mentions = _parse_role_id_list(topic_settings.get('digest_mention_role_ids'))
     content  = _mention_content(mentions)
     allowed  = discord.AllowedMentions(roles=True, users=False, everyone=False)
 
-    sent_posts: list[dict] = []
-    first_topic_skip_reason = None
+    try:
+        msg = await channel.send(content=content, embed=embed, allowed_mentions=allowed)
+    except discord.Forbidden as e:
+        raise DigestSendError(
+            f'Bot lacks permission to post in #{getattr(channel, "name", ch_id)}.'
+        ) from e
+    except Exception as e:  # noqa: BLE001
+        raise DigestSendError(f'Discord error: {type(e).__name__}: {e}') from e
 
-    # Per-topic posts.
-    for kind, ch_id, ks in topic_posts:
-        try:
-            channel = guild.get_channel(int(ch_id))
-        except (TypeError, ValueError):
-            channel = None
-        if channel is None:
-            print(f'[radar/digest] g={guild_id} {kind} channel {ch_id} missing — skip')
-            continue
-        embed = _build_digest_embed(int(guild_id), settings, kinds=ks)
-        if embed is None:
-            print(f'[radar/digest] g={guild_id} {kind} embed empty — skip')
-            if first_topic_skip_reason is None:
-                first_topic_skip_reason = (
-                    f'No {kind} data to post yet. Either the cache is cold '
-                    '(fetcher runs every 5 minutes) or your watchlist is '
-                    'empty for that kind.'
-                )
-            continue
-        try:
-            msg = await channel.send(content=content, embed=embed,
-                                     allowed_mentions=allowed)
-            sent_posts.append({'kind': kind, 'channel_id': int(channel.id),
-                               'message_id': int(msg.id)})
-        except discord.Forbidden:
-            raise DigestSendError(
-                f'Bot lacks permission to post in #{getattr(channel, "name", ch_id)}.'
-            )
-        except Exception as e:  # noqa: BLE001
-            raise DigestSendError(f'Discord error: {type(e).__name__}: {e}') from e
-
-    # Combined embed for the main channel (covers kinds without explicit
-    # channels). Also fires when no per-topic channels were configured at
-    # all — in that case the main channel gets the full multi-kind digest.
-    main_kinds: tuple[str, ...] = ()
-    if main_ch_id is not None:
-        if not topic_channels:
-            # No per-topic routing at all — main channel gets the whole digest.
-            main_kinds = _KIND_ORDER
-        elif combined_kinds:
-            main_kinds = tuple(combined_kinds)
-
-    if main_kinds:
-        try:
-            channel = guild.get_channel(int(main_ch_id))
-        except (TypeError, ValueError):
-            channel = None
-        if channel is None:
-            print(f'[radar/digest] g={guild_id} main channel {main_ch_id} missing — skip')
-        else:
-            embed = _build_digest_embed(int(guild_id), settings, kinds=main_kinds)
-            if embed is not None:
-                try:
-                    msg = await channel.send(content=content, embed=embed,
-                                             allowed_mentions=allowed)
-                    sent_posts.append({'kind': 'combined',
-                                       'channel_id': int(channel.id),
-                                       'message_id': int(msg.id)})
-                except discord.Forbidden:
-                    raise DigestSendError(
-                        f'Bot lacks permission to post in #{getattr(channel, "name", main_ch_id)}.'
-                    )
-                except Exception as e:  # noqa: BLE001
-                    raise DigestSendError(f'Discord error: {type(e).__name__}: {e}') from e
-
-    if not sent_posts:
-        raise DigestSendError(first_topic_skip_reason or (
-            'No data to post yet. Either the cache is cold (fetcher runs '
-            'every 5 minutes) or every watchlist is empty.'
-        ))
-
-    rows = list_radar_watchlist(int(guild_id))
-    first = sent_posts[0]
+    rows = list_radar_watchlist(int(guild_id), asset_kind=t)
     return {
-        'channel_id':      first['channel_id'],
-        'message_id':      first['message_id'],
+        'topic':           t,
+        'channel_id':      int(channel.id),
+        'message_id':      int(msg.id),
         'watchlist_count': len(rows),
-        'posts':           len(sent_posts),
-        'all_posts':       sent_posts,
     }
 
 
-async def _maybe_send_for(
-    bot, guild_id: int, settings: dict,
+async def _maybe_send_for_topic(
+    bot, guild_id: int, topic: str,
+    topic_settings: dict, global_settings: dict,
 ) -> bool:
-    """Scheduled-tick handler. Idempotent within a guild-local day via
-    last_daily_sent_date. On any failure (forbidden / channel gone / no
-    data) it still marks the day complete to avoid hammering for 30 min."""
+    """Scheduled-tick handler for one (guild, topic). Idempotent within a
+    guild-local day via last_daily_sent_date on the topic row. On any
+    failure we still mark the day complete to avoid hammering for 30 min."""
     if not bot.is_ready():
         return False
-    if not int(settings.get('daily_enabled') or 0):
+    if not int(topic_settings.get('daily_enabled') or 0):
         return False
-    if not settings.get('daily_channel_crypto'):
+    if not topic_settings.get('daily_channel'):
         return False
 
-    daily_time = settings.get('daily_time') or '08:00'
+    daily_time = topic_settings.get('daily_time') or '08:00'
     hm = _parse_hhmm(daily_time)
     if hm is None:
         return False
 
-    tz_offset = int(settings.get('timezone_offset') or 0)
+    tz_offset = int(global_settings.get('timezone_offset') or 0)
     local_now = _local_now(tz_offset)
     local_today = local_now.strftime('%Y-%m-%d')
 
-    if str(settings.get('last_daily_sent_date') or '') == local_today:
-        return False  # already sent today (guild-local day)
+    if str(topic_settings.get('last_daily_sent_date') or '') == local_today:
+        return False
 
     target_h, target_m = hm
     target_dt = local_now.replace(
         hour=target_h, minute=target_m, second=0, microsecond=0,
     )
-    # Window: fire when local time is between target and target+30 min.
     delta = (local_now - target_dt).total_seconds()
     if not (0 <= delta < 30 * 60):
         return False
 
     try:
-        await post_digest_now(bot, guild_id, settings)
+        await post_digest_now(bot, int(guild_id), topic)
     except DigestSendError as e:
-        print(f'[radar/digest] g={guild_id} scheduled send failed: {e}')
-        # Mark date so we don't retry every 60s for the rest of the window.
-        update_radar_settings(guild_id, last_daily_sent_date=local_today)
+        print(f'[radar/digest] g={guild_id} {topic} scheduled failed: {e}')
+        update_radar_topic_settings(int(guild_id), topic,
+                                    last_daily_sent_date=local_today)
         return False
     except Exception as e:  # noqa: BLE001
-        print(f'[radar/digest] g={guild_id} scheduled send crashed: '
+        print(f'[radar/digest] g={guild_id} {topic} scheduled crashed: '
               f'{type(e).__name__}: {e}')
         return False
 
-    update_radar_settings(guild_id, last_daily_sent_date=local_today)
-    print(f'[radar/digest] g={guild_id} digest posted at {local_now.isoformat()}')
+    update_radar_topic_settings(int(guild_id), topic,
+                                last_daily_sent_date=local_today)
+    print(f'[radar/digest] g={guild_id} {topic} posted at {local_now.isoformat()}')
     return True
 
 
 async def scheduler_loop(bot) -> None:
-    """Long-running coroutine that checks every 60s if any guild is due."""
-    print('[radar/digest] scheduler starting (60s tick)')
+    """Long-running coroutine that checks every 60s if any (guild, topic)
+    is due."""
+    print('[radar/digest] scheduler starting (60s tick, per-topic)')
     while True:
         try:
             for gid in list_guilds_with_radar():
                 try:
-                    settings = get_radar_settings(gid)
-                    await _maybe_send_for(bot, gid, settings)
+                    global_settings = get_radar_settings(gid)
                 except Exception as e:  # noqa: BLE001
-                    print(f'[radar/digest] g={gid} crashed: {type(e).__name__}: {e}')
+                    print(f'[radar/digest] g={gid} global read failed: '
+                          f'{type(e).__name__}: {e}')
+                    continue
+                for topic in _TOPICS:
+                    try:
+                        topic_settings = get_radar_topic_settings(gid, topic)
+                        await _maybe_send_for_topic(
+                            bot, gid, topic, topic_settings, global_settings,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        print(f'[radar/digest] g={gid} {topic} crashed: '
+                              f'{type(e).__name__}: {e}')
         except Exception as e:  # noqa: BLE001
             print(f'[radar/digest] tick crashed: {type(e).__name__}: {e}')
         try:

@@ -103,6 +103,10 @@ from database import (
     add_radar_watchlist_entry as db_add_radar_watchlist_entry,
     remove_radar_watchlist_entry as db_remove_radar_watchlist_entry,
     list_recent_radar_alerts as db_list_recent_radar_alerts,
+    get_radar_topic_settings as db_get_radar_topic_settings,
+    update_radar_topic_settings as db_update_radar_topic_settings,
+    list_radar_topic_settings as db_list_radar_topic_settings,
+    check_and_consume_topic_send_quota as db_check_and_consume_topic_send_quota,
 )
 from shared_bot import bot
 from cogs._branding import PREMIUM_GUILD_IDS
@@ -3638,37 +3642,51 @@ def _radar_normalize_hex_color(s: str) -> str:
     return '#' + raw.lstrip('#').lower()
 
 
-class _RadarSettingsUpdate(BaseModel):
-    timezone_offset:              Optional[int]    = None
-    daily_time:                   Optional[str]    = None
+class _RadarTopicBlock(BaseModel):
+    """All editable fields on a single (guild, topic) row. Every field is
+    optional so PATCH can be sparse — only present keys are written."""
     daily_enabled:                Optional[int]    = None
-    daily_channel_crypto:         Optional[str]    = None
-    daily_channel_nft:            Optional[str]    = None
-    daily_channel_meme:           Optional[str]    = None
-    daily_channel_forex:          Optional[str]    = None
-    daily_channel_stocks:         Optional[str]    = None
-    alerts_channel:               Optional[str]    = None
+    daily_channel:                Optional[str]    = None
+    daily_time:                   Optional[str]    = None
+    digest_mention_role_ids:      Optional[object] = None
     alerts_enabled:               Optional[int]    = None
+    alerts_channel:               Optional[str]    = None
     movement_threshold_pct:       Optional[float]  = None
     volume_multiplier_threshold:  Optional[float]  = None
-    liquidation_channel:          Optional[str]    = None
-    liquidation_enabled:          Optional[int]    = None
-    liquidation_min_usd:          Optional[int]    = None
-    stocks_alpha_vantage_key:     Optional[str]    = None
-    # Mention-role lists: accept list OR comma/space/newline string OR a
-    # single id. _normalize_role_id_list (shared with giveaway/protection)
-    # reduces all shapes to a canonical JSON-array string. Persisted as
-    # such; digest.py / alerts.py json.loads on read.
-    digest_mention_role_ids:      Optional[object] = None
     alerts_mention_role_ids:      Optional[object] = None
-    # Digest template overrides. Empty string = use the news-y default in
-    # services.radar.digest. Validated below.
     digest_title:                 Optional[str]    = None
     digest_intro:                 Optional[str]    = None
-    digest_color:                 Optional[str]    = None   # '#RRGGBB' or 'RRGGBB' or ''
+    digest_color:                 Optional[str]    = None
     digest_footer:                Optional[str]    = None
-    digest_thumbnail_mode:        Optional[str]    = None   # 'brand'|'first_coin'|'off'
-    digest_date_mode:             Optional[str]    = None   # 'off'|'date_only'|'date_tz'
+    digest_thumbnail_mode:        Optional[str]    = None
+    digest_date_mode:             Optional[str]    = None
+
+
+class _RadarGlobalBlock(BaseModel):
+    """Guild-global radar settings — timezone (shared across all topics) +
+    Phase-3 reserved fields (liquidation_* + stocks_alpha_vantage_key)."""
+    timezone_offset:              Optional[int]    = None
+    # Phase-3 reservations — accepted on write so we don't have to revisit
+    # the model when those topics ship.
+    liquidation_enabled:          Optional[int]    = None
+    liquidation_channel:          Optional[str]    = None
+    liquidation_min_usd:          Optional[int]    = None
+    stocks_alpha_vantage_key:     Optional[str]    = None
+
+
+class _RadarSettingsUpdate(BaseModel):
+    """New PATCH body shape: { global: {...}, topics: { crypto: {...}, ... } }.
+    Either side may be omitted; whichever is present is partially merged."""
+    global_:                      Optional[_RadarGlobalBlock] = None
+    topics:                       Optional[dict[str, _RadarTopicBlock]] = None
+
+    # FastAPI / Pydantic v2 alias for the reserved Python word 'global'.
+    model_config = {'populate_by_name': True}
+
+    def __init__(self, **data):
+        if 'global' in data and 'global_' not in data:
+            data['global_'] = data.pop('global')
+        super().__init__(**data)
 
 
 class _RadarWatchlistCreate(BaseModel):
@@ -3726,16 +3744,46 @@ def _radar_channel(value, *, field: str) -> str | None:
     return s
 
 
-def _radar_mask_settings(s: dict) -> dict:
-    """Redact the Alpha Vantage key in responses — clients can write it
-    via PATCH but never read it back. Mention-role columns are decoded from
-    their JSON-array storage so the dashboard renders ready-to-edit lists."""
+_RADAR_TOPIC_NAMES = ('crypto', 'nft', 'meme', 'forex')
+
+
+def _radar_mask_global(s: dict) -> dict:
+    """Guild-global block. Stringifies channel ids, masks Alpha Vantage key.
+    Phase-3 reserved fields pass through so the dashboard can read state
+    without a separate endpoint."""
     out = dict(s)
     key = out.get('stocks_alpha_vantage_key')
     if key:
-        out['stocks_alpha_vantage_key'] = f'••••{str(key)[-4:]}' if len(str(key)) > 4 else '••••'
+        out['stocks_alpha_vantage_key'] = (f'••••{str(key)[-4:]}'
+                                            if len(str(key)) > 4 else '••••')
     out['stocks_alpha_vantage_key_set'] = bool(key)
+    for col in ('liquidation_channel',):
+        v = out.get(col)
+        out[col] = str(v) if (v is not None and v != '') else None
+    # Strip legacy per-topic fields from the global view — they are owned
+    # by radar_topic_settings now.
+    for legacy in ('daily_enabled', 'daily_time', 'daily_channel_crypto',
+                   'daily_channel_nft', 'daily_channel_meme',
+                   'daily_channel_forex', 'daily_channel_stocks',
+                   'alerts_channel', 'alerts_enabled',
+                   'movement_threshold_pct', 'volume_multiplier_threshold',
+                   'digest_title', 'digest_intro', 'digest_color',
+                   'digest_footer', 'digest_thumbnail_mode',
+                   'digest_date_mode', 'digest_mention_role_ids',
+                   'alerts_mention_role_ids',
+                   'manual_digests_used_today', 'manual_digests_reset_date',
+                   'last_manual_digest_at', 'last_daily_sent_date'):
+        out.pop(legacy, None)
+    return out
 
+
+def _radar_mask_topic(row: dict) -> dict:
+    """Per-topic row: stringify channel ids, decode role-id JSON arrays,
+    surface per-topic manual-send quota counters."""
+    out = dict(row)
+    for col in ('daily_channel', 'alerts_channel'):
+        v = out.get(col)
+        out[col] = str(v) if (v is not None and v != '') else None
     for col in ('digest_mention_role_ids', 'alerts_mention_role_ids'):
         raw = out.get(col) or '[]'
         try:
@@ -3746,18 +3794,6 @@ def _radar_mask_settings(s: dict) -> dict:
             arr = []
         out[col] = [str(v).strip() for v in arr if str(v).strip()]
 
-    # Channel-id columns: ALWAYS string on the wire. JS Number.MAX_SAFE_INTEGER
-    # silently truncates 17-19 digit Discord snowflakes; stringifying here
-    # protects every legacy row that was stored as INTEGER.
-    for col in ('daily_channel_crypto', 'daily_channel_nft',
-                'daily_channel_meme', 'daily_channel_forex',
-                'daily_channel_stocks', 'alerts_channel',
-                'liquidation_channel'):
-        v = out.get(col)
-        out[col] = str(v) if (v is not None and v != '') else None
-
-    # Manual-digest quota: show remaining alongside used so the dashboard
-    # doesn't need to compute it. Quota resets on UTC date change.
     today_utc = datetime.now(timezone.utc).date().isoformat()
     used = int(out.get('manual_digests_used_today') or 0)
     if str(out.get('manual_digests_reset_date') or '') != today_utc:
@@ -3774,8 +3810,116 @@ async def radar_settings_get(
     server_id: int, user: dict = Depends(get_current_user),
 ):
     require_module_access(user, server_id, 'radar')
-    s = db_get_radar_settings(server_id)
-    return _radar_mask_settings(s)
+    glob = db_get_radar_settings(server_id)
+    topics_raw = db_list_radar_topic_settings(server_id)
+    return {
+        'global': _radar_mask_global(glob),
+        'topics': {t: _radar_mask_topic(topics_raw[t]) for t in _RADAR_TOPIC_NAMES},
+    }
+
+
+def _validate_topic_block(topic: str, raw: dict) -> dict:
+    """Translate a sparse _RadarTopicBlock dict into a column-named updates
+    dict suitable for db_update_radar_topic_settings. Each field present
+    is validated; absent fields are not touched."""
+    updates: dict = {}
+    if 'daily_enabled' in raw:
+        updates['daily_enabled'] = 1 if raw['daily_enabled'] else 0
+    if 'daily_channel' in raw:
+        updates['daily_channel'] = _radar_channel(raw['daily_channel'],
+                                                   field=f'{topic}.daily_channel')
+    if 'daily_time' in raw:
+        updates['daily_time'] = _radar_hhmm(raw['daily_time'] or '')
+    if 'digest_mention_role_ids' in raw:
+        updates['digest_mention_role_ids'] = _normalize_role_id_list(
+            raw['digest_mention_role_ids'],
+            field=f'{topic}.digest_mention_role_ids',
+        )
+    if 'alerts_enabled' in raw:
+        updates['alerts_enabled'] = 1 if raw['alerts_enabled'] else 0
+    if 'alerts_channel' in raw:
+        updates['alerts_channel'] = _radar_channel(raw['alerts_channel'],
+                                                     field=f'{topic}.alerts_channel')
+    if 'movement_threshold_pct' in raw:
+        updates['movement_threshold_pct'] = _radar_clamp(
+            raw['movement_threshold_pct'],
+            _RADAR_MOVE_PCT_RANGE[0], _RADAR_MOVE_PCT_RANGE[1],
+            kind='float', field=f'{topic}.movement_threshold_pct',
+        )
+    if 'volume_multiplier_threshold' in raw:
+        updates['volume_multiplier_threshold'] = _radar_clamp(
+            raw['volume_multiplier_threshold'],
+            _RADAR_VOL_MULT_RANGE[0], _RADAR_VOL_MULT_RANGE[1],
+            kind='float', field=f'{topic}.volume_multiplier_threshold',
+        )
+    if 'alerts_mention_role_ids' in raw:
+        updates['alerts_mention_role_ids'] = _normalize_role_id_list(
+            raw['alerts_mention_role_ids'],
+            field=f'{topic}.alerts_mention_role_ids',
+        )
+    # Digest template overrides — empty string is meaningful (= use default).
+    if 'digest_title' in raw:
+        val = (raw['digest_title'] or '').strip()
+        if len(val) > _RADAR_DIGEST_TITLE_MAX:
+            raise HTTPException(status_code=400,
+                detail=f'{topic}.digest_title too long')
+        updates['digest_title'] = val
+    if 'digest_intro' in raw:
+        val = (raw['digest_intro'] or '').strip()
+        if len(val) > _RADAR_DIGEST_INTRO_MAX:
+            raise HTTPException(status_code=400,
+                detail=f'{topic}.digest_intro too long')
+        updates['digest_intro'] = val
+    if 'digest_color' in raw:
+        updates['digest_color'] = _radar_normalize_hex_color(raw['digest_color'])
+    if 'digest_footer' in raw:
+        val = (raw['digest_footer'] or '').strip()
+        if len(val) > _RADAR_DIGEST_FOOTER_MAX:
+            raise HTTPException(status_code=400,
+                detail=f'{topic}.digest_footer too long')
+        updates['digest_footer'] = val
+    if 'digest_thumbnail_mode' in raw:
+        v = (raw['digest_thumbnail_mode'] or 'brand').strip().lower()
+        if v not in _RADAR_DIGEST_THUMB_MODES:
+            raise HTTPException(status_code=400,
+                detail=f'{topic}.digest_thumbnail_mode must be one of: '
+                       f'{", ".join(sorted(_RADAR_DIGEST_THUMB_MODES))}')
+        updates['digest_thumbnail_mode'] = v
+    if 'digest_date_mode' in raw:
+        v = (raw['digest_date_mode'] or 'date_tz').strip().lower()
+        if v not in _RADAR_DIGEST_DATE_MODES:
+            raise HTTPException(status_code=400,
+                detail=f'{topic}.digest_date_mode must be one of: '
+                       f'{", ".join(sorted(_RADAR_DIGEST_DATE_MODES))}')
+        updates['digest_date_mode'] = v
+    return updates
+
+
+def _validate_global_block(raw: dict) -> dict:
+    updates: dict = {}
+    if 'timezone_offset' in raw:
+        updates['timezone_offset'] = int(_radar_clamp(
+            raw['timezone_offset'],
+            _RADAR_TZ_OFFSET_RANGE[0], _RADAR_TZ_OFFSET_RANGE[1],
+            kind='int', field='global.timezone_offset',
+        ))
+    if 'liquidation_enabled' in raw:
+        updates['liquidation_enabled'] = 1 if raw['liquidation_enabled'] else 0
+    if 'liquidation_channel' in raw:
+        updates['liquidation_channel'] = _radar_channel(
+            raw['liquidation_channel'], field='global.liquidation_channel',
+        )
+    if 'liquidation_min_usd' in raw:
+        updates['liquidation_min_usd'] = int(_radar_clamp(
+            raw['liquidation_min_usd'],
+            _RADAR_LIQ_MIN_USD_RANGE[0], _RADAR_LIQ_MIN_USD_RANGE[1],
+            kind='int', field='global.liquidation_min_usd',
+        ))
+    if 'stocks_alpha_vantage_key' in raw:
+        new_key = (raw['stocks_alpha_vantage_key'] or '').strip()
+        if new_key and not new_key.startswith('••'):
+            updates['stocks_alpha_vantage_key'] = new_key[:128]
+    return updates
 
 
 @app.patch('/api/servers/{server_id}/radar/settings')
@@ -3786,110 +3930,37 @@ async def radar_settings_patch(
 ):
     require_module_access(user, server_id, 'radar')
     rate_limit(f'radar_settings:{server_id}', 60, 60.0)
-    payload = body.model_dump(exclude_unset=True)
-    updates: dict = {}
 
-    if 'timezone_offset' in payload:
-        updates['timezone_offset'] = int(_radar_clamp(
-            payload['timezone_offset'],
-            _RADAR_TZ_OFFSET_RANGE[0], _RADAR_TZ_OFFSET_RANGE[1],
-            kind='int', field='timezone_offset',
-        ))
-    if 'daily_time' in payload:
-        updates['daily_time'] = _radar_hhmm(payload['daily_time'] or '')
-    if 'daily_enabled' in payload:
-        updates['daily_enabled'] = 1 if payload['daily_enabled'] else 0
-    for ch_key in ('daily_channel_crypto', 'daily_channel_nft',
-                   'daily_channel_meme', 'daily_channel_forex',
-                   'daily_channel_stocks', 'alerts_channel',
-                   'liquidation_channel'):
-        if ch_key in payload:
-            updates[ch_key] = _radar_channel(payload[ch_key], field=ch_key)
-    if 'alerts_enabled' in payload:
-        updates['alerts_enabled'] = 1 if payload['alerts_enabled'] else 0
-    if 'movement_threshold_pct' in payload:
-        updates['movement_threshold_pct'] = _radar_clamp(
-            payload['movement_threshold_pct'],
-            _RADAR_MOVE_PCT_RANGE[0], _RADAR_MOVE_PCT_RANGE[1],
-            kind='float', field='movement_threshold_pct',
-        )
-    if 'volume_multiplier_threshold' in payload:
-        updates['volume_multiplier_threshold'] = _radar_clamp(
-            payload['volume_multiplier_threshold'],
-            _RADAR_VOL_MULT_RANGE[0], _RADAR_VOL_MULT_RANGE[1],
-            kind='float', field='volume_multiplier_threshold',
-        )
-    if 'liquidation_enabled' in payload:
-        updates['liquidation_enabled'] = 1 if payload['liquidation_enabled'] else 0
-    if 'liquidation_min_usd' in payload:
-        updates['liquidation_min_usd'] = int(_radar_clamp(
-            payload['liquidation_min_usd'],
-            _RADAR_LIQ_MIN_USD_RANGE[0], _RADAR_LIQ_MIN_USD_RANGE[1],
-            kind='int', field='liquidation_min_usd',
-        ))
-    if 'stocks_alpha_vantage_key' in payload:
-        # Only persist non-empty values — empty string means "leave the key
-        # alone" in the dashboard's mask-friendly model.
-        new_key = (payload['stocks_alpha_vantage_key'] or '').strip()
-        if new_key and not new_key.startswith('••'):
-            updates['stocks_alpha_vantage_key'] = new_key[:128]
-    if 'digest_mention_role_ids' in payload:
-        updates['digest_mention_role_ids'] = _normalize_role_id_list(
-            payload['digest_mention_role_ids'], field='digest_mention_role_ids',
-        )
-    if 'alerts_mention_role_ids' in payload:
-        updates['alerts_mention_role_ids'] = _normalize_role_id_list(
-            payload['alerts_mention_role_ids'], field='alerts_mention_role_ids',
-        )
+    payload = body.model_dump(exclude_unset=True, by_alias=False)
+    glob = payload.get('global_') or payload.get('global') or {}
+    topics_in = payload.get('topics') or {}
 
-    # Digest template overrides. Empty string is meaningful (= use default),
-    # so we trim but do NOT skip on empty.
-    if 'digest_title' in payload:
-        val = (payload['digest_title'] or '').strip()
-        if len(val) > _RADAR_DIGEST_TITLE_MAX:
-            raise HTTPException(
-                status_code=400,
-                detail=f'digest_title too long (max {_RADAR_DIGEST_TITLE_MAX})',
-            )
-        updates['digest_title'] = val
-    if 'digest_intro' in payload:
-        val = (payload['digest_intro'] or '').strip()
-        if len(val) > _RADAR_DIGEST_INTRO_MAX:
-            raise HTTPException(
-                status_code=400,
-                detail=f'digest_intro too long (max {_RADAR_DIGEST_INTRO_MAX})',
-            )
-        updates['digest_intro'] = val
-    if 'digest_color' in payload:
-        updates['digest_color'] = _radar_normalize_hex_color(payload['digest_color'])
-    if 'digest_footer' in payload:
-        val = (payload['digest_footer'] or '').strip()
-        if len(val) > _RADAR_DIGEST_FOOTER_MAX:
-            raise HTTPException(
-                status_code=400,
-                detail=f'digest_footer too long (max {_RADAR_DIGEST_FOOTER_MAX})',
-            )
-        updates['digest_footer'] = val
-    if 'digest_thumbnail_mode' in payload:
-        val = (payload['digest_thumbnail_mode'] or 'brand').strip().lower()
-        if val not in _RADAR_DIGEST_THUMB_MODES:
-            raise HTTPException(
-                status_code=400,
-                detail=f'digest_thumbnail_mode must be one of: '
-                       f'{", ".join(sorted(_RADAR_DIGEST_THUMB_MODES))}',
-            )
-        updates['digest_thumbnail_mode'] = val
-    if 'digest_date_mode' in payload:
-        val = (payload['digest_date_mode'] or 'date_tz').strip().lower()
-        if val not in _RADAR_DIGEST_DATE_MODES:
-            raise HTTPException(
-                status_code=400,
-                detail=f'digest_date_mode must be one of: '
-                       f'{", ".join(sorted(_RADAR_DIGEST_DATE_MODES))}',
-            )
-        updates['digest_date_mode'] = val
+    changed_global: list = []
+    changed_topics: dict = {}
 
-    fresh = db_update_radar_settings(server_id, **updates)
+    # Global block.
+    if glob:
+        g_updates = _validate_global_block(glob)
+        if g_updates:
+            db_update_radar_settings(server_id, **g_updates)
+            changed_global = sorted(g_updates.keys())
+
+    # Per-topic blocks.
+    if topics_in:
+        if not isinstance(topics_in, dict):
+            raise HTTPException(status_code=400, detail='topics must be an object')
+        for t_name, t_raw in topics_in.items():
+            t = (t_name or '').strip().lower()
+            if t not in _RADAR_TOPIC_NAMES:
+                raise HTTPException(status_code=400,
+                    detail=f'unknown topic in body: {t_name}')
+            if not isinstance(t_raw, dict):
+                raise HTTPException(status_code=400,
+                    detail=f'topics.{t} must be an object')
+            t_updates = _validate_topic_block(t, t_raw)
+            if t_updates:
+                db_update_radar_topic_settings(server_id, t, **t_updates)
+                changed_topics[t] = sorted(t_updates.keys())
 
     log_event(
         server_id, 'admin_action', 'radar_settings_updated',
@@ -3897,9 +3968,15 @@ async def radar_settings_patch(
         actor_user_id=user.get('user_id') or user.get('id'),
         actor_username=user.get('username'),
         module='radar', severity='info',
-        details={'changed': sorted(updates.keys())},
+        details={'global': changed_global, 'topics': changed_topics},
     )
-    return _radar_mask_settings(fresh)
+
+    glob_fresh   = db_get_radar_settings(server_id)
+    topics_fresh = db_list_radar_topic_settings(server_id)
+    return {
+        'global': _radar_mask_global(glob_fresh),
+        'topics': {t: _radar_mask_topic(topics_fresh[t]) for t in _RADAR_TOPIC_NAMES},
+    }
 
 
 @app.get('/api/servers/{server_id}/radar/watchlist')
@@ -4337,111 +4414,153 @@ async def radar_preview(
 @app.post('/api/servers/{server_id}/radar/preview-refresh')
 async def radar_preview_refresh(
     server_id: int,
+    body: Optional[dict] = None,
     user: dict = Depends(get_current_user),
 ):
-    """One-shot CoinGecko batch fetch for this guild's crypto watchlist.
-    Updates the global cache so the dashboard's 30s poll sees fresh prices.
-    Rate-limited per-user AND per-guild so the button can't be hammered."""
+    """One-shot batched fetch for this guild's watchlist. Optional body
+    field `topic` scopes the refresh to a single kind; omitted/null
+    refreshes every kind that has watchlist entries. Rate-limited
+    per-user AND per-guild."""
     require_module_access(user, server_id, 'radar')
-    # Per-user 4/min — protects against accidental click spam.
     uid = int(user.get('user_id') or user.get('id') or 0)
     if uid:
         rate_limit(f'radar_preview_refresh_u:{uid}', 4, 60.0)
-    # Per-guild 12/min — protects the CoinGecko free-tier budget across
-    # multiple admins in the same server.
     rate_limit(f'radar_preview_refresh_g:{server_id}', 12, 60.0)
 
-    rows = db_list_radar_watchlist(server_id, asset_kind='crypto')
-    identifiers = sorted({
-        (r.get('asset_identifier') or '').strip().lower()
-        for r in rows
-        if (r.get('asset_identifier') or '').strip()
-    })
-    if not identifiers:
-        return {'ok': True, 'refreshed': 0, 'note': 'empty_watchlist'}
+    topic = ((body or {}).get('topic') or '').strip().lower() or None
+    if topic and topic not in _RADAR_TOPIC_NAMES:
+        raise HTTPException(status_code=400,
+            detail=f'topic must be one of: {", ".join(_RADAR_TOPIC_NAMES)}')
 
-    try:
-        from services.radar.adapters import ADAPTERS_BY_KIND
-        from services.radar.cache    import CACHE as _RADAR_CACHE
-        adapter = ADAPTERS_BY_KIND.get('crypto')
-        if adapter is None:
-            raise RuntimeError('crypto adapter not registered')
-        fetched = await adapter.fetch_batch(identifiers)
-    except Exception as e:  # noqa: BLE001
-        print(f'[radar/api] preview-refresh failed: {type(e).__name__}: {e}')
-        raise HTTPException(
-            status_code=503,
-            detail='Live price refresh is temporarily unavailable. Try again shortly.',
-        )
+    from services.radar.adapters import ADAPTERS_BY_KIND
+    from services.radar.cache    import CACHE as _RADAR_CACHE
 
-    for snap in fetched:
-        _RADAR_CACHE.put('crypto', snap['identifier'], snap)
+    kinds_to_refresh = (topic,) if topic else _RADAR_TOPIC_NAMES
+    refreshed_total = 0
+    requested_total = 0
+    errors: list[str] = []
+
+    for k in kinds_to_refresh:
+        rows = db_list_radar_watchlist(server_id, asset_kind=k)
+        # crypto/nft cache keys are lowercased; meme/forex preserve case.
+        identifiers = sorted({
+            ((r.get('asset_identifier') or '').strip().lower()
+              if k in ('crypto', 'nft')
+              else (r.get('asset_identifier') or '').strip())
+            for r in rows
+            if (r.get('asset_identifier') or '').strip()
+        })
+        requested_total += len(identifiers)
+        if not identifiers:
+            continue
+        adapter = ADAPTERS_BY_KIND.get(k)
+        if adapter is None or getattr(adapter, 'disabled_reason', None):
+            errors.append(f'{k}: '
+                          + (getattr(adapter, 'disabled_reason', '')
+                             or 'adapter not registered'))
+            continue
+        try:
+            fetched = await adapter.fetch_batch(identifiers)
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] preview-refresh {k} failed: '
+                  f'{type(e).__name__}: {e}')
+            errors.append(f'{k}: refresh unavailable')
+            continue
+        for snap in fetched:
+            _RADAR_CACHE.put(k, snap['identifier'], snap)
+        refreshed_total += len(fetched)
+
+    if requested_total == 0:
+        return {'ok': True, 'refreshed': 0, 'note': 'empty_watchlist',
+                'topic': topic}
+    if refreshed_total == 0 and errors:
+        raise HTTPException(status_code=503,
+            detail='Live price refresh is temporarily unavailable. ' + '; '.join(errors))
 
     return {
         'ok':         True,
-        'refreshed':  len(fetched),
-        'requested':  len(identifiers),
+        'topic':      topic,
+        'refreshed':  refreshed_total,
+        'requested':  requested_total,
+        'errors':     errors,
     }
 
 
 @app.post('/api/servers/{server_id}/radar/digest/send-now')
 async def radar_digest_send_now(
     server_id: int,
+    body: dict,
     user: dict = Depends(get_current_user),
 ):
-    """Admin-triggered immediate digest post to the configured crypto
-    channel. Per-guild 5/UTC-day cap + 5-min cooldown. Quota is consumed
-    ONLY on successful send so a misconfig doesn't burn the daily budget."""
+    """Admin-triggered immediate per-topic digest. Body: {"topic":
+    "crypto"|"nft"|"meme"|"forex"}. Per-(guild, topic) 5/UTC-day cap +
+    5-min cooldown. Quota is consumed ONLY on successful send."""
     require_guild_admin(user, server_id)
     require_module_access(user, server_id, 'radar')
 
-    settings = db_get_radar_settings(server_id)
+    topic = ((body or {}).get('topic') or '').strip().lower()
+    if topic not in _RADAR_TOPIC_NAMES:
+        raise HTTPException(status_code=400,
+            detail=f'topic must be one of: {", ".join(_RADAR_TOPIC_NAMES)}')
 
-    # Quota reset: a new UTC day clears the counter regardless of how high
-    # it got yesterday. Persisted via radar_settings so it survives restarts.
+    settings = db_get_radar_topic_settings(server_id, topic)
+    cap = _RADAR_MANUAL_DIGEST_DAILY_CAP
+
+    # UTC-day quota reset.
     today_utc = datetime.now(timezone.utc).date().isoformat()
     used = int(settings.get('manual_digests_used_today') or 0)
     if str(settings.get('manual_digests_reset_date') or '') != today_utc:
         used = 0
-        db_update_radar_settings(
-            server_id,
+        db_update_radar_topic_settings(
+            server_id, topic,
             manual_digests_used_today=0,
             manual_digests_reset_date=today_utc,
         )
-        settings = db_get_radar_settings(server_id)
+        settings = db_get_radar_topic_settings(server_id, topic)
 
-    cap = _RADAR_MANUAL_DIGEST_DAILY_CAP
     if used >= cap:
         raise HTTPException(
             status_code=429,
-            detail=(f'Daily cap reached ({cap} manual sends per UTC day). '
-                    'The scheduled daily digest still runs at your configured time.'),
+            detail=(f'Daily cap reached for {topic} ({cap} manual sends per '
+                    'UTC day). The scheduled daily digest still runs at the '
+                    'configured time.'),
             headers={'Retry-After': '3600'},
         )
 
-    # 5-minute cooldown between manual sends.
-    last_iso = settings.get('last_manual_digest_at')
+    # 5-minute cooldown — derived from radar_topic_settings.updated_at via
+    # the last-sent date / time tuple; we use last_daily_sent_date plus a
+    # transient per-process timestamp would be wrong across restarts, so
+    # we read the cooldown from the most-recent radar_alerts_log entry of
+    # type='digest_sent' if present — simpler: just compare manual_digests_*
+    # update_at field.
+    # Use a lightweight in-row marker: re-use manual_digests_reset_date AND
+    # check the row's updated_at column.
+    last_iso = settings.get('updated_at')
     if last_iso:
         try:
             last_dt = datetime.fromisoformat(str(last_iso).replace('Z', '+00:00'))
             if last_dt.tzinfo is None:
                 last_dt = last_dt.replace(tzinfo=timezone.utc)
             elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
-            if elapsed < _RADAR_MANUAL_DIGEST_COOLDOWN_S:
+            # The 5-minute cooldown only applies when the row was last
+            # touched specifically by a manual send (i.e. used_today > 0
+            # AND reset_date == today). This avoids treating a settings
+            # PATCH as a manual-send heartbeat.
+            if used > 0 and elapsed < _RADAR_MANUAL_DIGEST_COOLDOWN_S:
                 wait = int(_RADAR_MANUAL_DIGEST_COOLDOWN_S - elapsed) + 1
                 raise HTTPException(
                     status_code=429,
-                    detail=f'Manual digests are limited to one every 5 minutes. '
-                           f'Try again in {wait}s.',
+                    detail=(f'Manual {topic} digests are limited to one every '
+                            f'5 minutes. Try again in {wait}s.'),
                     headers={'Retry-After': str(wait)},
                 )
         except (TypeError, ValueError):
             pass
 
-    if not settings.get('daily_channel_crypto'):
+    if not settings.get('daily_channel'):
         raise HTTPException(
             status_code=400,
-            detail='Configure a crypto digest channel first.',
+            detail=f'Configure a {topic} daily channel first.',
         )
 
     if not bot.is_ready():
@@ -4449,30 +4568,29 @@ async def radar_digest_send_now(
 
     try:
         from services.radar.digest import post_digest_now, DigestSendError
-        result = await post_digest_now(bot, int(server_id), settings)
+        result = await post_digest_now(bot, int(server_id), topic)
     except DigestSendError as e:
-        # Quota NOT consumed on failure — admin can fix config + retry.
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:  # noqa: BLE001
-        print(f'[radar/api] digest send-now crashed g={server_id}: '
+        print(f'[radar/api] digest send-now crashed g={server_id} t={topic}: '
               f'{type(e).__name__}: {e}')
         raise HTTPException(status_code=502, detail='Unexpected error sending digest.')
 
-    # Consume one quota unit + update timestamp ONLY after a confirmed post.
-    db_update_radar_settings(
-        server_id,
+    # Consume quota only after a confirmed post.
+    db_update_radar_topic_settings(
+        server_id, topic,
         manual_digests_used_today=used + 1,
         manual_digests_reset_date=today_utc,
-        last_manual_digest_at=datetime.now(timezone.utc).isoformat(),
     )
 
     log_event(
         server_id, 'admin_action', 'radar_digest_send_now',
-        f'Manual Radar digest sent by {user.get("username")}',
+        f'Manual Radar {topic} digest sent by {user.get("username")}',
         actor_user_id=user.get('user_id') or user.get('id'),
         actor_username=user.get('username'),
         module='radar', severity='info',
         details={
+            'topic':              topic,
             'channel_id':         result.get('channel_id'),
             'message_id':         result.get('message_id'),
             'watchlist_count':    result.get('watchlist_count'),
@@ -4482,6 +4600,7 @@ async def radar_digest_send_now(
 
     return {
         'ok':                True,
+        'topic':             topic,
         'message_id':        str(result.get('message_id')),
         'channel_id':        str(result.get('channel_id')),
         'watchlist_count':   result.get('watchlist_count'),
