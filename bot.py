@@ -44,9 +44,14 @@ async def on_ready():
         try:
             from services.radar.fetcher import fetch_loop
             from services.radar.digest  import scheduler_loop
-            _asyncio.create_task(fetch_loop(bot),     name='radar.fetcher')
-            _asyncio.create_task(scheduler_loop(bot), name='radar.digest')
-            print('[startup] Radar background loops started (fetcher + digest)')
+            from services.radar.discovery_meme import discovery_meme_loop
+            from services.radar.discovery_nft  import discovery_nft_loop
+            _asyncio.create_task(fetch_loop(bot),         name='radar.fetcher')
+            _asyncio.create_task(scheduler_loop(bot),     name='radar.digest')
+            _asyncio.create_task(discovery_meme_loop(bot), name='radar.discovery.meme')
+            _asyncio.create_task(discovery_nft_loop(bot),  name='radar.discovery.nft')
+            print('[startup] Radar background loops started '
+                  '(fetcher + digest + meme discovery + nft discovery)')
         except Exception as e:
             import traceback as _tb
             print(f'[startup] Radar tasks failed to start: {type(e).__name__}: {e}')

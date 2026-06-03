@@ -509,6 +509,29 @@ def init_db():
             "ALTER TABLE radar_settings ADD COLUMN digest_thumbnail_mode TEXT NOT NULL DEFAULT 'brand'",
             # Date display mode in the digest title. {'off','date_only','date_tz'}.
             "ALTER TABLE radar_settings ADD COLUMN digest_date_mode TEXT NOT NULL DEFAULT 'date_tz'",
+            # Phase 3 — multi-timeframe alerts (crypto). Columns exist on
+            # every topic row so the schema is uniform; only the crypto
+            # topic uses 7d in practice (forex has no 7d feed yet).
+            "ALTER TABLE radar_topic_settings ADD COLUMN alert_1h_threshold_pct REAL NOT NULL DEFAULT 3.0",
+            "ALTER TABLE radar_topic_settings ADD COLUMN alert_24h_threshold_pct REAL NOT NULL DEFAULT 8.0",
+            "ALTER TABLE radar_topic_settings ADD COLUMN alert_7d_threshold_pct REAL NOT NULL DEFAULT 20.0",
+            "ALTER TABLE radar_topic_settings ADD COLUMN alert_volume_multiplier REAL NOT NULL DEFAULT 2.5",
+            "ALTER TABLE radar_topic_settings ADD COLUMN alert_1h_enabled INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE radar_topic_settings ADD COLUMN alert_24h_enabled INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE radar_topic_settings ADD COLUMN alert_7d_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE radar_topic_settings ADD COLUMN alert_volume_enabled INTEGER NOT NULL DEFAULT 1",
+            # Phase 3 — Trending Discovery (Memecoin + NFT). Channels are
+            # TEXT for snowflake-precision; thresholds are conservative
+            # research-based defaults documented in the dashboard hints.
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_channel TEXT",
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_mention_role_ids TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_min_liquidity_usd INTEGER NOT NULL DEFAULT 50000",
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_min_volume_24h_usd INTEGER NOT NULL DEFAULT 100000",
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_min_age_hours INTEGER NOT NULL DEFAULT 24",
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_min_change_1h_pct REAL NOT NULL DEFAULT 30.0",
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_min_volume_change_24h_pct REAL NOT NULL DEFAULT 50.0",
+            "ALTER TABLE radar_topic_settings ADD COLUMN discovery_min_sales_24h INTEGER NOT NULL DEFAULT 10",
             # bot profile columns
             "ALTER TABLE guild_settings ADD COLUMN bot_display_name TEXT",
             "ALTER TABLE guild_settings ADD COLUMN bot_avatar_url TEXT",
@@ -2172,6 +2195,15 @@ _RADAR_TOPIC_EDITABLE = (
     'digest_thumbnail_mode', 'digest_date_mode',
     'manual_digests_used_today', 'manual_digests_reset_date',
     'last_daily_sent_date',
+    # Phase 3 — multi-timeframe alerts + Trending Discovery.
+    'alert_1h_threshold_pct', 'alert_24h_threshold_pct',
+    'alert_7d_threshold_pct', 'alert_volume_multiplier',
+    'alert_1h_enabled', 'alert_24h_enabled',
+    'alert_7d_enabled', 'alert_volume_enabled',
+    'discovery_enabled', 'discovery_channel', 'discovery_mention_role_ids',
+    'discovery_min_liquidity_usd', 'discovery_min_volume_24h_usd',
+    'discovery_min_age_hours', 'discovery_min_change_1h_pct',
+    'discovery_min_volume_change_24h_pct', 'discovery_min_sales_24h',
 )
 
 
@@ -2197,6 +2229,25 @@ def _radar_topic_default_row(guild_id: int, topic: str) -> dict:
         'manual_digests_used_today':  0,
         'manual_digests_reset_date':  '',
         'last_daily_sent_date':       '',
+        # Phase 3 — multi-timeframe alerts.
+        'alert_1h_threshold_pct':     3.0,
+        'alert_24h_threshold_pct':    8.0,
+        'alert_7d_threshold_pct':     20.0,
+        'alert_volume_multiplier':    2.5,
+        'alert_1h_enabled':           1,
+        'alert_24h_enabled':          1,
+        'alert_7d_enabled':           0,
+        'alert_volume_enabled':       1,
+        # Phase 3 — Trending Discovery (meme + nft).
+        'discovery_enabled':                  0,
+        'discovery_channel':                  None,
+        'discovery_mention_role_ids':         '[]',
+        'discovery_min_liquidity_usd':        50000,
+        'discovery_min_volume_24h_usd':       100000,
+        'discovery_min_age_hours':            24,
+        'discovery_min_change_1h_pct':        30.0,
+        'discovery_min_volume_change_24h_pct': 50.0,
+        'discovery_min_sales_24h':            10,
     }
 
 

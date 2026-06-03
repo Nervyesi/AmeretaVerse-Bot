@@ -123,7 +123,10 @@ async def _markets_request(
         'order':                    'market_cap_desc',
         'per_page':                 max(1, min(int(per_page), 250)),
         'page':                     max(1, int(page)),
-        'price_change_percentage':  '1h,24h',
+        # CoinGecko fills price_change_percentage_{1h,24h,7d}_in_currency
+        # only when these are requested explicitly. The new multi-timeframe
+        # alerts consume all three.
+        'price_change_percentage':  '1h,24h,7d',
         'sparkline':                'false',
     }
     if ids_csv:
@@ -158,6 +161,7 @@ def _normalize_markets_rows(rows: list) -> list[dict]:
         cid = (r.get('id') or '').strip().lower()
         if not cid:
             continue
+        change_7d_pct = r.get('price_change_percentage_7d_in_currency')
         out.append(common_snapshot(
             identifier=     cid,
             kind=           'crypto',
@@ -174,6 +178,7 @@ def _normalize_markets_rows(rows: list) -> list[dict]:
             page_url=       f'https://www.coingecko.com/en/coins/{cid}',
             raw=            {
                 'name':                          r.get('name'),
+                'change_7d_pct':                 change_7d_pct,
                 'high_24h':                      r.get('high_24h'),
                 'low_24h':                       r.get('low_24h'),
                 'ath':                           r.get('ath'),

@@ -3625,6 +3625,20 @@ _RADAR_DIGEST_THUMB_MODES = {'brand', 'first_coin', 'off'}
 _RADAR_DIGEST_DATE_MODES  = {'off', 'date_only', 'date_tz'}
 _RADAR_DIGEST_COLOR_RE    = _gw_re.compile(r'^#?[0-9a-fA-F]{6}$')
 
+# Phase 3 — multi-timeframe alert threshold ranges.
+_RADAR_ALERT_1H_RANGE   = (1.0, 20.0)
+_RADAR_ALERT_24H_RANGE  = (3.0, 50.0)
+_RADAR_ALERT_7D_RANGE   = (10.0, 100.0)
+_RADAR_ALERT_VOL_MUL    = (1.5, 10.0)
+# Discovery thresholds — broad ranges so server admins can be aggressive
+# or conservative without us second-guessing them.
+_RADAR_DISCOVERY_LIQ_RANGE    = (1_000, 10_000_000)
+_RADAR_DISCOVERY_VOL_RANGE    = (1_000, 100_000_000)
+_RADAR_DISCOVERY_AGE_RANGE    = (0, 24 * 90)         # hours, 0..90 days
+_RADAR_DISCOVERY_PCT_RANGE    = (5.0, 500.0)
+_RADAR_DISCOVERY_VCHG_RANGE   = (10.0, 1000.0)
+_RADAR_DISCOVERY_SALES_RANGE  = (1, 10_000)
+
 
 def _radar_normalize_hex_color(s: str) -> str:
     """Return canonical '#RRGGBB' lowercase or '' for empty. 400s on
@@ -3660,6 +3674,25 @@ class _RadarTopicBlock(BaseModel):
     digest_footer:                Optional[str]    = None
     digest_thumbnail_mode:        Optional[str]    = None
     digest_date_mode:             Optional[str]    = None
+    # Phase 3 — multi-timeframe alerts.
+    alert_1h_threshold_pct:       Optional[float]  = None
+    alert_24h_threshold_pct:      Optional[float]  = None
+    alert_7d_threshold_pct:       Optional[float]  = None
+    alert_volume_multiplier:      Optional[float]  = None
+    alert_1h_enabled:             Optional[int]    = None
+    alert_24h_enabled:            Optional[int]    = None
+    alert_7d_enabled:             Optional[int]    = None
+    alert_volume_enabled:         Optional[int]    = None
+    # Phase 3 — Trending Discovery (meme + nft).
+    discovery_enabled:                  Optional[int]    = None
+    discovery_channel:                  Optional[str]    = None
+    discovery_mention_role_ids:         Optional[object] = None
+    discovery_min_liquidity_usd:        Optional[int]    = None
+    discovery_min_volume_24h_usd:       Optional[int]    = None
+    discovery_min_age_hours:            Optional[int]    = None
+    discovery_min_change_1h_pct:        Optional[float]  = None
+    discovery_min_volume_change_24h_pct: Optional[float] = None
+    discovery_min_sales_24h:            Optional[int]    = None
 
 
 class _RadarGlobalBlock(BaseModel):
@@ -3781,10 +3814,11 @@ def _radar_mask_topic(row: dict) -> dict:
     """Per-topic row: stringify channel ids, decode role-id JSON arrays,
     surface per-topic manual-send quota counters."""
     out = dict(row)
-    for col in ('daily_channel', 'alerts_channel'):
+    for col in ('daily_channel', 'alerts_channel', 'discovery_channel'):
         v = out.get(col)
         out[col] = str(v) if (v is not None and v != '') else None
-    for col in ('digest_mention_role_ids', 'alerts_mention_role_ids'):
+    for col in ('digest_mention_role_ids', 'alerts_mention_role_ids',
+                'discovery_mention_role_ids'):
         raw = out.get(col) or '[]'
         try:
             arr = raw if isinstance(raw, list) else json.loads(raw)
@@ -3892,6 +3926,85 @@ def _validate_topic_block(topic: str, raw: dict) -> dict:
                 detail=f'{topic}.digest_date_mode must be one of: '
                        f'{", ".join(sorted(_RADAR_DIGEST_DATE_MODES))}')
         updates['digest_date_mode'] = v
+
+    # ── Phase 3 — multi-timeframe alerts ────────────────────────────────
+    for boolkey in ('alert_1h_enabled', 'alert_24h_enabled',
+                    'alert_7d_enabled', 'alert_volume_enabled'):
+        if boolkey in raw:
+            updates[boolkey] = 1 if raw[boolkey] else 0
+    if 'alert_1h_threshold_pct' in raw:
+        updates['alert_1h_threshold_pct'] = _radar_clamp(
+            raw['alert_1h_threshold_pct'],
+            _RADAR_ALERT_1H_RANGE[0], _RADAR_ALERT_1H_RANGE[1],
+            kind='float', field=f'{topic}.alert_1h_threshold_pct',
+        )
+    if 'alert_24h_threshold_pct' in raw:
+        updates['alert_24h_threshold_pct'] = _radar_clamp(
+            raw['alert_24h_threshold_pct'],
+            _RADAR_ALERT_24H_RANGE[0], _RADAR_ALERT_24H_RANGE[1],
+            kind='float', field=f'{topic}.alert_24h_threshold_pct',
+        )
+    if 'alert_7d_threshold_pct' in raw:
+        updates['alert_7d_threshold_pct'] = _radar_clamp(
+            raw['alert_7d_threshold_pct'],
+            _RADAR_ALERT_7D_RANGE[0], _RADAR_ALERT_7D_RANGE[1],
+            kind='float', field=f'{topic}.alert_7d_threshold_pct',
+        )
+    if 'alert_volume_multiplier' in raw:
+        updates['alert_volume_multiplier'] = _radar_clamp(
+            raw['alert_volume_multiplier'],
+            _RADAR_ALERT_VOL_MUL[0], _RADAR_ALERT_VOL_MUL[1],
+            kind='float', field=f'{topic}.alert_volume_multiplier',
+        )
+
+    # ── Phase 3 — Trending Discovery (meme + nft) ───────────────────────
+    if 'discovery_enabled' in raw:
+        updates['discovery_enabled'] = 1 if raw['discovery_enabled'] else 0
+    if 'discovery_channel' in raw:
+        updates['discovery_channel'] = _radar_channel(
+            raw['discovery_channel'], field=f'{topic}.discovery_channel',
+        )
+    if 'discovery_mention_role_ids' in raw:
+        updates['discovery_mention_role_ids'] = _normalize_role_id_list(
+            raw['discovery_mention_role_ids'],
+            field=f'{topic}.discovery_mention_role_ids',
+        )
+    if 'discovery_min_liquidity_usd' in raw:
+        updates['discovery_min_liquidity_usd'] = int(_radar_clamp(
+            raw['discovery_min_liquidity_usd'],
+            _RADAR_DISCOVERY_LIQ_RANGE[0], _RADAR_DISCOVERY_LIQ_RANGE[1],
+            kind='int', field=f'{topic}.discovery_min_liquidity_usd',
+        ))
+    if 'discovery_min_volume_24h_usd' in raw:
+        updates['discovery_min_volume_24h_usd'] = int(_radar_clamp(
+            raw['discovery_min_volume_24h_usd'],
+            _RADAR_DISCOVERY_VOL_RANGE[0], _RADAR_DISCOVERY_VOL_RANGE[1],
+            kind='int', field=f'{topic}.discovery_min_volume_24h_usd',
+        ))
+    if 'discovery_min_age_hours' in raw:
+        updates['discovery_min_age_hours'] = int(_radar_clamp(
+            raw['discovery_min_age_hours'],
+            _RADAR_DISCOVERY_AGE_RANGE[0], _RADAR_DISCOVERY_AGE_RANGE[1],
+            kind='int', field=f'{topic}.discovery_min_age_hours',
+        ))
+    if 'discovery_min_change_1h_pct' in raw:
+        updates['discovery_min_change_1h_pct'] = _radar_clamp(
+            raw['discovery_min_change_1h_pct'],
+            _RADAR_DISCOVERY_PCT_RANGE[0], _RADAR_DISCOVERY_PCT_RANGE[1],
+            kind='float', field=f'{topic}.discovery_min_change_1h_pct',
+        )
+    if 'discovery_min_volume_change_24h_pct' in raw:
+        updates['discovery_min_volume_change_24h_pct'] = _radar_clamp(
+            raw['discovery_min_volume_change_24h_pct'],
+            _RADAR_DISCOVERY_VCHG_RANGE[0], _RADAR_DISCOVERY_VCHG_RANGE[1],
+            kind='float', field=f'{topic}.discovery_min_volume_change_24h_pct',
+        )
+    if 'discovery_min_sales_24h' in raw:
+        updates['discovery_min_sales_24h'] = int(_radar_clamp(
+            raw['discovery_min_sales_24h'],
+            _RADAR_DISCOVERY_SALES_RANGE[0], _RADAR_DISCOVERY_SALES_RANGE[1],
+            kind='int', field=f'{topic}.discovery_min_sales_24h',
+        ))
     return updates
 
 
@@ -4088,7 +4201,8 @@ async def radar_watchlist_add(
             if snap is None:
                 raise HTTPException(
                     status_code=404,
-                    detail=f'NFT collection not found: {raw_ident}',
+                    detail='Collection not found on Reservoir. Try a different '
+                           'name or paste the collection slug.',
                 )
             _RADAR_CACHE.put('nft', snap['identifier'], snap)
             if display_name == raw_ident.lower() or display_name == ident:
@@ -4114,7 +4228,10 @@ async def radar_watchlist_add(
                        'dexscreener.com URL.',
             )
         chain, address = parsed
-        if chain not in SUPPORTED_CHAINS:
+        # chain may be None for a bare EVM address — the adapter then scans
+        # every chain DEXScreener lists for the address and picks the most
+        # liquid pair. Only reject an explicitly-named unsupported chain.
+        if chain is not None and chain not in SUPPORTED_CHAINS:
             raise HTTPException(
                 status_code=400,
                 detail=f'Chain "{chain}" is not supported. Use one of: '
@@ -4123,15 +4240,17 @@ async def radar_watchlist_add(
         if not address_looks_valid(chain, address):
             raise HTTPException(
                 status_code=400,
-                detail=f'Address does not look valid for chain "{chain}".',
+                detail=f'Address does not look valid for chain "{chain or "auto"}".',
             )
         adapter = ADAPTERS_BY_KIND.get('meme')
         try:
-            snap = await adapter.fetch_one(f'{chain}:{address}')
+            # Bare address → pass the address alone so the adapter auto-detects
+            # the chain; otherwise pin to the named chain.
+            snap = await adapter.fetch_one(f'{chain}:{address}' if chain else address)
             if snap is None:
                 raise HTTPException(
                     status_code=404,
-                    detail='No active DEX pair found for that address.',
+                    detail='No active pair found for this token on DEXScreener. Check the address.',
                 )
             ident = snap['identifier']
             _RADAR_CACHE.put('meme', ident, snap)
@@ -4261,7 +4380,8 @@ async def radar_watchlist_resolve(
             detail='Could not parse a chain:address or dexscreener.com URL.',
         )
     chain, address = parsed
-    if chain not in SUPPORTED_CHAINS:
+    # chain may be None for a bare EVM address — the adapter scans all chains.
+    if chain is not None and chain not in SUPPORTED_CHAINS:
         raise HTTPException(
             status_code=400,
             detail=f'Chain "{chain}" is not supported. Use one of: '
@@ -4270,22 +4390,25 @@ async def radar_watchlist_resolve(
     if not address_looks_valid(chain, address):
         raise HTTPException(
             status_code=400,
-            detail=f'Address does not look valid for chain "{chain}".',
+            detail=f'Address does not look valid for chain "{chain or "auto"}".',
         )
     adapter = ADAPTERS_BY_KIND.get('meme')
     try:
-        snap = await adapter.fetch_one(f'{chain}:{address}')
+        snap = await adapter.fetch_one(f'{chain}:{address}' if chain else address)
     except Exception as e:  # noqa: BLE001
         print(f'[radar/api] resolve meme failed: {type(e).__name__}: {e}')
         raise HTTPException(status_code=503,
             detail='Memecoin lookup unavailable. Try again shortly.')
     if snap is None:
         raise HTTPException(status_code=404,
-            detail='No active DEX pair found for that address.')
+            detail='No active pair found for this token on DEXScreener. Check the address.')
+    # Report the chain the adapter actually resolved (important for the
+    # bare-address path where the request chain was unknown).
+    resolved_chain = (snap.get('raw') or {}).get('chain') or chain
     return {
         'kind':              'meme',
         'identifier':        snap['identifier'],
-        'chain':             chain,
+        'chain':             resolved_chain,
         'address':           address,
         'symbol':            snap.get('symbol_display'),
         'name':              snap.get('raw', {}).get('name'),

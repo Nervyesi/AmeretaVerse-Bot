@@ -34,7 +34,7 @@ class ReservoirAdapter(AssetAdapter):
         self.disabled_reason: Optional[str] = None
         if not self.api_key:
             self.disabled_reason = (
-                'Set RESERVOIR_API_KEY in Railway env to enable NFT.'
+                'Set RESERVOIR_API_KEY in Railway env to enable NFT topic.'
             )
             print('[radar/reservoir] disabled — no RESERVOIR_API_KEY')
 
@@ -70,38 +70,91 @@ class ReservoirAdapter(AssetAdapter):
         q = (query or '').strip()
         if not q:
             return []
+        # Try the documented 'name' param first; some Reservoir API
+        # versions accept 'q' instead, so fall back to that if the first
+        # call returns zero results.
+        for param_name in ('name', 'q'):
+            results = await self._search_call(q, param_name, limit)
+            if results:
+                return results
+        return []
+
+    async def _search_call(
+        self, q: str, param_name: str, limit: int,
+    ) -> list[dict]:
+        from ..rate_limiter import LIMITER
+        if not await LIMITER.allow(self.api_limit_name):
+            print(f'[radar/reservoir] rate-limited search q={q!r}')
+            return []
         try:
-            from ..rate_limiter import LIMITER
-            if not await LIMITER.allow(self.api_limit_name):
-                print('[radar/reservoir] rate-limited search')
-                return []
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                 resp = await client.get(
                     f'{_BASE}/search/collections/v2',
-                    params={'name': q, 'limit': max(1, min(int(limit), 20))},
+                    params={param_name: q, 'limit': max(1, min(int(limit), 20))},
                     headers=self._headers(),
                 )
-            if resp.status_code != 200:
-                print(f'[radar/reservoir] search HTTP {resp.status_code}')
+            status = resp.status_code
+            if status != 200:
+                print(f'[radar/reservoir] search HTTP {status} '
+                      f'param={param_name} q={q!r} body={resp.text[:200]}')
                 return []
             data = resp.json() or {}
         except (httpx.HTTPError, ValueError, asyncio.TimeoutError) as e:
-            print(f'[radar/reservoir] search error: {type(e).__name__}: {e}')
+            print(f'[radar/reservoir] search error param={param_name}: '
+                  f'{type(e).__name__}: {e}')
             return []
         out: list[dict] = []
         for c in (data.get('collections') or [])[:limit]:
             if not isinstance(c, dict):
                 continue
-            slug = (c.get('slug') or c.get('collectionId') or '').strip().lower()
-            if not slug:
+            # Reservoir returns both `collectionId` (canonical) and `slug`
+            # on /search/collections/v2 entries. Prefer collectionId since
+            # /collections/v7 keys off it; fall back to slug for back-compat.
+            cid = (c.get('collectionId') or c.get('id') or c.get('slug') or '').strip()
+            if not cid:
                 continue
+            floor = c.get('floorAskPrice') or {}
+            floor_usd = None
+            if isinstance(floor, dict):
+                amt = floor.get('amount')
+                if isinstance(amt, dict):
+                    floor_usd = amt.get('usd')
+                elif isinstance(amt, (int, float)):
+                    floor_usd = amt
             out.append({
-                'identifier':       slug,
-                'name':             c.get('name') or slug,
+                'identifier':       cid,
+                'name':             c.get('name') or cid,
                 'image':            c.get('image') or c.get('imageUrl') or '',
-                'floor_price_usd':  (c.get('floorAskPrice', {}) or {}).get('amount', {}).get('usd'),
+                'floor_price_usd':  floor_usd,
+                'slug':             c.get('slug') or '',
             })
         return out
+
+    async def trending(self, limit: int = 20) -> list[dict]:
+        """Top collections by 24h volume — input for the NFT Discovery
+        scanner. Returns full normalized snapshots so we can filter
+        without a second round-trip."""
+        if self.disabled_reason:
+            return []
+        from ..rate_limiter import LIMITER
+        if not await LIMITER.allow(self.api_limit_name):
+            return []
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.get(
+                    f'{_BASE}/collections/v7',
+                    params={'sortBy': '1DayVolume',
+                            'limit':  max(1, min(int(limit), 20))},
+                    headers=self._headers(),
+                )
+            if resp.status_code != 200:
+                print(f'[radar/reservoir] trending HTTP {resp.status_code}: '
+                      f'{resp.text[:200]}')
+                return []
+            return _normalize_collections(resp.json() or {})
+        except (httpx.HTTPError, ValueError, asyncio.TimeoutError) as e:
+            print(f'[radar/reservoir] trending error: {type(e).__name__}: {e}')
+            return []
 
     async def _collections_v7(self, ids: list[str]) -> Optional[dict]:
         from ..rate_limiter import LIMITER
@@ -135,6 +188,20 @@ def _safe_get(obj, *path, default=None):
     return cur if cur is not None else default
 
 
+def _safe_float(v) -> Optional[float]:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(v) -> Optional[int]:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_collections(data: dict) -> list[dict]:
     cols = data.get('collections') if isinstance(data, dict) else None
     if not isinstance(cols, list):
@@ -143,24 +210,24 @@ def _normalize_collections(data: dict) -> list[dict]:
     for c in cols:
         if not isinstance(c, dict):
             continue
-        slug = (c.get('slug') or c.get('id') or c.get('collectionId') or '').strip().lower()
-        if not slug:
+        # Prefer collectionId for the canonical identifier; fall back to
+        # slug / id. The watchlist add path now passes collectionId in.
+        ident = (c.get('id') or c.get('collectionId') or c.get('slug') or '').strip()
+        if not ident:
             continue
-        name = c.get('name') or slug
+        slug = (c.get('slug') or '').strip().lower() or ident.lower()
+        name = c.get('name') or ident
         floor_usd = _safe_get(c, 'floorAsk', 'price', 'amount', 'usd')
-        change_24h = _safe_get(c, 'floorSale', '1day')
-        try:
-            change_24h_pct = float(change_24h) if change_24h is not None else None
-        except (TypeError, ValueError):
-            change_24h_pct = None
-        vol_24h = _safe_get(c, 'volume', '1day')
-        try:
-            vol_24h = float(vol_24h) if vol_24h is not None else None
-        except (TypeError, ValueError):
-            vol_24h = None
+        change_24h_pct = _safe_float(_safe_get(c, 'floorSale', '1day'))
+        vol_24h        = _safe_float(_safe_get(c, 'volume', '1day'))
+        # Discovery scanner needs the volume-change-24h pct and sales count
+        # in the last 24h. Reservoir provides these under volumeChange.1day
+        # and salesCount.1day on /collections/v7 with sortBy=1DayVolume.
+        vol_change_24h_pct = _safe_float(_safe_get(c, 'volumeChange', '1day'))
+        sales_24h          = _safe_int(_safe_get(c, 'salesCount', '1day'))
         image = c.get('image') or _safe_get(c, 'metadata', 'imageUrl') or ''
         out.append(common_snapshot(
-            identifier=     slug,
+            identifier=     ident,
             kind=           'nft',
             symbol_display= name,
             price_usd=      floor_usd or 0.0,
@@ -168,8 +235,13 @@ def _normalize_collections(data: dict) -> list[dict]:
             volume_24h_usd= vol_24h,
             market_cap_usd= None,
             image_url=      image or None,
-            page_url=       f'https://www.opensea.io/collection/{slug}',
-            raw=            {'name': name},
+            page_url=       f'https://www.opensea.io/collection/{slug or ident}',
+            raw=            {
+                'name':                name,
+                'slug':                slug,
+                'volume_change_24h_pct': vol_change_24h_pct,
+                'sales_count_24h':       sales_24h,
+            },
             price_display_symbol='$',
         ))
     return out
