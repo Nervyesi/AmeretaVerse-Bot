@@ -38,6 +38,7 @@ from cogs._branding import build_branded_embed
 
 from services.radar.cache import CACHE
 from services.radar.adapters import ADAPTERS_BY_KIND, SUPPORTED_KINDS_PHASE_1
+from services.radar.chain_badges import chain_badge, chain_from_identifier
 
 
 # ── Choice lists ────────────────────────────────────────────────────────────
@@ -315,11 +316,23 @@ class Radar(commands.Cog):
             for r in items:
                 ident = r.get('asset_identifier') or '?'
                 name  = r.get('display_name') or ident
-                snap  = CACHE.get_snapshot(kind, ident.lower()) if kind == 'crypto' else None
+                # Crypto cache keys are lowercased; meme keys match the saved
+                # 'chain:address' identifier exactly.
+                if kind == 'crypto':
+                    snap = CACHE.get_snapshot('crypto', ident.lower())
+                elif kind == 'meme':
+                    snap = CACHE.get_snapshot('meme', ident)
+                else:
+                    snap = None
                 price = _fmt_price(snap.get('price_usd')) if snap else '—'
                 ch24  = (f'{snap["change_24h_pct"]:+.2f}%'
                          if snap and snap.get('change_24h_pct') is not None else '—')
-                lines.append(f'`{name[:18]:<18}` {price:<13} {ch24}')
+                if kind == 'meme':
+                    chain = ((snap.get('raw', {}) or {}).get('chain') if snap else '') \
+                        or chain_from_identifier(ident)
+                    lines.append(f'{chain_badge(chain)} `{name[:12]:<12}` {price:<13} {ch24}')
+                else:
+                    lines.append(f'`{name[:18]:<18}` {price:<13} {ch24}')
             sections.append(f'**{kind.capitalize()}**\n' + '\n'.join(lines))
 
         e = build_branded_embed(

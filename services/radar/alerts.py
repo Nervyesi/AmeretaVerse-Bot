@@ -31,6 +31,19 @@ from database import (
 )
 from cogs._branding import build_branded_embed
 from .cache import CACHE
+from .chain_badges import chain_badge, chain_from_identifier
+
+
+def _meme_chain_field(embed: discord.Embed, snap: dict) -> None:
+    """Add a Chain field (badge) to a memecoin alert embed. No-op for other
+    kinds. Chain is read from the snapshot, falling back to the 'chain:address'
+    identifier prefix when the cached snapshot predates the chain field."""
+    if (snap.get('kind') or '').lower() != 'meme':
+        return
+    chain = ((snap.get('raw') or {}).get('chain')
+             or chain_from_identifier(snap.get('identifier')))
+    if chain:
+        embed.add_field(name='Chain', value=chain_badge(chain), inline=True)
 
 
 _COOLDOWN_MOVEMENT_S = 3600.0    # 1 hour per (guild, asset, direction)
@@ -177,6 +190,7 @@ def _alert_movement_embed(
         e.set_thumbnail(url=img)
     if name and name != snap.get('symbol_display'):
         e.add_field(name='Asset', value=str(name), inline=True)
+    _meme_chain_field(e, snap)
     return e
 
 
@@ -207,6 +221,7 @@ def _alert_volume_embed(guild_id: int, snap: dict) -> discord.Embed:
     img = snap.get('image_url')
     if img:
         e.set_thumbnail(url=img)
+    _meme_chain_field(e, snap)
     return e
 
 
@@ -332,7 +347,23 @@ async def dispatch_alerts(bot) -> dict:
                          else identifier_raw)
                 snap = CACHE.get_snapshot(topic, ident)
                 if not snap:
+                    if topic == 'meme':
+                        print(f'[radar/alerts] meme_eval g={gid} asset={ident} '
+                              f'snapshot=MISSING (cache cold or fetch failing)')
                     continue
+
+                # Observability for the memecoin smoke test: log every meme
+                # evaluation with the values + thresholds that gate it. Read-only.
+                if topic == 'meme':
+                    _d1h = _change_1h_pct(snap, topic, ident)
+                    _d24 = snap.get('change_24h_pct')
+                    print(
+                        f'[radar/alerts] meme_eval g={gid} asset={ident} '
+                        f'1h={_d1h if _d1h is not None else "n/a"} '
+                        f'24h={_d24 if _d24 is not None else "n/a"} '
+                        f'thr_1h={thr_1h} thr_24h={thr_24h} '
+                        f'en_1h={en_1h} en_24h={en_24h} en_vol={en_vol}'
+                    )
 
                 # ── 1h timeframe ────────────────────────────────────────
                 if en_1h and thr_1h > 0:

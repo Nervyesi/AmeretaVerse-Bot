@@ -33,6 +33,7 @@ from database import (
 )
 from cogs._branding import build_branded_embed
 from .cache import CACHE
+from .chain_badges import chain_badge, chain_from_identifier
 
 
 _TOPICS = ('crypto', 'nft', 'meme', 'forex')
@@ -233,7 +234,12 @@ def _build_topic_embed(
                    or row.get('asset_identifier') or '').upper()
             price = _format_snap_price(snap)
             ch24  = _format_pct(snap.get('change_24h_pct'))
-            lines.append(f'`{sym:<10}` {price:<16} {ch24}')
+            if topic == 'meme':
+                chain = ((snap.get('raw', {}) or {}).get('chain')
+                         or chain_from_identifier(row.get('asset_identifier')))
+                lines.append(f'{chain_badge(chain)} `{sym:<10}` {price:<16} {ch24}')
+            else:
+                lines.append(f'`{sym:<10}` {price:<16} {ch24}')
         e.add_field(
             name=f'Your {topic_label} watchlist',
             value='\n'.join(lines)[:1024],

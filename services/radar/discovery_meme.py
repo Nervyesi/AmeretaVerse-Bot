@@ -147,6 +147,8 @@ async def _send_for_guild(bot, guild_id: int, ts: dict, candidates: list[dict]) 
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
 
     sent = 0
+    passed = 0            # candidates that cleared the guild's quality filters
+    cooldown_skipped = 0  # passed filters but still inside the 12h per-token window
     now_utc = datetime.now(timezone.utc)
     for snap in candidates:
         identifier = snap.get('identifier')
@@ -154,6 +156,7 @@ async def _send_for_guild(bot, guild_id: int, ts: dict, candidates: list[dict]) 
             continue
         if not _passes_filters(snap, ts):
             continue
+        passed += 1
         # Per-token 12h cooldown.
         last = last_radar_alert_at(guild_id, identifier, _ALERT_TYPE)
         if last:
@@ -162,6 +165,7 @@ async def _send_for_guild(bot, guild_id: int, ts: dict, candidates: list[dict]) 
                 if last_dt.tzinfo is None:
                     last_dt = last_dt.replace(tzinfo=timezone.utc)
                 if (now_utc - last_dt).total_seconds() < _PER_TOKEN_COOLDOWN_S:
+                    cooldown_skipped += 1
                     continue
             except (TypeError, ValueError):
                 pass
@@ -191,6 +195,10 @@ async def _send_for_guild(bot, guild_id: int, ts: dict, candidates: list[dict]) 
         sent += 1
         # Pace within a single tick to avoid bursting the channel.
         await asyncio.sleep(1.0)
+    # Observability for the discovery smoke test: how the candidate funnel
+    # narrowed for this guild on this tick. Read-only.
+    print(f'[radar/discovery_meme] scan g={guild_id} candidates={len(candidates)} '
+          f'passed_filters={passed} cooldown_skipped={cooldown_skipped} sent={sent}')
     return sent
 
 
