@@ -21,7 +21,7 @@ from typing import Optional
 _TTL_DEFAULT = 300.0       # seconds; CoinGecko-friendly default
 TTL_BY_KIND = {
     'crypto':  300.0,      # 5 min   — CoinGecko
-    'nft':     600.0,      # 10 min  — Reservoir
+    'nft':     600.0,      # 10 min, OpenSea
     'meme':    300.0,      # 5 min   — DEXScreener
     'forex':  1800.0,      # 30 min  — Frankfurter (daily-cadence rates)
     'stocks': 1800.0,      # 30 min  — Alpha Vantage (Phase 4 reservation)

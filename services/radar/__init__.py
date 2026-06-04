@@ -19,8 +19,8 @@ What runs today:
     matches the guild's daily_time + timezone_offset.
 
 What's reserved for later phases (schema only, no code yet):
-  • Reservoir (NFT), DEXScreener (meme), Frankfurter (forex), Alpha Vantage
-    (stocks) adapters.
+  • Alpha Vantage (stocks) adapter. NFT (OpenSea), meme (DEXScreener) and
+    forex (Frankfurter) adapters are live.
   • Binance + Bybit Futures liquidation WebSockets + cross-exchange
     aggregation + 5-min cooldown alerts (radar_liquidations_window already
     exists for these).

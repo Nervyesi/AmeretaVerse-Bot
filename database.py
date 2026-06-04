@@ -541,6 +541,11 @@ def init_db():
             "ALTER TABLE guild_settings ADD COLUMN xp_cooldown_seconds INTEGER NOT NULL DEFAULT 60",
             "ALTER TABLE guild_settings ADD COLUMN level_up_message_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE guild_settings ADD COLUMN level_up_channel_id TEXT",
+            # Radar NFT migration to OpenSea (Reservoir shut down Oct 2025).
+            # Tracks which data source a watchlist row was added under; NFT rows
+            # added via the dashboard are stamped 'opensea'. Other kinds stay
+            # NULL. Idempotent.
+            "ALTER TABLE radar_watchlist ADD COLUMN platform TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -2099,6 +2104,16 @@ def add_radar_watchlist_entry(
              display_name or '', added_by),
         )
         return cur.lastrowid
+
+
+def set_radar_watchlist_platform(guild_id, entry_id: int, platform: str) -> None:
+    """Stamp the data-source platform on a watchlist row (e.g. 'opensea' for
+    NFT). Best-effort; the column is informational and unused by the fetcher."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE radar_watchlist SET platform=? WHERE id=? AND guild_id=?",
+            (str(platform), int(entry_id), int(guild_id)),
+        )
 
 
 def remove_radar_watchlist_entry(guild_id, entry_id: int) -> bool:

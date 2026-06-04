@@ -1,20 +1,19 @@
 """
-Adapter registry. Phase 1 registers CoinGecko (crypto) only. Phase 2 adds
-Reservoir / DEXScreener / Frankfurter / Alpha Vantage by importing and
-appending to ADAPTERS_BY_KIND.
+Adapter registry. CoinGecko (crypto), OpenSea (nft), DEXScreener (meme) and
+Frankfurter (forex) are registered here, one instance per process.
 """
 from .base        import AssetAdapter, CommonAssetSnapshot
 from .coingecko    import CoinGeckoAdapter
-from .reservoir    import ReservoirAdapter
+from .opensea      import OpenSeaAdapter
 from .dexscreener  import DexscreenerAdapter
 from .frankfurter  import FrankfurterAdapter
 
-# One instance per process. Reservoir is env-gated — when
-# RESERVOIR_API_KEY is missing it stays in the registry but its
-# disabled_reason is set; the fetcher and API endpoints check that flag.
+# One instance per process. OpenSea is env-gated — when OPENSEA_API_KEY is
+# missing it stays in the registry but its disabled_reason is set; the fetcher,
+# discovery scanner and API endpoints check that flag.
 ADAPTERS_BY_KIND: dict[str, AssetAdapter] = {
     'crypto': CoinGeckoAdapter(),
-    'nft':    ReservoirAdapter(),
+    'nft':    OpenSeaAdapter(),
     'meme':   DexscreenerAdapter(),
     'forex':  FrankfurterAdapter(),
 }
@@ -29,7 +28,7 @@ ALL_KINDS               = ('crypto', 'nft', 'meme', 'forex', 'stocks')
 def adapter_for(kind: str) -> AssetAdapter | None:
     """Return the registered adapter, or None if the kind is unregistered.
     Callers should additionally check `.disabled_reason` for env-gated
-    adapters (currently only Reservoir)."""
+    adapters (currently only OpenSea)."""
     return ADAPTERS_BY_KIND.get((kind or '').lower())
 
 

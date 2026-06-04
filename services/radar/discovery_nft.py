@@ -1,10 +1,14 @@
 """
 NFT Trending Discovery scanner.
 
-Runs every 10 minutes. Pulls Reservoir's top-24h-volume collections and
-applies the guild's quality filters — minimum 24h volume in USD, volume
-change %, sales count, and a non-negative floor change (no dump signals).
-Per-collection 24h cooldown via radar_alerts_log.
+Runs every 10 minutes. Pulls OpenSea's top collections per chain (ranked by
+recent volume) and applies the guild's quality filters — 24h volume change %,
+sales count, and a minimum native floor price (dust filter). Per-collection
+24h cooldown via radar_alerts_log.
+
+Floor prices and volumes from OpenSea are in each chain's native token, so the
+old USD volume gate is gone; surge detection rides on volume_change_24h_pct +
+sales + a native floor floor.
 """
 from __future__ import annotations
 
@@ -22,11 +26,21 @@ from database import (
 )
 from cogs._branding import build_branded_embed
 from .adapters import ADAPTERS_BY_KIND
+from .cache import CACHE
 
 
 _INTERVAL_S = 600                          # 10 min tick
 _PER_COLLECTION_COOLDOWN_S = 24 * 3600     # 24h per (guild, collection)
 _ALERT_TYPE = 'discovery_nft'
+
+# Chains scanned each tick. OpenSea floor/volume are native-denominated, so we
+# keep the scan set small to stay within the 60/min rate budget (each chain is
+# one list call plus one stats call per candidate collection).
+_DISCOVERY_CHAINS = ('ethereum', 'base', 'solana')
+_PER_CHAIN_LIMIT = 10
+# Minimum native floor price to count as real (dust filter). Native units, so
+# ~0.005 ETH on ETH chains; applied uniformly as a small positive floor.
+_MIN_FLOOR_NATIVE = 0.005
 
 
 def _parse_role_ids(raw) -> list[str]:
@@ -43,40 +57,44 @@ def _parse_role_ids(raw) -> list[str]:
 
 def _passes_filters(snap: dict, ts: dict) -> bool:
     raw = snap.get('raw') or {}
-    vol_24h        = snap.get('volume_24h_usd')
-    floor_change   = snap.get('change_24h_pct')          # floorSale.1day
+    floor          = snap.get('price_usd')               # native floor price
     vol_change_pct = raw.get('volume_change_24h_pct')
     sales_24h      = raw.get('sales_count_24h')
 
     try:
-        min_vol   = float(ts.get('discovery_min_volume_24h_usd') or 0)
         min_vchg  = float(ts.get('discovery_min_volume_change_24h_pct') or 0)
         min_sales = int(ts.get('discovery_min_sales_24h') or 0)
     except (TypeError, ValueError):
         return False
 
-    if vol_24h is None or vol_24h < min_vol:                  return False
     if vol_change_pct is None or vol_change_pct < min_vchg:   return False
     if sales_24h is None or sales_24h < min_sales:            return False
-    if floor_change is None or floor_change < 0:              return False  # no dump
+    if floor is None or floor < _MIN_FLOOR_NATIVE:           return False  # dust
     return True
 
 
 def _build_embed(guild_id: int, snap: dict) -> discord.Embed:
     raw = snap.get('raw') or {}
-    name = raw.get('name') or snap.get('symbol_display') or 'Collection'
-    title = f'🎨 NFT Heating Up — {name}'
+    name = snap.get('raw', {}).get('name') or snap.get('symbol_display') or 'Collection'
+    chain = (raw.get('chain') or '').upper()
+    sym = snap.get('price_display_symbol') or ''
+    title = f'🎨 NFT Heating Up: {name}'
+
+    def _amt(v, decimals):
+        # Native-token amount with the chain glyph (Ξ12.50 / 12.50 SOL).
+        if len(sym) == 1:
+            return f'{sym}{v:,.{decimals}f}'
+        return f'{v:,.{decimals}f} {sym}'
 
     desc: list[str] = []
+    if chain:
+        desc.append(f'**Chain:** {chain}')
     floor = snap.get('price_usd')
     if floor:
-        desc.append(f'**Floor:** ${floor:,.2f}')
-    floor_chg = snap.get('change_24h_pct')
-    if floor_chg is not None:
-        desc.append(f'**Floor change 24h:** {floor_chg:+.2f}%')
+        desc.append(f'**Floor:** {_amt(floor, 3)}')
     vol = snap.get('volume_24h_usd')
     if vol:
-        desc.append(f'**24h volume:** ${vol:,.0f}')
+        desc.append(f'**24h volume:** {_amt(vol, 2)}')
     vol_chg = raw.get('volume_change_24h_pct')
     if vol_chg is not None:
         desc.append(f'**Volume change 24h:** {vol_chg:+.1f}%')
@@ -176,8 +194,25 @@ async def discovery_nft_loop(bot) -> None:
                 if int(__import__('time').time()) % 3600 < _INTERVAL_S:
                     print(f'[radar/discovery_nft] adapter disabled: {disabled}')
             else:
-                candidates = await adapter.trending(limit=20)
-                print(f'[radar/discovery_nft] tick: candidates={len(candidates)}')
+                candidates: list[dict] = []
+                for ch in _DISCOVERY_CHAINS:
+                    try:
+                        rows = await adapter.trending(
+                            chain=ch, period='one_day', limit=_PER_CHAIN_LIMIT,
+                        )
+                        candidates.extend(rows)
+                    except Exception as e:  # noqa: BLE001
+                        print(f'[radar/discovery_nft] trending chain={ch} failed: '
+                              f'{type(e).__name__}: {e}')
+                print(f'[radar/discovery_nft] tick: chains={len(_DISCOVERY_CHAINS)} '
+                      f'candidates={len(candidates)}')
+                # Cache each candidate so the NEXT tick has a prior volume to
+                # diff against (OpenSea gives no volume-change field, so the
+                # surge signal is built up from successive observations).
+                for snap in candidates:
+                    ident = snap.get('identifier')
+                    if ident:
+                        CACHE.put('nft', ident, snap)
 
                 if candidates and bot.is_ready():
                     for gid in list_guilds_with_radar():

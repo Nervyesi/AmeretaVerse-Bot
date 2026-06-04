@@ -4113,8 +4113,10 @@ async def radar_watchlist_list(
         kind_v = (r.get('asset_kind') or '').lower()
         ident  = (r.get('asset_identifier') or '').lower()
         snap   = None
-        if _RADAR_CACHE is not None and kind_v == 'crypto':
-            snap = _RADAR_CACHE.get_snapshot('crypto', ident)
+        # Crypto and NFT cache keys are lowercased identifiers; hydrate both so
+        # their live-preview cards show floor/price + change.
+        if _RADAR_CACHE is not None and kind_v in ('crypto', 'nft'):
+            snap = _RADAR_CACHE.get_snapshot(kind_v, ident)
         out.append({
             'id':               int(r['id']),
             'asset_kind':       kind_v,
@@ -4201,8 +4203,8 @@ async def radar_watchlist_add(
             if snap is None:
                 raise HTTPException(
                     status_code=404,
-                    detail='Collection not found on Reservoir. Try a different '
-                           'name or paste the collection slug.',
+                    detail='Collection not found on OpenSea. Paste the collection '
+                           'slug as "chain:slug", e.g. ethereum:pudgypenguins.',
                 )
             _RADAR_CACHE.put('nft', snap['identifier'], snap)
             if display_name == raw_ident.lower() or display_name == ident:
@@ -4311,6 +4313,13 @@ async def radar_watchlist_add(
         print(f'[radar/api] add failed: {type(e).__name__}: {e}')
         raise HTTPException(status_code=500, detail='Could not save the entry')
 
+    if kind == 'nft':
+        try:
+            from database import set_radar_watchlist_platform
+            set_radar_watchlist_platform(server_id, entry_id, 'opensea')
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] set platform failed: {type(e).__name__}: {e}')
+
     log_event(
         server_id, 'admin_action', 'radar_watchlist_added',
         f'Radar watchlist: {kind} {ident} added via dashboard',
@@ -4347,24 +4356,74 @@ async def radar_watchlist_delete(
     return {'ok': True}
 
 
+async def _resolve_nft_preview(body: dict) -> dict:
+    """NFT preview for the dashboard add UI. Accepts a '<chain>:<slug>' in
+    `input`/`query`, or a separate `chain` + `query` slug."""
+    from services.radar.adapters import ADAPTERS_BY_KIND
+    adapter = ADAPTERS_BY_KIND.get('nft')
+    if adapter is None or getattr(adapter, 'disabled_reason', None):
+        raise HTTPException(
+            status_code=503,
+            detail=getattr(adapter, 'disabled_reason', None)
+                   or 'NFT adapter not configured.',
+        )
+    query = str(body.get('query') or body.get('input') or '').strip()
+    chain = str(body.get('chain') or '').strip().lower()
+    if not query:
+        raise HTTPException(status_code=400, detail='query is required')
+    ident = query if ':' in query else (f'{chain}:{query}' if chain else query)
+    try:
+        snap = await adapter.fetch_one(ident)
+    except Exception as e:  # noqa: BLE001
+        print(f'[radar/api] resolve nft failed: {type(e).__name__}: {e}')
+        raise HTTPException(status_code=503,
+            detail='NFT lookup unavailable. Try again shortly.')
+    if snap is None:
+        raise HTTPException(
+            status_code=404,
+            detail='Collection not found on OpenSea. Check the chain and slug, '
+                   'e.g. ethereum:pudgypenguins.',
+        )
+    raw = snap.get('raw') or {}
+    return {
+        'kind':           'nft',
+        'identifier':     snap['identifier'],
+        'chain':          raw.get('chain'),
+        'slug':           raw.get('slug'),
+        'symbol':         snap.get('symbol_display'),
+        'name':           raw.get('name'),
+        'price_usd':      snap.get('price_usd'),
+        'price_symbol':   snap.get('price_display_symbol'),
+        'change_24h_pct': snap.get('change_24h_pct'),
+        'volume_24h_usd': snap.get('volume_24h_usd'),
+        'image_url':      snap.get('image_url'),
+        'page_url':       snap.get('page_url'),
+    }
+
+
 @app.post('/api/servers/{server_id}/radar/watchlist/resolve')
 async def radar_watchlist_resolve(
     server_id: int,
     body: dict,
     user: dict = Depends(get_current_user),
 ):
-    """Memecoin paste-and-resolve preview. Takes either a chain:address
-    string or a dexscreener.com URL; returns a snapshot preview so the
-    admin can confirm before saving via POST /watchlist."""
+    """Paste-and-resolve preview. Memecoin: a chain:address string or a
+    dexscreener.com URL. NFT: a '<chain>:<slug>' (or a separate `chain` plus a
+    `query` slug). Returns a snapshot preview so the admin can confirm before
+    saving via POST /watchlist."""
     require_module_access(user, server_id, 'radar')
     rate_limit(f'radar_resolve:{server_id}', 30, 60.0)
 
-    kind = (body.get('kind') or 'meme').strip().lower()
-    if kind != 'meme':
+    kind = (body.get('kind') or body.get('topic') or 'meme').strip().lower()
+    if kind not in ('meme', 'nft'):
         raise HTTPException(
             status_code=400,
-            detail='resolve currently only supports kind=meme',
+            detail='resolve supports kind=meme or kind=nft',
         )
+
+    if kind == 'nft':
+        return await _resolve_nft_preview(body)
+
     raw = str(body.get('input') or '').strip()
     if not raw:
         raise HTTPException(status_code=400, detail='input is required')
@@ -4428,8 +4487,9 @@ async def radar_search_asset(
     user: dict = Depends(get_current_user),
 ):
     """Autocomplete for the dashboard add UI. Crypto via CoinGecko /search;
-    NFT via Reservoir search; Forex via Frankfurter /currencies (filtered).
-    Memecoin uses paste-and-resolve (see /watchlist/resolve)."""
+    NFT via OpenSea (resolves a 'chain:slug' directly — OpenSea has no fuzzy
+    name search); Forex via Frankfurter /currencies (filtered). Memecoin uses
+    paste-and-resolve (see /watchlist/resolve)."""
     require_module_access(user, server_id, 'radar')
     rate_limit(f'radar_search:{server_id}', 30, 60.0)
     kind = (kind or 'crypto').strip().lower()

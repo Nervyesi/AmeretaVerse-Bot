@@ -87,7 +87,7 @@ async def fetch_once() -> dict:
             if adapter is None:
                 continue
             if getattr(adapter, 'disabled_reason', None):
-                # e.g. Reservoir without RESERVOIR_API_KEY
+                # e.g. OpenSea without OPENSEA_API_KEY
                 continue
             wanted = _watchlist_union(kind)
             if not wanted:

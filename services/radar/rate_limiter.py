@@ -7,9 +7,8 @@ the loop. Buckets refill smoothly over time so bursts are tolerated.
 
 Defaults are tuned to stay safely under each free tier:
   • coingecko: 25/min (CoinGecko free tier is ~30/min; we leave headroom)
-  • reservoir, dexscreener, frankfurter, alpha_vantage: reserved entries
-    for Phase 2; the buckets exist so Phase-2 code doesn't need to revisit
-    this file.
+  • opensea: 60/min (OpenSea v2 ~5/s, 60/min)
+  • dexscreener, frankfurter: per-source buckets sized to each free tier.
 """
 from __future__ import annotations
 
@@ -80,6 +79,6 @@ class RateLimiter:
 # one source's per-minute does not pause the others.
 LIMITER = RateLimiter()
 LIMITER.configure('coingecko',    per_minute=25)
-LIMITER.configure('reservoir',    per_minute=30)
+LIMITER.configure('opensea',      per_minute=60)   # OpenSea v2: ~5/s, 60/min
 LIMITER.configure('dexscreener',  per_minute=60)
 LIMITER.configure('frankfurter',  per_minute=30)

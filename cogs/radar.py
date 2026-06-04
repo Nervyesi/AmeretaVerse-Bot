@@ -186,7 +186,7 @@ class Radar(commands.Cog):
 
     # ── /price (placeholder commands for future topics) ───────────────────
     @price_group.command(name='nft', description='Coming soon: NFT collection lookup')
-    @app_commands.describe(collection='Reservoir collection slug')
+    @app_commands.describe(collection='OpenSea collection, e.g. ethereum:pudgypenguins')
     async def price_nft(self, interaction: discord.Interaction, collection: str):
         await self._coming_soon(interaction, 'NFT')
 
