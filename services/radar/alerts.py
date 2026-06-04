@@ -137,6 +137,30 @@ def _volume_multiple(snap: dict, kind: str, identifier: str) -> Optional[float]:
 
 # ── Discord embed builders ──────────────────────────────────────────────────
 
+def _price_str(snap: dict) -> Optional[str]:
+    """Format a snapshot price. NFT floors are in chain-native units (ETH, SOL,
+    ...) so they use the snapshot's display symbol; crypto/meme are USD."""
+    p = snap.get('price_usd')
+    if p is None:
+        return None
+    if (snap.get('kind') or '').lower() == 'nft':
+        sym = snap.get('price_display_symbol') or 'Ξ'
+        return f'{sym}{p:,.4f}' if len(sym) == 1 else f'{p:,.4f} {sym}'
+    return f'${p:,.4f}'
+
+
+def _volume_str(snap: dict) -> Optional[str]:
+    """Format a snapshot's 24h volume. NFT volumes are chain-native (ETH on
+    Ethereum collections, etc.); crypto/meme are USD."""
+    v = snap.get('volume_24h_usd')
+    if not v:
+        return None
+    if (snap.get('kind') or '').lower() == 'nft':
+        sym = snap.get('price_display_symbol') or 'Ξ'
+        return f'{sym}{v:,.2f}' if len(sym) == 1 else f'{v:,.2f} {sym}'
+    return f'${v:,.0f}'
+
+
 def _alert_movement_embed(
     guild_id: int, snap: dict, change_pct: float,
     *, label: str = '1h',
@@ -155,7 +179,7 @@ def _alert_movement_embed(
 
     desc_lines = []
     if price is not None:
-        desc_lines.append(f'**Price:** ${price:,.4f}')
+        desc_lines.append(f'**Price:** {_price_str(snap)}')
     desc_lines.append(f'**{label} change:** {change_pct:+.2f}%')
     # Also surface the OTHER timeframes when present for context.
     if label != '1h':
@@ -167,7 +191,7 @@ def _alert_movement_embed(
         if ch24v is not None:
             desc_lines.append(f'**24h change:** {ch24v:+.2f}%')
     if vol_24h:
-        desc_lines.append(f'**24h volume:** ${vol_24h:,.0f}')
+        desc_lines.append(f'**24h volume:** {_volume_str(snap)}')
     # No upstream-source attribution link — brand footer is the only credit.
 
     e = build_branded_embed(
@@ -196,9 +220,9 @@ def _alert_volume_embed(guild_id: int, snap: dict) -> discord.Embed:
 
     desc = []
     if price is not None:
-        desc.append(f'**Price:** ${price:,.4f}')
+        desc.append(f'**Price:** {_price_str(snap)}')
     if vol:
-        desc.append(f'**24h volume:** ${vol:,.0f}')
+        desc.append(f'**24h volume:** {_volume_str(snap)}')
     ch24 = snap.get('change_24h_pct')
     if ch24 is not None:
         desc.append(f'**24h change:** {ch24:+.2f}%')
