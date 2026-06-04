@@ -111,6 +111,72 @@ def _pct_change(prev, cur) -> Optional[float]:
     return (c - p) / p * 100.0
 
 
+import re
+
+# Contract-address shapes. EVM is hex (case-insensitive); Solana is base58
+# (case-SENSITIVE — never lowercase a Solana address before matching).
+_EVM_ADDR_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
+_SOLANA_ADDR_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
+
+
+def detect_address(query: str, chain: str) -> Optional[str]:
+    """Return the address when `query` looks like a contract address on the
+    given chain, else None. Case is preserved (required for Solana)."""
+    q = (query or '').strip()
+    if not q:
+        return None
+    if (chain or '').lower() == 'solana':
+        return q if _SOLANA_ADDR_RE.match(q) else None
+    return q if _EVM_ADDR_RE.match(q) else None
+
+
+def slug_candidates(query: str) -> list[str]:
+    """Generate plausible OpenSea slug forms from a free-text query so that
+    e.g. 'Bored Ape Yacht Club' resolves to 'boredapeyachtclub'."""
+    q = (query or '').strip()
+    out: list[str] = []
+    if not q:
+        return out
+    out.append(q.lower())
+    alnum = ''.join(c for c in q.lower() if c.isalnum())
+    if alnum and alnum not in out:
+        out.append(alnum)
+    dashed = '-'.join(q.lower().split())
+    if dashed and dashed not in out:
+        out.append(dashed)
+    underscored = '_'.join(q.lower().split())
+    if underscored and underscored not in out:
+        out.append(underscored)
+    return out
+
+
+def _split_chain_query(s: str) -> Optional[tuple[str, str]]:
+    """Split user input into (chain, query) WITHOUT lowercasing the query, so
+    a contract address survives intact. '<chain>:<rest>' only splits when the
+    prefix is a known chain; otherwise the whole string is the query on the
+    default chain. opensea.io URLs yield (default_chain, slug)."""
+    raw = (s or '').strip()
+    if not raw:
+        return None
+    low = raw.lower()
+    marker = 'opensea.io/'
+    if marker in low:
+        tail = low.split(marker, 1)[1]
+        parts = [p for p in tail.split('/') if p]
+        if 'collection' in parts:
+            i = parts.index('collection')
+            if i + 1 < len(parts):
+                return DEFAULT_CHAIN, parts[i + 1]
+        if parts:
+            return DEFAULT_CHAIN, parts[-1]
+        return None
+    if ':' in raw:
+        head, _, rest = raw.partition(':')
+        if head.strip().lower() in CHAIN_IDS and rest.strip():
+            return head.strip().lower(), rest.strip()
+    return DEFAULT_CHAIN, raw
+
+
 def parse_nft_input(s: str) -> Optional[tuple[str, str]]:
     """Accept '<chain>:<slug>', a bare slug (defaults to ethereum), or an
     opensea.io/collection/<slug> URL. Returns (chain, slug) lowercased, or
@@ -216,16 +282,43 @@ class OpenSeaAdapter(AssetAdapter):
     async def fetch_one(self, identifier: str) -> Optional[dict]:
         if self.disabled_reason:
             return None
-        parsed = parse_nft_input(identifier)
+        parsed = _split_chain_query(identifier)
         if parsed is None:
             return None
-        chain, slug = parsed
+        chain, query = parsed
+        slug, meta = await self._resolve_collection(chain, query)
+        if not slug:
+            return None
         stats = await self._get(f'/collections/{slug}/stats')
         if stats is None:
             return None
-        meta = await self._get(f'/collections/{slug}')
         prev_v24, prev_v7 = _prev_volumes(chain, slug)
         return _build_snapshot(chain, slug, meta or {}, stats, prev_v24, prev_v7)
+
+    async def _resolve_collection(
+        self, chain: str, query: str,
+    ) -> tuple[Optional[str], dict]:
+        """Resolve free-text / address / slug input to (canonical_slug, meta).
+        Order: contract address -> slug candidates. Returns (None, {}) when
+        nothing resolves. The collection metadata is fetched here so fetch_one
+        does not need a second lookup."""
+        # 1. Contract address -> /chain/{chain}/contract/{address} -> slug.
+        addr = detect_address(query, chain)
+        if addr:
+            data = await self._get(f'/chain/{chain}/contract/{addr}')
+            slug = (data or {}).get('collection')
+            if slug:
+                meta = await self._get(f'/collections/{slug}')
+                return slug, (meta or {})
+            # Contract lookup miss — fall through to slug forms.
+
+        # 2. Try each slug candidate; first one that resolves wins. The
+        #    /collections/{slug} response doubles as the metadata.
+        for cand in slug_candidates(query):
+            meta = await self._get(f'/collections/{cand}')
+            if meta:
+                return (meta.get('collection') or cand), meta
+        return None, {}
 
     async def search(self, query: str, limit: int = 8) -> list[dict]:
         """OpenSea v2 has no fuzzy collection-name search. We treat the query

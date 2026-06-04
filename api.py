@@ -4159,7 +4159,7 @@ async def radar_watchlist_add(
     ident = raw_ident.lower() if kind in ('crypto', 'nft') else raw_ident
     display_name = (body.display_name or '').strip() or ident
 
-    from services.radar.adapters import ADAPTERS_BY_KIND
+    from services.radar.adapters import ADAPTERS_BY_KIND, is_commodity
     from services.radar.cache    import CACHE as _RADAR_CACHE
 
     if kind == 'crypto':
@@ -4203,8 +4203,10 @@ async def radar_watchlist_add(
             if snap is None:
                 raise HTTPException(
                     status_code=404,
-                    detail='Collection not found on OpenSea. Paste the collection '
-                           'slug as "chain:slug", e.g. ethereum:pudgypenguins.',
+                    detail="Collection not found. Try the slug from the OpenSea "
+                           "URL (e.g. 'boredapeyachtclub' from "
+                           "opensea.io/collection/boredapeyachtclub), or paste "
+                           "the contract address.",
                 )
             _RADAR_CACHE.put('nft', snap['identifier'], snap)
             if display_name == raw_ident.lower() or display_name == ident:
@@ -4266,6 +4268,24 @@ async def radar_watchlist_add(
             print(f'[radar/api] resolve meme failed: {type(e).__name__}: {e}')
             raise HTTPException(status_code=503,
                 detail='Memecoin lookup unavailable. Try again shortly.')
+
+    elif kind == 'forex' and is_commodity(raw_ident):
+        # Commodities (XAU/XAG/WTI/BRENT/XPT) are quoted in USD via Yahoo,
+        # bypassing the fiat 3-letter validation (BRENT is 5 chars).
+        from services.radar.adapters import COMMODITIES_ADAPTER
+        base = raw_ident.split('/')[0].strip().upper()
+        ident = f'{base}/USD'
+        try:
+            snap = await COMMODITIES_ADAPTER.fetch_one(ident)
+        except Exception as e:  # noqa: BLE001
+            print(f'[radar/api] commodity prefetch failed: {type(e).__name__}: {e}')
+            snap = None
+        if snap is None:
+            raise HTTPException(status_code=503,
+                detail='Commodity price source unavailable. Try again shortly.')
+        _RADAR_CACHE.put('forex', ident, snap)
+        if display_name == raw_ident or display_name == ident:
+            display_name = (snap.get('raw', {}).get('name') or ident)
 
     elif kind == 'forex':
         from services.radar.adapters.frankfurter import split_pair
@@ -4381,8 +4401,10 @@ async def _resolve_nft_preview(body: dict) -> dict:
     if snap is None:
         raise HTTPException(
             status_code=404,
-            detail='Collection not found on OpenSea. Check the chain and slug, '
-                   'e.g. ethereum:pudgypenguins.',
+            detail="Collection not found. Try the slug from the OpenSea URL "
+                   "(e.g. 'boredapeyachtclub' from "
+                   "opensea.io/collection/boredapeyachtclub), or paste the "
+                   "contract address.",
         )
     raw = snap.get('raw') or {}
     return {

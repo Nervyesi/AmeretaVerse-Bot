@@ -80,8 +80,8 @@ async def fetch_once() -> dict:
     except Exception as e:  # noqa: BLE001
         print(f'[radar/fetcher] crypto block crashed: {type(e).__name__}: {e}')
 
-    # ── NFT, Memecoin, Forex: one batched fetch per registered adapter ──
-    for kind in ('nft', 'meme', 'forex'):
+    # ── NFT, Memecoin: one batched fetch per registered adapter ──
+    for kind in ('nft', 'meme'):
         try:
             adapter = ADAPTERS_BY_KIND.get(kind)
             if adapter is None:
@@ -104,6 +104,41 @@ async def fetch_once() -> dict:
             summary[f'{kind}_got']    = len(rows)
         except Exception as e:  # noqa: BLE001
             print(f'[radar/fetcher] {kind} block crashed: {type(e).__name__}: {e}')
+
+    # ── Forex: fiat pairs via Frankfurter, commodities via Yahoo. Both share
+    #    the 'forex' topic/cache; routing is per-identifier base. ──
+    try:
+        from .adapters import COMMODITIES_ADAPTER, is_commodity
+        wanted = _watchlist_union('forex')
+        if not wanted:
+            summary['forex_wanted'] = 0
+        else:
+            fiat        = sorted(i for i in wanted if not is_commodity(i))
+            commodities = sorted(i for i in wanted if is_commodity(i))
+            got = 0
+            fx = ADAPTERS_BY_KIND.get('forex')
+            if fiat and fx is not None and not getattr(fx, 'disabled_reason', None):
+                try:
+                    rows = await fx.fetch_batch(fiat)
+                except Exception as e:  # noqa: BLE001
+                    print(f'[radar/fetcher] forex fiat fetch failed: {type(e).__name__}: {e}')
+                    rows = []
+                for snap in rows:
+                    CACHE.put('forex', snap['identifier'], snap)
+                got += len(rows)
+            if commodities:
+                try:
+                    rows = await COMMODITIES_ADAPTER.fetch_batch(commodities)
+                except Exception as e:  # noqa: BLE001
+                    print(f'[radar/fetcher] commodities fetch failed: {type(e).__name__}: {e}')
+                    rows = []
+                for snap in rows:
+                    CACHE.put('forex', snap['identifier'], snap)
+                got += len(rows)
+            summary['forex_wanted'] = len(wanted)
+            summary['forex_got']    = got
+    except Exception as e:  # noqa: BLE001
+        print(f'[radar/fetcher] forex block crashed: {type(e).__name__}: {e}')
 
     return summary
 

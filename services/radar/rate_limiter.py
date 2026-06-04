@@ -82,3 +82,4 @@ LIMITER.configure('coingecko',    per_minute=25)
 LIMITER.configure('opensea',      per_minute=60)   # OpenSea v2: ~5/s, 60/min
 LIMITER.configure('dexscreener',  per_minute=60)
 LIMITER.configure('frankfurter',  per_minute=30)
+LIMITER.configure('yahoo',        per_minute=30)   # Yahoo Finance (commodities)
