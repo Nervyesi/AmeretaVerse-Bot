@@ -26,7 +26,7 @@ from database import (
     get_radar_settings,
     list_guilds_with_radar,
     list_radar_watchlist,
-    last_radar_alert_at,
+    recent_alert_magnitude,
     record_radar_alert,
 )
 from cogs._branding import build_branded_embed
@@ -46,34 +46,25 @@ def _meme_chain_field(embed: discord.Embed, snap: dict) -> None:
         embed.add_field(name='Chain', value=chain_badge(chain), inline=True)
 
 
-_COOLDOWN_MOVEMENT_S = 3600.0    # 1 hour per (guild, asset, direction)
-_COOLDOWN_VOLUME_S   = 3600.0
 _HISTORY_LOOKBACK_S  = 3600.0    # ~1h ago for the in-memory change_1h fallback
 
 
-def _parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        s2 = str(s).replace('Z', '+00:00')
-        d  = datetime.fromisoformat(s2)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return d
-    except (TypeError, ValueError):
-        return None
+# ── 24h dedup with doubling exception ───────────────────────────────────────
+# Per (guild, asset, alert_kind) within a rolling 24h window:
+#   • 1st alert fires freely
+#   • a later alert ONLY fires if its magnitude >= 2x the last fired magnitude
+#   • after 24h from the most recent fire the chain naturally resets (the
+#     lookup is windowed)
+# alert_kind is direction-independent ('movement_24h', not '..._up'), so a pump
+# then a dump share one doubling chain; each kind (1h/24h/7d/volume) is its own.
 
-
-def _cooled_down(
-    guild_id: int, identifier: str, alert_type: str,
-    cooldown_seconds: float,
+def should_fire_alert(
+    guild_id: int, identifier: str, alert_kind: str, magnitude: float,
 ) -> bool:
-    """True when an alert of this type for this asset was sent recently
-    enough that we should suppress this one."""
-    last = _parse_iso(last_radar_alert_at(guild_id, identifier, alert_type))
+    last = recent_alert_magnitude(guild_id, identifier, alert_kind, within_hours=24)
     if last is None:
-        return False
-    return (datetime.now(timezone.utc) - last).total_seconds() < cooldown_seconds
+        return True
+    return abs(float(magnitude)) >= last * 2.0
 
 
 # ── Change-1h fallback ──────────────────────────────────────────────────────
@@ -121,24 +112,27 @@ def _change_1h_pct(snap: dict, kind: str, identifier: str) -> Optional[float]:
 # multiplier × the median 24h volume across the recent in-memory history.
 # That catches genuine sustained spikes without flapping on tiny ticks.
 
-def _volume_spike(snap: dict, kind: str, identifier: str, multiplier: float) -> bool:
+def _volume_multiple(snap: dict, kind: str, identifier: str) -> Optional[float]:
+    """Current 24h volume as a multiple of the recent median, or None when
+    there isn't enough history. The caller compares it to the guild's
+    multiplier threshold and uses it as the alert magnitude."""
     vol_now = snap.get('volume_24h_usd')
-    if not vol_now or vol_now <= 0 or multiplier <= 1.0:
-        return False
+    if not vol_now or vol_now <= 0:
+        return None
     hist = CACHE.history(kind, identifier)
     if len(hist) < 6:    # need a few samples before we'll call anything a spike
-        return False
+        return None
     vols = sorted(
         float(h[1].get('volume_24h_usd') or 0)
         for h in hist
         if h[1].get('volume_24h_usd')
     )
     if not vols:
-        return False
+        return None
     median = vols[len(vols) // 2]
     if median <= 0:
-        return False
-    return float(vol_now) >= float(multiplier) * median
+        return None
+    return float(vol_now) / median
 
 
 # ── Discord embed builders ──────────────────────────────────────────────────
@@ -152,7 +146,7 @@ def _alert_movement_embed(
     is_up = change_pct >= 0
     arrow = '🚀' if is_up else '📉'
     direction = 'pumping' if is_up else 'dumping'
-    sym = snap.get('symbol_display') or snap.get('identifier')
+    sym = snap.get('display_name') or snap.get('symbol_display') or snap.get('identifier')
     title = f'{arrow} {sym} {direction} ({label})'
 
     price = snap.get('price_usd')
@@ -195,7 +189,8 @@ def _alert_movement_embed(
 
 
 def _alert_volume_embed(guild_id: int, snap: dict) -> discord.Embed:
-    title = f'📊 {snap.get("symbol_display") or snap.get("identifier")} volume spike'
+    _label = snap.get('display_name') or snap.get('symbol_display') or snap.get('identifier')
+    title = f'📊 {_label} volume spike'
     price = snap.get('price_usd')
     vol = snap.get('volume_24h_usd')
 
@@ -365,34 +360,32 @@ async def dispatch_alerts(bot) -> dict:
                         f'en_1h={en_1h} en_24h={en_24h} en_vol={en_vol}'
                     )
 
+                # Each timeframe is one direction-independent alert_kind under
+                # the 24h doubling dedup. abs(change) >= threshold gates entry;
+                # should_fire_alert gates re-fires.
+                async def _fire_movement(change: float, label: str, kind_name: str,
+                                         payload_key: str) -> bool:
+                    if not should_fire_alert(gid, ident, kind_name, abs(change)):
+                        return False
+                    embed = _alert_movement_embed(gid, snap, change, label=label)
+                    if not await _send_alert(bot, gid, int(ch_id), embed,
+                                             mention_role_ids=alert_mentions):
+                        return False
+                    record_radar_alert(
+                        gid, topic, ident, kind_name,
+                        {payload_key: change, 'price_usd': snap.get('price_usd'),
+                         'volume_24h_usd': snap.get('volume_24h_usd')},
+                        magnitude=abs(change),
+                        direction='up' if change > 0 else 'down',
+                    )
+                    return True
+
                 # ── 1h timeframe ────────────────────────────────────────
                 if en_1h and thr_1h > 0:
                     ch1h = _change_1h_pct(snap, topic, ident)
-                    if ch1h is not None:
-                        if ch1h >= thr_1h:
-                            if not _cooled_down(gid, ident, 'movement_1h_up', _COOLDOWN_MOVEMENT_S):
-                                embed = _alert_movement_embed(gid, snap, ch1h, label='1h')
-                                if await _send_alert(bot, gid, int(ch_id), embed,
-                                                     mention_role_ids=alert_mentions):
-                                    record_radar_alert(
-                                        gid, topic, ident, 'movement_1h_up',
-                                        {'change_1h_pct': ch1h,
-                                         'price_usd':     snap.get('price_usd'),
-                                         'volume_24h_usd': snap.get('volume_24h_usd')},
-                                    )
-                                    sent += 1
-                        elif ch1h <= -thr_1h:
-                            if not _cooled_down(gid, ident, 'movement_1h_down', _COOLDOWN_MOVEMENT_S):
-                                embed = _alert_movement_embed(gid, snap, ch1h, label='1h')
-                                if await _send_alert(bot, gid, int(ch_id), embed,
-                                                     mention_role_ids=alert_mentions):
-                                    record_radar_alert(
-                                        gid, topic, ident, 'movement_1h_down',
-                                        {'change_1h_pct': ch1h,
-                                         'price_usd':     snap.get('price_usd'),
-                                         'volume_24h_usd': snap.get('volume_24h_usd')},
-                                    )
-                                    sent += 1
+                    if ch1h is not None and abs(ch1h) >= thr_1h:
+                        if await _fire_movement(ch1h, '1h', 'movement_1h', 'change_1h_pct'):
+                            sent += 1
 
                 # ── 24h timeframe ───────────────────────────────────────
                 if en_24h and thr_24h > 0:
@@ -401,29 +394,9 @@ async def dispatch_alerts(bot) -> dict:
                         ch24 = float(ch24) if ch24 is not None else None
                     except (TypeError, ValueError):
                         ch24 = None
-                    if ch24 is not None:
-                        if ch24 >= thr_24h:
-                            if not _cooled_down(gid, ident, 'movement_24h_up', _COOLDOWN_MOVEMENT_S):
-                                embed = _alert_movement_embed(gid, snap, ch24, label='24h')
-                                if await _send_alert(bot, gid, int(ch_id), embed,
-                                                     mention_role_ids=alert_mentions):
-                                    record_radar_alert(
-                                        gid, topic, ident, 'movement_24h_up',
-                                        {'change_24h_pct': ch24,
-                                         'price_usd':       snap.get('price_usd')},
-                                    )
-                                    sent += 1
-                        elif ch24 <= -thr_24h:
-                            if not _cooled_down(gid, ident, 'movement_24h_down', _COOLDOWN_MOVEMENT_S):
-                                embed = _alert_movement_embed(gid, snap, ch24, label='24h')
-                                if await _send_alert(bot, gid, int(ch_id), embed,
-                                                     mention_role_ids=alert_mentions):
-                                    record_radar_alert(
-                                        gid, topic, ident, 'movement_24h_down',
-                                        {'change_24h_pct': ch24,
-                                         'price_usd':       snap.get('price_usd')},
-                                    )
-                                    sent += 1
+                    if ch24 is not None and abs(ch24) >= thr_24h:
+                        if await _fire_movement(ch24, '24h', 'movement_24h', 'change_24h_pct'):
+                            sent += 1
 
                 # ── 7d timeframe (crypto only — others have no feed) ───
                 if en_7d and thr_7d > 0 and topic == 'crypto':
@@ -432,42 +405,25 @@ async def dispatch_alerts(bot) -> dict:
                         ch7d = float(ch7d) if ch7d is not None else None
                     except (TypeError, ValueError):
                         ch7d = None
-                    if ch7d is not None:
-                        if ch7d >= thr_7d:
-                            if not _cooled_down(gid, ident, 'movement_7d_up', _COOLDOWN_MOVEMENT_S):
-                                embed = _alert_movement_embed(gid, snap, ch7d, label='7d')
-                                if await _send_alert(bot, gid, int(ch_id), embed,
-                                                     mention_role_ids=alert_mentions):
-                                    record_radar_alert(
-                                        gid, topic, ident, 'movement_7d_up',
-                                        {'change_7d_pct': ch7d,
-                                         'price_usd':     snap.get('price_usd')},
-                                    )
-                                    sent += 1
-                        elif ch7d <= -thr_7d:
-                            if not _cooled_down(gid, ident, 'movement_7d_down', _COOLDOWN_MOVEMENT_S):
-                                embed = _alert_movement_embed(gid, snap, ch7d, label='7d')
-                                if await _send_alert(bot, gid, int(ch_id), embed,
-                                                     mention_role_ids=alert_mentions):
-                                    record_radar_alert(
-                                        gid, topic, ident, 'movement_7d_down',
-                                        {'change_7d_pct': ch7d,
-                                         'price_usd':     snap.get('price_usd')},
-                                    )
-                                    sent += 1
+                    if ch7d is not None and abs(ch7d) >= thr_7d:
+                        if await _fire_movement(ch7d, '7d', 'movement_7d', 'change_7d_pct'):
+                            sent += 1
 
-                # ── Volume spike — forex skipped, others use multiplier ──
+                # ── Volume surge — forex skipped, others use multiplier ──
                 if topic == 'forex' or not en_vol:
                     continue
-                if vol_mul > 1.0 and _volume_spike(snap, topic, ident, vol_mul):
-                    if not _cooled_down(gid, ident, 'volume_spike', _COOLDOWN_VOLUME_S):
+                mult = _volume_multiple(snap, topic, ident)
+                if mult is not None and vol_mul > 1.0 and mult >= vol_mul:
+                    if should_fire_alert(gid, ident, 'volume_surge_24h', mult):
                         embed = _alert_volume_embed(gid, snap)
                         if await _send_alert(bot, gid, int(ch_id), embed,
                                              mention_role_ids=alert_mentions):
                             record_radar_alert(
-                                gid, topic, ident, 'volume_spike',
+                                gid, topic, ident, 'volume_surge_24h',
                                 {'volume_24h_usd': snap.get('volume_24h_usd'),
-                                 'price_usd':      snap.get('price_usd')},
+                                 'price_usd':      snap.get('price_usd'),
+                                 'volume_multiple': mult},
+                                magnitude=mult, direction='up',
                             )
                             sent += 1
 

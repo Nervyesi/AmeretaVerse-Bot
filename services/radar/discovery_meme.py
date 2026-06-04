@@ -44,9 +44,10 @@ def _parse_role_ids(raw) -> list[str]:
     return [str(v).strip() for v in data if str(v).strip()]
 
 
-def _passes_filters(snap: dict, ts: dict) -> bool:
-    """Per-guild threshold check. All thresholds default to the schema's
-    conservative values; admins tune them in the dashboard."""
+def _rejection_reason(snap: dict, ts: dict) -> str | None:
+    """Return the first filter a candidate fails ('liquidity_low', 'volume_low',
+    'price_change_low', 'age_young', 'buy_pressure_low'), or None when it passes.
+    Used both for the pass/fail decision and the per-filter diagnostic counts."""
     raw = snap.get('raw') or {}
     liq = raw.get('liquidity_usd')
     vol = snap.get('volume_24h_usd')
@@ -61,18 +62,22 @@ def _passes_filters(snap: dict, ts: dict) -> bool:
         min_age = float(ts.get('discovery_min_age_hours') or 0)
         min_ch1 = float(ts.get('discovery_min_change_1h_pct') or 0)
     except (TypeError, ValueError):
-        return False
+        return 'liquidity_low'
 
-    if liq is None or liq < min_liq:                     return False
-    if vol is None or vol < min_vol:                     return False
-    if age is None or age < min_age:                     return False
-    if ch1 is None or ch1 < min_ch1 or ch1 <= 0:         return False  # buy signal only
-    # Buy pressure: more buys than 1.5x sells in the last hour. If either
-    # value is missing we fall through (DEXScreener occasionally omits txns
-    # on lightly-traded pairs); admins can always raise other thresholds.
+    if liq is None or liq < min_liq:                 return 'liquidity_low'
+    if vol is None or vol < min_vol:                 return 'volume_low'
+    if ch1 is None or ch1 < min_ch1 or ch1 <= 0:     return 'price_change_low'  # buy signal only
+    if age is None or age < min_age:                 return 'age_young'
+    # Buy pressure: more buys than 1.5x sells in the last hour. If either value
+    # is missing we let it pass (DEXScreener occasionally omits txns on lightly
+    # traded pairs).
     if buys is not None and sells is not None and buys < sells * 1.5:
-        return False
-    return True
+        return 'buy_pressure_low'
+    return None
+
+
+def _passes_filters(snap: dict, ts: dict) -> bool:
+    return _rejection_reason(snap, ts) is None
 
 
 def _build_embed(guild_id: int, snap: dict) -> discord.Embed:
@@ -149,12 +154,16 @@ async def _send_for_guild(bot, guild_id: int, ts: dict, candidates: list[dict]) 
     sent = 0
     passed = 0            # candidates that cleared the guild's quality filters
     cooldown_skipped = 0  # passed filters but still inside the 12h per-token window
+    rejections = {'liquidity_low': 0, 'volume_low': 0, 'price_change_low': 0,
+                  'age_young': 0, 'buy_pressure_low': 0}
     now_utc = datetime.now(timezone.utc)
     for snap in candidates:
         identifier = snap.get('identifier')
         if not identifier:
             continue
-        if not _passes_filters(snap, ts):
+        reason = _rejection_reason(snap, ts)
+        if reason is not None:
+            rejections[reason] = rejections.get(reason, 0) + 1
             continue
         passed += 1
         # Per-token 12h cooldown.
@@ -198,7 +207,8 @@ async def _send_for_guild(bot, guild_id: int, ts: dict, candidates: list[dict]) 
     # Observability for the discovery smoke test: how the candidate funnel
     # narrowed for this guild on this tick. Read-only.
     print(f'[radar/discovery_meme] scan g={guild_id} candidates={len(candidates)} '
-          f'passed_filters={passed} cooldown_skipped={cooldown_skipped} sent={sent}')
+          f'by_filter={rejections} passed_filters={passed} '
+          f'cooldown_skipped={cooldown_skipped} sent={sent}')
     return sent
 
 

@@ -230,8 +230,10 @@ def _build_topic_embed(
     if watch_section:
         lines: list[str] = []
         for row, snap in watch_section[:25]:
-            sym = (snap.get('symbol_display') or row.get('display_name')
-                   or row.get('asset_identifier') or '').upper()
+            # Prefer the snapshot's friendly display name (e.g. commodities show
+            # 'Gold (XAU/USD)'); fall back to the symbol / saved name.
+            sym = (snap.get('display_name') or snap.get('symbol_display')
+                   or row.get('display_name') or row.get('asset_identifier') or '').upper()
             price = _format_snap_price(snap)
             ch24  = _format_pct(snap.get('change_24h_pct'))
             if topic == 'meme':

@@ -29,16 +29,16 @@ _HEADERS = {
     'Accept':     'application/json',
 }
 
-# base code -> (yahoo symbol, display name, quote currency)
+# base code -> (yahoo symbol, friendly name, quote currency)
 # Yahoo's v8 chart endpoint serves COMEX/NYMEX futures (=F); the spot FX-style
 # metal symbols (XAUUSD=X) return "delisted" there, so we use the near-month
 # futures, which track spot closely.
 COMMODITY_SYMBOLS: dict[str, tuple[str, str, str]] = {
-    'XAU':   ('GC=F', 'Gold (per oz)',          'USD'),
-    'XAG':   ('SI=F', 'Silver (per oz)',        'USD'),
-    'WTI':   ('CL=F', 'Oil WTI (per barrel)',   'USD'),
-    'BRENT': ('BZ=F', 'Oil Brent (per barrel)', 'USD'),
-    'XPT':   ('PL=F', 'Platinum (per oz)',      'USD'),
+    'XAU':   ('GC=F', 'Gold',      'USD'),
+    'XAG':   ('SI=F', 'Silver',    'USD'),
+    'WTI':   ('CL=F', 'Oil WTI',   'USD'),
+    'BRENT': ('BZ=F', 'Oil Brent', 'USD'),
+    'XPT':   ('PL=F', 'Platinum',  'USD'),
 }
 COMMODITY_BASES = frozenset(COMMODITY_SYMBOLS.keys())
 
@@ -47,6 +47,16 @@ def is_commodity(identifier: str) -> bool:
     """True when the identifier's base is a known commodity code."""
     base = (identifier or '').split('/')[0].strip().upper()
     return base in COMMODITY_BASES
+
+
+def build_display_name(identifier: str) -> str:
+    """'XAU/USD' -> 'Gold (XAU/USD)'. Fiat pairs (and anything unknown) are
+    returned unchanged."""
+    base = (identifier or '').split('/')[0].strip().upper()
+    spec = COMMODITY_SYMBOLS.get(base)
+    if spec:
+        return f'{spec[1]} ({identifier})'
+    return identifier
 
 
 def _flt(v) -> Optional[float]:
@@ -125,10 +135,11 @@ class CommoditiesAdapter(AssetAdapter):
         if prev is not None and prev != 0:
             change_24h = (price - prev) / prev * 100.0
 
+        ident = f'{base}/{quote}'
         return common_snapshot(
-            identifier=     f'{base}/{quote}',
+            identifier=     ident,
             kind=           'forex',
-            symbol_display= f'{base}/{quote}',
+            symbol_display= ident,
             price_usd=      price,
             change_1h_pct=  None,
             change_24h_pct= change_24h,
@@ -139,6 +150,7 @@ class CommoditiesAdapter(AssetAdapter):
             raw=            {'name': name, 'base': base, 'quote': quote,
                             'yahoo_symbol': yahoo_symbol, 'previous_close': prev},
             price_display_symbol='$',
+            display_name=   build_display_name(ident),   # 'Gold (XAU/USD)'
         )
 
     async def search(self, query: str, limit: int = 10) -> list[dict]:

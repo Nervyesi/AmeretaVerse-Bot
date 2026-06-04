@@ -36,11 +36,22 @@ _LEADERBOARD_SIZE = max(10, int(os.getenv('RADAR_LEADERBOARD_SIZE', '100') or 10
 def _watchlist_union(kind: str) -> set[str]:
     """All identifiers requested by any guild for this kind. The watchlist
     table is the only thing the fetcher consults — guilds opt INTO data
-    pull just by having a row."""
+    pull just by having a row.
+
+    Crypto/NFT identifiers are canonically lowercase (CoinGecko ids, OpenSea
+    'chain:slug'). Meme/forex are NOT lowercased: meme addresses include
+    case-significant Solana base58 and checksummed EVM hex, and the adapter
+    caches under the exact identifier it was given — lowercasing here would put
+    the snapshot under a key the alert/digest readers never look up (the
+    'snapshot=MISSING' bug)."""
     rows = list_all_radar_watchlists(kind)
-    return {(r.get('asset_identifier') or '').strip().lower()
-            for r in rows
-            if (r.get('asset_identifier') or '').strip()}
+    lower = kind in ('crypto', 'nft')
+    out: set[str] = set()
+    for r in rows:
+        ident = (r.get('asset_identifier') or '').strip()
+        if ident:
+            out.add(ident.lower() if lower else ident)
+    return out
 
 
 async def fetch_once() -> dict:

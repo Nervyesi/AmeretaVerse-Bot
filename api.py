@@ -4113,10 +4113,14 @@ async def radar_watchlist_list(
         kind_v = (r.get('asset_kind') or '').lower()
         ident  = (r.get('asset_identifier') or '').lower()
         snap   = None
-        # Crypto and NFT cache keys are lowercased identifiers; hydrate both so
-        # their live-preview cards show floor/price + change.
-        if _RADAR_CACHE is not None and kind_v in ('crypto', 'nft'):
-            snap = _RADAR_CACHE.get_snapshot(kind_v, ident)
+        # Crypto/NFT cache keys are lowercased identifiers; forex (incl.
+        # commodities) keys are the raw 'BASE/QUOTE'. Hydrate all so their
+        # live-preview cards show price + change.
+        if _RADAR_CACHE is not None:
+            if kind_v in ('crypto', 'nft'):
+                snap = _RADAR_CACHE.get_snapshot(kind_v, ident)
+            elif kind_v == 'forex':
+                snap = _RADAR_CACHE.get_snapshot('forex', r.get('asset_identifier'))
         out.append({
             'id':               int(r['id']),
             'asset_kind':       kind_v,
@@ -4285,7 +4289,8 @@ async def radar_watchlist_add(
                 detail='Commodity price source unavailable. Try again shortly.')
         _RADAR_CACHE.put('forex', ident, snap)
         if display_name == raw_ident or display_name == ident:
-            display_name = (snap.get('raw', {}).get('name') or ident)
+            display_name = (snap.get('display_name')
+                            or snap.get('raw', {}).get('name') or ident)
 
     elif kind == 'forex':
         from services.radar.adapters.frankfurter import split_pair

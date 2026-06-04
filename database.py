@@ -546,6 +546,12 @@ def init_db():
             # added via the dashboard are stamped 'opensea'. Other kinds stay
             # NULL. Idempotent.
             "ALTER TABLE radar_watchlist ADD COLUMN platform TEXT",
+            # Radar alert dedup (24h window + doubling rule): magnitude is the
+            # absolute change/volume-multiple the alert fired on; direction is
+            # 'up'/'down'. The existing idx_radar_alerts_cooldown index already
+            # covers (guild_id, asset_identifier, alert_type, sent_at).
+            "ALTER TABLE radar_alerts_log ADD COLUMN magnitude REAL",
+            "ALTER TABLE radar_alerts_log ADD COLUMN direction TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -2163,19 +2169,45 @@ def list_guilds_with_radar() -> list:
 def record_radar_alert(
     guild_id, asset_kind: str, asset_identifier: str,
     alert_type: str, payload: dict | None = None,
+    *, magnitude: float | None = None, direction: str | None = None,
 ) -> int:
     """Append to radar_alerts_log AFTER a successful Discord send. Returns
-    the new row id. payload is JSON-encoded for audit + cooldown lookup."""
+    the new row id. payload is JSON-encoded for audit; magnitude (absolute)
+    and direction feed the 24h dedup + doubling rule."""
     import json as _json
     payload_str = _json.dumps(payload or {}, default=str)
+    mag = None if magnitude is None else abs(float(magnitude))
     with get_connection() as conn:
         cur = conn.execute(
             """INSERT INTO radar_alerts_log
-                 (guild_id, asset_kind, asset_identifier, alert_type, payload_json)
-               VALUES (?,?,?,?,?)""",
-            (int(guild_id), asset_kind, asset_identifier, alert_type, payload_str),
+                 (guild_id, asset_kind, asset_identifier, alert_type, payload_json,
+                  magnitude, direction)
+               VALUES (?,?,?,?,?,?,?)""",
+            (int(guild_id), asset_kind, asset_identifier, alert_type, payload_str,
+             mag, direction),
         )
         return cur.lastrowid
+
+
+def recent_alert_magnitude(
+    guild_id, asset_identifier: str, alert_type: str, within_hours: int = 24,
+) -> float | None:
+    """Magnitude (absolute) of the most recent alert of this kind for this
+    (guild, asset) within the rolling window, or None when there is none.
+    Drives the dedup doubling rule in services/radar/alerts.py."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT magnitude FROM radar_alerts_log
+                WHERE guild_id=? AND asset_identifier=? AND alert_type=?
+                  AND sent_at > datetime('now', ?)
+                ORDER BY sent_at DESC, id DESC LIMIT 1""",
+            (int(guild_id), asset_identifier, alert_type,
+             f'-{int(within_hours)} hours'),
+        ).fetchone()
+    if not row:
+        return None
+    m = row['magnitude']
+    return None if m is None else abs(float(m))
 
 
 def last_radar_alert_at(

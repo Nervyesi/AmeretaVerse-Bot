@@ -24,6 +24,7 @@ def common_snapshot(
     page_url:          str | None   = None,
     raw:               dict | None  = None,
     price_display_symbol: str = '$',
+    display_name:      str | None   = None,
 ) -> dict:
     """Constructor for the normalized snapshot. Adapter modules call this
     so we never accidentally drift on field names.
@@ -44,6 +45,9 @@ def common_snapshot(
         'page_url':       page_url,
         'raw':            raw or {},
         'price_display_symbol': str(price_display_symbol or '$'),
+        # Optional friendly label (e.g. 'Gold (XAU/USD)'); None for assets that
+        # just use symbol_display.
+        'display_name':   display_name,
     }
 
 
