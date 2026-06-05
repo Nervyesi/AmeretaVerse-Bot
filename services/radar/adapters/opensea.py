@@ -292,8 +292,9 @@ class OpenSeaAdapter(AssetAdapter):
         stats = await self._get(f'/collections/{slug}/stats')
         if stats is None:
             return None
-        prev_v24, prev_v7 = _prev_volumes(chain, slug)
-        return _build_snapshot(chain, slug, meta or {}, stats, prev_v24, prev_v7)
+        prev_floor, prev_v24, prev_v7 = _prev_metrics(chain, slug)
+        return _build_snapshot(chain, slug, meta or {}, stats,
+                               prev_floor, prev_v24, prev_v7)
 
     async def _resolve_collection(
         self, chain: str, query: str,
@@ -371,9 +372,9 @@ class OpenSeaAdapter(AssetAdapter):
             stats = await self._get(f'/collections/{slug}/stats')
             if stats is None:
                 continue
-            prev_v24, prev_v7 = _prev_volumes((chain or '').lower(), slug)
+            prev_floor, prev_v24, prev_v7 = _prev_metrics((chain or '').lower(), slug)
             snap = _build_snapshot((chain or '').lower(), slug, c, stats,
-                                   prev_v24, prev_v7)
+                                   prev_floor, prev_v24, prev_v7)
             if snap:
                 out.append(snap)
             if len(out) >= cap:
@@ -381,20 +382,22 @@ class OpenSeaAdapter(AssetAdapter):
         return out
 
 
-def _prev_volumes(chain: str, slug: str):
+def _prev_metrics(chain: str, slug: str):
     """Look up the previously cached snapshot for this collection and return
-    (prev_one_day_volume, prev_seven_day_volume) for the volume-change diff.
-    get_snapshot returns the last stored value regardless of TTL, so a 10-min
-    discovery cadence still finds the prior tick's sample. Returns (None, None)
-    when there's no prior snapshot."""
+    (prev_floor_price, prev_one_day_volume, prev_seven_day_volume) for the
+    change diffs. get_snapshot returns the last stored value regardless of TTL,
+    so a 10-min discovery cadence still finds the prior tick's sample. Returns
+    (None, None, None) when there's no prior snapshot."""
     try:
         from ..cache import CACHE
         prev = CACHE.get_snapshot('nft', f'{(chain or "").lower()}:{(slug or "").lower()}')
     except Exception:  # noqa: BLE001
         prev = None
     if not prev:
-        return None, None
-    return prev.get('volume_24h_usd'), (prev.get('raw') or {}).get('volume_7d')
+        return None, None, None
+    return (prev.get('price_usd'),
+            prev.get('volume_24h_usd'),
+            (prev.get('raw') or {}).get('volume_7d'))
 
 
 def _interval(stats: dict, name: str) -> dict:
@@ -406,15 +409,18 @@ def _interval(stats: dict, name: str) -> dict:
 
 def _build_snapshot(
     chain: str, slug: str, meta: dict, stats: dict,
-    prev_vol_24h=None, prev_vol_7d=None,
+    prev_floor=None, prev_vol_24h=None, prev_vol_7d=None,
 ) -> Optional[dict]:
     """Normalize an OpenSea collection + stats pair into a CommonAssetSnapshot.
     Defensive against missing/renamed fields — never raises.
 
-    OpenSea exposes no volume-change field, so the 24h/7d change percents are
-    computed by diffing the current rolling volumes against `prev_vol_24h` /
-    `prev_vol_7d` (the previously cached snapshot's volumes). They are None on
-    the first observation."""
+    OpenSea exposes no change fields, so we compute them by diffing against the
+    previously cached snapshot:
+      • change_24h_pct        = FLOOR PRICE change % (drives the pumping/dumping
+                                'movement' label) — None on the first observation
+      • raw.volume_change_24h_pct = 24h VOLUME change % (drives volume-surge), a
+                                SEPARATE metric so a volume spike never gets
+                                mislabeled as a price pump."""
     chain = (chain or DEFAULT_CHAIN).lower()
     slug = (slug or '').lower()
     if not slug:
@@ -429,18 +435,27 @@ def _build_snapshot(
     vol_24h = _flt(one_day.get('volume'))
     vol_7d = _flt(seven_day.get('volume'))
     sales_24h = _int(one_day.get('sales'))
+    floor_change_24h = _pct_change(prev_floor, floor)
     vol_change_24h = _pct_change(prev_vol_24h, vol_24h)
     vol_change_7d = _pct_change(prev_vol_7d, vol_7d)
 
     name = (meta.get('name') or '').strip() or slug
     image = meta.get('image_url') or meta.get('image') or None
 
+    # Audit line: floor change vs volume change, so logs prove a 'pumping' label
+    # only follows a real floor move (not a volume surge).
+    _sym = chain_symbol(chain, floor_symbol)
+    print(f'[radar/opensea] {slug}: floor={floor}{_sym} '
+          f'change_24h={"n/a" if floor_change_24h is None else f"{floor_change_24h:+.2f}%"} '
+          f'volume_24h={vol_24h}{_sym} '
+          f'vol_change_24h={"n/a" if vol_change_24h is None else f"{vol_change_24h:+.2f}%"}')
+
     return common_snapshot(
         identifier=     f'{chain}:{slug}',
         kind=           'nft',
         symbol_display= slug.upper(),
         price_usd=      floor if floor is not None else 0.0,
-        change_24h_pct= vol_change_24h,   # 24h volume change % (NFT movement signal)
+        change_24h_pct= floor_change_24h,  # 24h FLOOR PRICE change % (movement signal)
         volume_24h_usd= vol_24h,          # native-token rolling 24h volume (not USD)
         market_cap_usd= None,             # OpenSea /stats has no market cap
         image_url=      image,
@@ -455,5 +470,5 @@ def _build_snapshot(
             'volume_7d':             vol_7d,     # native 7d volume, for next diff
             'floor_symbol':          floor_symbol,
         },
-        price_display_symbol=chain_symbol(chain, floor_symbol),
+        price_display_symbol=_sym,
     )

@@ -88,9 +88,14 @@ def _format_pct(v) -> str:
     if v is None:
         return '—'
     try:
-        return f'{float(v):+.2f}%'
+        f = float(v)
     except (TypeError, ValueError):
         return '—'
+    # A change of exactly 0.0 is a cold-cache non-signal (no baseline yet);
+    # render it as a dash rather than a misleading +0.00%.
+    if f == 0.0:
+        return '—'
+    return f'{f:+.2f}%'
 
 
 def _format_snap_price(snap: dict) -> str:

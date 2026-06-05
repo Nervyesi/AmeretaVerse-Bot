@@ -55,8 +55,9 @@ _HISTORY_LOOKBACK_S  = 3600.0    # ~1h ago for the in-memory change_1h fallback
 #   • a later alert ONLY fires if its magnitude >= 2x the last fired magnitude
 #   • after 24h from the most recent fire the chain naturally resets (the
 #     lookup is windowed)
-# alert_kind is direction-independent ('movement_24h', not '..._up'), so a pump
-# then a dump share one doubling chain; each kind (1h/24h/7d/volume) is its own.
+# alert_kind is direction-independent ('movement', not '..._up'), so a pump then
+# a dump share one doubling chain. The kinds are: 'movement' (all of 1h/24h/7d
+# price change collapsed into one alert) and 'volume_surge_24h' (separate).
 
 def should_fire_alert(
     guild_id: int, identifier: str, alert_kind: str, magnitude: float,
@@ -162,35 +163,30 @@ def _volume_str(snap: dict) -> Optional[str]:
 
 
 def _alert_movement_embed(
-    guild_id: int, snap: dict, change_pct: float,
-    *, label: str = '1h',
+    guild_id: int, snap: dict,
+    *, primary_tf: str, direction: str,
+    ch1h: Optional[float] = None, ch24: Optional[float] = None,
+    ch7d: Optional[float] = None,
 ) -> discord.Embed:
-    """Build a movement-alert embed. `label` names the timeframe ('1h',
-    '24h', '7d') so the title and primary line read accurately."""
-    is_up = change_pct >= 0
-    arrow = '🚀' if is_up else '📉'
-    direction = 'pumping' if is_up else 'dumping'
+    """Unified movement embed: ONE alert covering all available timeframes.
+    `primary_tf` is the highest-priority triggering timeframe (1h > 24h > 7d)
+    and sets the title; the body lists every timeframe with a real change. A
+    None or exactly-0.0 change is omitted (cold cache, not a signal) — never
+    rendered as +0.00%."""
+    arrow = '🚀' if direction == 'up' else '📉'
+    verb = 'pumping' if direction == 'up' else 'dumping'
     sym = snap.get('display_name') or snap.get('symbol_display') or snap.get('identifier')
-    title = f'{arrow} {sym} {direction} ({label})'
+    title = f'{arrow} {sym} {verb} ({primary_tf})'
 
-    price = snap.get('price_usd')
-    vol_24h = snap.get('volume_24h_usd')
     name = snap.get('raw', {}).get('name') or snap.get('symbol_display')
 
     desc_lines = []
-    if price is not None:
+    if snap.get('price_usd') is not None:
         desc_lines.append(f'**Price:** {_price_str(snap)}')
-    desc_lines.append(f'**{label} change:** {change_pct:+.2f}%')
-    # Also surface the OTHER timeframes when present for context.
-    if label != '1h':
-        ch1h_v = snap.get('change_1h_pct')
-        if ch1h_v is not None:
-            desc_lines.append(f'**1h change:** {ch1h_v:+.2f}%')
-    if label != '24h':
-        ch24v = snap.get('change_24h_pct')
-        if ch24v is not None:
-            desc_lines.append(f'**24h change:** {ch24v:+.2f}%')
-    if vol_24h:
+    for _lbl, _ch in (('1h', ch1h), ('24h', ch24), ('7d', ch7d)):
+        if _ch is not None and _ch != 0.0:
+            desc_lines.append(f'**{_lbl} change:** {_ch:+.2f}%')
+    if snap.get('volume_24h_usd'):
         desc_lines.append(f'**24h volume:** {_volume_str(snap)}')
     # No upstream-source attribution link — brand footer is the only credit.
 
@@ -214,7 +210,7 @@ def _alert_movement_embed(
 
 def _alert_volume_embed(guild_id: int, snap: dict) -> discord.Embed:
     _label = snap.get('display_name') or snap.get('symbol_display') or snap.get('identifier')
-    title = f'📊 {_label} volume spike'
+    title = f'📊 {_label} volume surge (24h)'
     price = snap.get('price_usd')
     vol = snap.get('volume_24h_usd')
 
@@ -224,7 +220,7 @@ def _alert_volume_embed(guild_id: int, snap: dict) -> discord.Embed:
     if vol:
         desc.append(f'**24h volume:** {_volume_str(snap)}')
     ch24 = snap.get('change_24h_pct')
-    if ch24 is not None:
+    if ch24 is not None and ch24 != 0.0:
         desc.append(f'**24h change:** {ch24:+.2f}%')
     # No upstream-source attribution link.
 
@@ -384,53 +380,50 @@ async def dispatch_alerts(bot) -> dict:
                         f'en_1h={en_1h} en_24h={en_24h} en_vol={en_vol}'
                     )
 
-                # Each timeframe is one direction-independent alert_kind under
-                # the 24h doubling dedup. abs(change) >= threshold gates entry;
-                # should_fire_alert gates re-fires.
-                async def _fire_movement(change: float, label: str, kind_name: str,
-                                         payload_key: str) -> bool:
-                    if not should_fire_alert(gid, ident, kind_name, abs(change)):
-                        return False
-                    embed = _alert_movement_embed(gid, snap, change, label=label)
-                    if not await _send_alert(bot, gid, int(ch_id), embed,
+                # ── Unified price MOVEMENT alert ────────────────────────
+                # 1h/24h/7d are collapsed into ONE 'movement' alert_kind per
+                # 24h (doubling dedup) so a coin can't spam multiple timeframe
+                # alerts in a day. A None or exactly-0.0 change is a cold-cache
+                # non-signal: it never triggers and never renders as +0.00%.
+                # volume_surge_24h stays a SEPARATE alert below.
+                def _num(v):
+                    try:
+                        return float(v) if v is not None else None
+                    except (TypeError, ValueError):
+                        return None
+
+                ch1h = _num(_change_1h_pct(snap, topic, ident))
+                ch24 = _num(snap.get('change_24h_pct'))
+                ch7d = _num((snap.get('raw') or {}).get('change_7d_pct')) if topic == 'crypto' else None
+
+                # Triggering timeframes in priority order (1h > 24h > 7d).
+                triggered = []
+                for _lbl, _ch, _thr, _en in (
+                    ('1h',  ch1h, thr_1h,  en_1h),
+                    ('24h', ch24, thr_24h, en_24h),
+                    ('7d',  ch7d, thr_7d,  en_7d and topic == 'crypto'),
+                ):
+                    if _en and _thr > 0 and _ch is not None and _ch != 0.0 and abs(_ch) >= _thr:
+                        triggered.append((_lbl, _ch))
+
+                if triggered:
+                    primary_tf, primary_change = triggered[0]
+                    max_mag = max(abs(c) for _, c in triggered)
+                    direction = 'up' if primary_change > 0 else 'down'
+                    if should_fire_alert(gid, ident, 'movement', max_mag):
+                        embed = _alert_movement_embed(
+                            gid, snap, primary_tf=primary_tf, direction=direction,
+                            ch1h=ch1h, ch24=ch24, ch7d=ch7d,
+                        )
+                        if await _send_alert(bot, gid, int(ch_id), embed,
                                              mention_role_ids=alert_mentions):
-                        return False
-                    record_radar_alert(
-                        gid, topic, ident, kind_name,
-                        {payload_key: change, 'price_usd': snap.get('price_usd'),
-                         'volume_24h_usd': snap.get('volume_24h_usd')},
-                        magnitude=abs(change),
-                        direction='up' if change > 0 else 'down',
-                    )
-                    return True
-
-                # ── 1h timeframe ────────────────────────────────────────
-                if en_1h and thr_1h > 0:
-                    ch1h = _change_1h_pct(snap, topic, ident)
-                    if ch1h is not None and abs(ch1h) >= thr_1h:
-                        if await _fire_movement(ch1h, '1h', 'movement_1h', 'change_1h_pct'):
-                            sent += 1
-
-                # ── 24h timeframe ───────────────────────────────────────
-                if en_24h and thr_24h > 0:
-                    ch24 = snap.get('change_24h_pct')
-                    try:
-                        ch24 = float(ch24) if ch24 is not None else None
-                    except (TypeError, ValueError):
-                        ch24 = None
-                    if ch24 is not None and abs(ch24) >= thr_24h:
-                        if await _fire_movement(ch24, '24h', 'movement_24h', 'change_24h_pct'):
-                            sent += 1
-
-                # ── 7d timeframe (crypto only — others have no feed) ───
-                if en_7d and thr_7d > 0 and topic == 'crypto':
-                    ch7d = (snap.get('raw') or {}).get('change_7d_pct')
-                    try:
-                        ch7d = float(ch7d) if ch7d is not None else None
-                    except (TypeError, ValueError):
-                        ch7d = None
-                    if ch7d is not None and abs(ch7d) >= thr_7d:
-                        if await _fire_movement(ch7d, '7d', 'movement_7d', 'change_7d_pct'):
+                            record_radar_alert(
+                                gid, topic, ident, 'movement',
+                                {'change_1h_pct': ch1h, 'change_24h_pct': ch24,
+                                 'change_7d_pct': ch7d, 'price_usd': snap.get('price_usd'),
+                                 'volume_24h_usd': snap.get('volume_24h_usd')},
+                                magnitude=max_mag, direction=direction,
+                            )
                             sent += 1
 
                 # ── Volume surge — forex skipped, others use multiplier ──
