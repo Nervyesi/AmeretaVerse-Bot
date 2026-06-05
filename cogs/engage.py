@@ -39,6 +39,7 @@ from database import (
     get_user_daily_engage_submissions,
     get_engage_action,
     upsert_engage_action,
+    mark_engage_deprioritized,
     add_engage_verification_log,
     upsert_engage_user_points,
     get_engage_user_points,
@@ -557,6 +558,24 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
             )
 
         print(f'[engage] sub={sub_id} earned_total={earned}')
+
+        # User engaged this submission but the verification awarded zero points.
+        # Deprioritize it for them: it stays selectable via /engage but sinks to
+        # the bottom of their queue so they get another shot only after they have
+        # exhausted everything they have not yet tried. Idempotent (no compounding),
+        # and only ever fires on zero-point engagements — never on >0 points
+        # (closed) or skips (not recorded at all).
+        if earned == 0:
+            mark_engage_deprioritized(str(guild_id), str(user_id), sub_id)
+            log_event(
+                guild_id, 'bot_activity', 'engage_deprioritize_zero_points',
+                f'Deprioritized submission {sub_id} for zero-point engagement',
+                actor_user_id=user_id,
+                actor_username=x_username or None,
+                module='engage', severity='info',
+                details={'pool_id': pool_id, 'submission_id': sub_id},
+            )
+
         total_earned += earned
         processed.append({'sub': sub, 'claims': claims, 'earned': earned, 'results': results})
 

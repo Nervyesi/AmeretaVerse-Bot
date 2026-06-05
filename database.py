@@ -1007,6 +1007,24 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_engage_log ON engage_verification_log(submission_id, engager_user_id);
 
+            -- Engage deprioritization: a (user, submission) pair lands here when
+            -- the user engaged a submission but the verification awarded zero
+            -- points. The submission stays selectable via /engage but is sorted
+            -- to the bottom of the queue so the user only sees it again after
+            -- exhausting everything they have not yet tried. Per (user, submission),
+            -- persistent, no compounding. Cleared via ON DELETE CASCADE when the
+            -- submission is closed/removed.
+            CREATE TABLE IF NOT EXISTS engage_deprioritized (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                submission_id INTEGER NOT NULL,
+                deprioritized_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (guild_id, user_id, submission_id),
+                FOREIGN KEY (submission_id) REFERENCES engage_submissions(submission_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_engage_deprioritized_user
+                ON engage_deprioritized (guild_id, user_id);
+
             -- Embed Message module: dashboard-composed branded embeds posted
             -- to any channel. Per-guild isolated; channel_id/message_id are
             -- NULL until the embed has been sent. Draft → Posted lifecycle.
@@ -3088,39 +3106,91 @@ def ensure_default_pool(guild_id) -> dict:
 # Alias names used in cogs/engage.py (spec-required names)
 
 def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_id=None) -> list:
-    """Random sample of active subs, excluding user's own and any they already claimed tasks on."""
+    """Random sample of active subs for /engage.
+
+    Excludes the user's own submissions and any submission they already engaged
+    AND earned points on (closed for them). A submission the user engaged but
+    earned zero points on is NOT excluded: it stays in the pool but is sorted to
+    the bottom (deprioritized) so they only see it again after everything else.
+    Skipped submissions are never recorded, so skip behavior is unchanged.
+    """
     params = [pool_id]
+    select_deprioritized = '0 AS is_deprioritized'
+    join_deprioritized = ''
     already_engaged_clause = ''
+    order_clause = 'ORDER BY RANDOM()'
     if exclude_user_id is not None:
         uid = str(exclude_user_id)
+        select_deprioritized = (
+            'CASE WHEN d.submission_id IS NOT NULL THEN 1 ELSE 0 END AS is_deprioritized'
+        )
+        join_deprioritized = """
+            LEFT JOIN engage_deprioritized d
+                ON d.submission_id = s.submission_id
+                AND d.guild_id = s.guild_id
+                AND d.user_id = ?
+        """
+        params.append(uid)  # d.user_id
         already_engaged_clause = """
             AND s.submitter_user_id != ?
             AND NOT EXISTS (
                 SELECT 1 FROM engage_actions a
                 WHERE a.submission_id = s.submission_id
                   AND a.engager_user_id = ?
-                  AND (a.like_claimed = 1 OR a.comment_claimed = 1 OR a.retweet_claimed = 1)
+                  AND a.points_earned > 0
             )
         """
-        params.extend([uid, uid])
+        params.extend([uid, uid])  # submitter check, engaged-with-points check
+        # Non-deprioritized first, deprioritized last; preserve random secondary order.
+        order_clause = 'ORDER BY is_deprioritized ASC, RANDOM()'
     params.append(limit)
     with get_connection() as conn:
         rows = conn.execute(
-            f"""SELECT s.* FROM engage_submissions s
+            f"""SELECT s.*, {select_deprioritized}
+                FROM engage_submissions s
+                {join_deprioritized}
                 WHERE s.pool_id = ?
                   AND s.status = 'active'
                   AND (s.expires_at IS NULL OR s.expires_at > datetime('now'))
                   {already_engaged_clause}
-                ORDER BY RANDOM()
+                {order_clause}
                 LIMIT ?""",
             params,
         ).fetchall()
     result = [dict(r) for r in rows]
     print(
         f'[engage] list_active: pool={pool_id} exclude_user={exclude_user_id!r} '
-        f'returned {len(result)} submissions, ids={[r["submission_id"] for r in result]}'
+        f'returned {len(result)} submissions, ids={[r["submission_id"] for r in result]}, '
+        f'deprioritized_ids={[r["submission_id"] for r in result if r.get("is_deprioritized")]}'
     )
     return result
+
+
+def mark_engage_deprioritized(guild_id, user_id, submission_id: int) -> None:
+    """Record that a user engaged a submission but earned zero points, so the
+    submission drops to the bottom of their /engage queue. Idempotent: a repeat
+    zero-point engagement is a no-op (no compounding)."""
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO engage_deprioritized
+                   (guild_id, user_id, submission_id)
+               VALUES (?, ?, ?)""",
+            (str(guild_id), str(user_id), submission_id),
+        )
+
+
+def count_engage_deprioritized(guild_id) -> dict:
+    """Return {submission_id: count} of how many users each submission is
+    deprioritized for, scoped to a guild."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT submission_id, COUNT(*) AS deprioritized_count
+               FROM engage_deprioritized
+               WHERE guild_id = ?
+               GROUP BY submission_id""",
+            (str(guild_id),),
+        ).fetchall()
+    return {r['submission_id']: r['deprioritized_count'] for r in rows}
 
 
 def expire_old_engage_submissions() -> int:
