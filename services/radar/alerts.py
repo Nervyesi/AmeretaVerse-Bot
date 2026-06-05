@@ -27,6 +27,7 @@ from database import (
     list_guilds_with_radar,
     list_radar_watchlist,
     recent_alert_magnitude,
+    recent_alert_exists,
     record_radar_alert,
 )
 from cogs._branding import build_branded_embed
@@ -63,9 +64,17 @@ def should_fire_alert(
     guild_id: int, identifier: str, alert_kind: str, magnitude: float,
 ) -> bool:
     last = recent_alert_magnitude(guild_id, identifier, alert_kind, within_hours=24)
-    if last is None:
-        return True
-    return abs(float(magnitude)) >= last * 2.0
+    if last is not None:
+        # A prior alert of this kind exists within 24h with a known magnitude:
+        # only re-fire if this one is at least double it.
+        return abs(float(magnitude)) >= last * 2.0
+    # No known magnitude. 'last is None' is ambiguous: either no recent alert at
+    # all (fire freely) OR a recent alert whose magnitude wasn't recorded (legacy
+    # row / partial migration). In the latter case we already alerted this window,
+    # so suppress — never silently re-fire just because the prior magnitude is NULL.
+    if recent_alert_exists(guild_id, identifier, alert_kind, within_hours=24):
+        return False
+    return True
 
 
 # ── Change-1h fallback ──────────────────────────────────────────────────────
@@ -410,7 +419,12 @@ async def dispatch_alerts(bot) -> dict:
                     primary_tf, primary_change = triggered[0]
                     max_mag = max(abs(c) for _, c in triggered)
                     direction = 'up' if primary_change > 0 else 'down'
-                    if should_fire_alert(gid, ident, 'movement', max_mag):
+                    fire = should_fire_alert(gid, ident, 'movement', max_mag)
+                    print(
+                        f'[radar/alerts] dedup_check g={gid} asset={ident} '
+                        f'kind=movement mag={max_mag:.2f} dir={direction} fire={fire}'
+                    )
+                    if fire:
                         embed = _alert_movement_embed(
                             gid, snap, primary_tf=primary_tf, direction=direction,
                             ch1h=ch1h, ch24=ch24, ch7d=ch7d,
@@ -431,7 +445,12 @@ async def dispatch_alerts(bot) -> dict:
                     continue
                 mult = _volume_multiple(snap, topic, ident)
                 if mult is not None and vol_mul > 1.0 and mult >= vol_mul:
-                    if should_fire_alert(gid, ident, 'volume_surge_24h', mult):
+                    fire = should_fire_alert(gid, ident, 'volume_surge_24h', mult)
+                    print(
+                        f'[radar/alerts] dedup_check g={gid} asset={ident} '
+                        f'kind=volume_surge_24h mag={mult:.2f} dir=up fire={fire}'
+                    )
+                    if fire:
                         embed = _alert_volume_embed(gid, snap)
                         if await _send_alert(bot, gid, int(ch_id), embed,
                                              mention_role_ids=alert_mentions):

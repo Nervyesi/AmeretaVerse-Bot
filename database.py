@@ -1163,7 +1163,15 @@ def init_db():
                 asset_identifier TEXT    NOT NULL,
                 alert_type       TEXT    NOT NULL,
                 payload_json     TEXT    NOT NULL DEFAULT '{}',
-                sent_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                sent_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- magnitude (absolute change / volume multiple the alert fired on)
+                -- and direction feed the 24h dedup + doubling rule. Declared here
+                -- so a FRESH database has them: the ALTER TABLE fallbacks below run
+                -- earlier in init_db, BEFORE this CREATE, so on a brand-new db they
+                -- hit 'no such table' and are skipped. They remain only to add the
+                -- columns to databases created before the dedup feature existed.
+                magnitude        REAL,
+                direction        TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_radar_alerts_cooldown
                 ON radar_alerts_log(guild_id, asset_identifier, alert_type, sent_at);
@@ -2226,6 +2234,25 @@ def recent_alert_magnitude(
         return None
     m = row['magnitude']
     return None if m is None else abs(float(m))
+
+
+def recent_alert_exists(
+    guild_id, asset_identifier: str, alert_type: str, within_hours: int = 24,
+) -> bool:
+    """True when ANY alert of this kind fired for this (guild, asset) inside the
+    rolling window, regardless of whether its magnitude is recorded. Lets the
+    dedup gate distinguish 'no recent alert' (fire) from 'recent alert with an
+    unknown/NULL magnitude' (suppress) so a legacy row never re-fires."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM radar_alerts_log
+                WHERE guild_id=? AND asset_identifier=? AND alert_type=?
+                  AND sent_at > datetime('now', ?)
+                LIMIT 1""",
+            (int(guild_id), asset_identifier, alert_type,
+             f'-{int(within_hours)} hours'),
+        ).fetchone()
+    return row is not None
 
 
 def last_radar_alert_at(

@@ -273,8 +273,11 @@ class Radar(commands.Cog):
         for s in top:
             sym = (s.get('symbol_display') or s.get('identifier') or '').upper()
             price = _fmt_price(s.get('price_usd'))
-            ch24 = s.get('change_24h_pct') or 0
-            lines.append(f'`{sym:<6}` {price:<13} {ch24:+.2f}%')
+            # rows are pre-filtered to non-None change_24h_pct above; guard None
+            # explicitly anyway so missing history renders as a dash, never +0.00%.
+            _ch = s.get('change_24h_pct')
+            ch24 = f'{_ch:+.2f}%' if _ch is not None else '—'
+            lines.append(f'`{sym:<6}` {price:<13} {ch24}')
 
         gid = interaction.guild_id or 0
         e = build_branded_embed(
