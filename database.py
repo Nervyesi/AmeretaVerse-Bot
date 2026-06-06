@@ -3187,9 +3187,6 @@ def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_i
                 {order_clause}
                 LIMIT ?"""
     params = [*join_params, pool_id, *where_params, limit]
-    # Temporary diagnostics (one deploy cycle): prove the EXACT SQL + binds in prod.
-    print(f'[engage] list_active SQL: {" ".join(query.split())}')
-    print(f'[engage] list_active params: {params}')
     with get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
     result = [dict(r) for r in rows]
