@@ -125,13 +125,41 @@ _USERSIDE_CONFIDENT_FALSE_MIN = max(
     1, int(os.getenv('TWITTER_USERSIDE_CONFIDENT_FALSE_MIN', '20') or 20)
 )
 
+# ── Twitter verify resilience toggles (failing-verify fix) ───────────────────
+# TwitterAPI.io's /twitter/user/last_tweets and /twitter/tweet/replies endpoints
+# have a documented quirk: a single cursor can return an empty page
+# ({tweets: []}) with has_next_page=False even though a LATER cursor for the same
+# user still yields the reply we're looking for. When resilient mode is on we
+# treat has_next_page=False as advisory and keep paging while the cursor keeps
+# advancing, stopping only after TWITTER_EMPTY_PAGE_TOLERANCE consecutive empty
+# pages, a dead/stalled cursor, the page cap, or the time budget. Set
+# TWITTER_PAGINATION_RESILIENT=false to revert to the trust-the-flag behavior.
+TWITTER_PAGINATION_RESILIENT = (
+    (os.getenv('TWITTER_PAGINATION_RESILIENT', 'true') or 'true').strip().lower() == 'true'
+)
+# Per-user probe cache: a winning replies-endpoint variant is a property of the
+# API (shared globally once found), but an 'unavailable' verdict only means THIS
+# probe user's timeline happened to have no replies — caching it process-wide
+# disabled the user-side check for every later user (cache poisoning). When on,
+# 'unavailable' is tracked per username so one empty timeline can't poison the
+# rest. Set TWITTER_PER_USER_PROBE_CACHE=false to revert to the old shared state.
+TWITTER_PER_USER_PROBE_CACHE = (
+    (os.getenv('TWITTER_PER_USER_PROBE_CACHE', 'true') or 'true').strip().lower() == 'true'
+)
+TWITTER_EMPTY_PAGE_TOLERANCE = max(
+    1, int(os.getenv('TWITTER_EMPTY_PAGE_TOLERANCE', '3') or 3)
+)
+
 print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'retweeters cap={_RETWEETERS_MAX_PAGES} '
       f'user_tweets cap={_USER_TWEETS_MAX_PAGES} '
       f'rt_userside cap={_USER_TWEETS_RETWEET_MAX_PAGES} '
       f'cache_ttl={_USER_TWEETS_CACHE_TTL}s '
       f'time budget={_PAGINATION_BUDGET_S}s '
-      f'tweetside_confident_min={_TWEETSIDE_CONFIDENT_FALSE_MIN}')
+      f'tweetside_confident_min={_TWEETSIDE_CONFIDENT_FALSE_MIN} '
+      f'pagination_resilient={TWITTER_PAGINATION_RESILIENT} '
+      f'per_user_probe_cache={TWITTER_PER_USER_PROBE_CACHE} '
+      f'empty_page_tol={TWITTER_EMPTY_PAGE_TOLERANCE}')
 
 
 # ── User-tweets cache (single fetch reused across one finalize batch) ────────
@@ -570,6 +598,13 @@ _REPLIES_ENDPOINT_CANDIDATES = (
 # once.
 _replies_endpoint_probe_result = None
 _replies_endpoint_probe_lock   = asyncio.Lock()
+# Per-user 'unavailable' verdicts (Fix 2: probe cache poisoning). A winning
+# endpoint variant stays in _replies_endpoint_probe_result (it's an API
+# property, legitimately shared once found). But an 'unavailable' verdict only
+# means THIS test user's timeline had no replies in any candidate — caching it
+# globally disabled user-side checks for every later user. Keyed by normalized
+# username; only consulted when TWITTER_PER_USER_PROBE_CACHE is on.
+_replies_probe_unavailable_by_user: dict = {}  # username -> True
 
 
 async def _probe_replies_endpoint(test_username: str) -> Optional[dict]:
@@ -579,12 +614,27 @@ async def _probe_replies_endpoint(test_username: str) -> Optional[dict]:
     global _replies_endpoint_probe_result
     async with _replies_endpoint_probe_lock:
         if isinstance(_replies_endpoint_probe_result, dict):
+            # A working endpoint variant is an API property — reuse it for every
+            # user, no re-probe spend, regardless of cache mode.
+            print(f'[twitter] probe_cache: target={test_username} '
+                  f'scope={"per_user" if TWITTER_PER_USER_PROBE_CACHE else "global"} '
+                  f'cached_winner={_replies_endpoint_probe_result["name"]}')
             return _replies_endpoint_probe_result
-        if _replies_endpoint_probe_result == 'unavailable':
-            return None
+        if TWITTER_PER_USER_PROBE_CACHE:
+            # Per-user: only skip the probe if THIS user was already seen empty.
+            # Other users (and the first with real replies) still probe and can
+            # promote a global winner that everyone then reuses.
+            if _replies_probe_unavailable_by_user.get(test_username):
+                print(f'[twitter] probe_cache: target={test_username} scope=per_user '
+                      f'cached_winner=none (this user previously unavailable)')
+                return None
+        else:
+            if _replies_endpoint_probe_result == 'unavailable':
+                return None
 
         print(f'[twitter] probe_replies: starting one-shot probe with @{test_username} '
-              f'({len(_REPLIES_ENDPOINT_CANDIDATES)} candidates)')
+              f'({len(_REPLIES_ENDPOINT_CANDIDATES)} candidates) '
+              f'per_user_cache={TWITTER_PER_USER_PROBE_CACHE}')
 
         for path, extra, name in _REPLIES_ENDPOINT_CANDIDATES:
             params = {'userName': test_username, **extra}
@@ -601,11 +651,24 @@ async def _probe_replies_endpoint(test_username: str) -> Optional[dict]:
                 _replies_endpoint_probe_result = winner
                 print(f'[twitter] probe_replies: WINNER={name} '
                       f'(this will be used for comment user-side from now on)')
+                print(f'[twitter] probe_cache: target={test_username} '
+                      f'scope={"per_user" if TWITTER_PER_USER_PROBE_CACHE else "global"} '
+                      f'cached_winner={name}')
                 return winner
 
-        _replies_endpoint_probe_result = 'unavailable'
-        print('[twitter] probe_replies: NO candidate returned replies — '
-              'comment verification will rely on tweet-side only')
+        if TWITTER_PER_USER_PROBE_CACHE:
+            # No candidate exposed replies for THIS user's timeline. Mark only
+            # this user unavailable — do NOT poison the cache for everyone else.
+            _replies_probe_unavailable_by_user[test_username] = True
+            print(f'[twitter] probe_replies: NO candidate returned replies for '
+                  f'@{test_username} — marking unavailable for THIS user only '
+                  f'(other users still probe)')
+            print(f'[twitter] probe_cache: target={test_username} scope=per_user '
+                  f'cached_winner=none')
+        else:
+            _replies_endpoint_probe_result = 'unavailable'
+            print('[twitter] probe_replies: NO candidate returned replies — '
+                  'comment verification will rely on tweet-side only')
         return None
 
 
@@ -647,6 +710,7 @@ async def _fetch_user_recent_tweets(
     deadline   = started_at + _PAGINATION_BUDGET_S
     pages = 0
     prev_empty = False   # tolerate one empty page when the cursor is advancing
+    consecutive_empty = 0  # resilient pagination: tolerate N consecutive empties
     break_reason = f'page_cap({max_pages})'
     replies_seen   = 0   # diagnostic: how many tweets in the timeline are replies
     retweets_seen  = 0   # diagnostic: how many are retweets
@@ -720,26 +784,56 @@ async def _fetch_user_recent_tweets(
             break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
             break
 
-        # Tolerate ONE empty page if the cursor is still advancing — the
-        # API occasionally returns a metadata-only first page. A second
-        # empty page in a row means we're really out of data.
+        # Track consecutive empty pages for resilient pagination. (The dead /
+        # stalled cursor cases are already handled above, so reaching here means
+        # the cursor is live and advancing.)
         if len(tweets) == 0:
-            if prev_empty:
-                break_reason = 'two_empty_pages_in_a_row'
-                break
-            prev_empty = True
-            print(f'[twitter] user_tweets p{page_idx} @{target}: '
-                  f'empty page but cursor advances — continuing')
+            consecutive_empty += 1
         else:
-            prev_empty = False
+            consecutive_empty = 0
 
-        # has_next_page=False with NO next cursor is handled above. If it's
-        # False but a cursor exists, the API is being inconsistent — keep
-        # paging and let the cursor / empty-page logic stop us.
-        if parsed_has_next is False and not tweets and prev_empty:
-            # The API really wants us to stop and there's nothing in hand.
-            break_reason = f'has_next_page=False(raw={raw_has_next!r})_after_empty'
-            break
+        if TWITTER_PAGINATION_RESILIENT:
+            # The API can return an empty page + has_next_page=False on one
+            # cursor while a LATER cursor still yields the tweet. Keep paging
+            # while the cursor advances; stop only after TWITTER_EMPTY_PAGE_
+            # TOLERANCE consecutive empties (cursor-dead/stalled handled above).
+            if len(tweets) == 0:
+                retrying = consecutive_empty < TWITTER_EMPTY_PAGE_TOLERANCE
+                print(
+                    f'[twitter] empty page detected p={page_idx} '
+                    f'cursor_advanced=True has_next_raw={raw_has_next!r} '
+                    f'retry={retrying} consecutive_empty={consecutive_empty}'
+                )
+            if consecutive_empty >= TWITTER_EMPTY_PAGE_TOLERANCE:
+                print(
+                    f'[twitter] pagination giving up after {consecutive_empty} '
+                    f'consecutive empty pages, total scanned={pages}, '
+                    f'total tweets={len(all_tweets)}'
+                )
+                break_reason = f'empty_page_tolerance({TWITTER_EMPTY_PAGE_TOLERANCE})'
+                break
+            # has_next=False with a live, advancing cursor is advisory — continue.
+        else:
+            # Original behavior: tolerate exactly ONE empty page if the cursor is
+            # still advancing — the API occasionally returns a metadata-only
+            # first page. A second empty page in a row means we're out of data.
+            if len(tweets) == 0:
+                if prev_empty:
+                    break_reason = 'two_empty_pages_in_a_row'
+                    break
+                prev_empty = True
+                print(f'[twitter] user_tweets p{page_idx} @{target}: '
+                      f'empty page but cursor advances — continuing')
+            else:
+                prev_empty = False
+
+            # has_next_page=False with NO next cursor is handled above. If it's
+            # False but a cursor exists, the API is being inconsistent — keep
+            # paging and let the cursor / empty-page logic stop us.
+            if parsed_has_next is False and not tweets and prev_empty:
+                # The API really wants us to stop and there's nothing in hand.
+                break_reason = f'has_next_page=False(raw={raw_has_next!r})_after_empty'
+                break
 
         sent_cursor = new_cursor
 
@@ -991,6 +1085,7 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
     scanned_usernames: list = []
     seen_handles: set  = set()   # all handles observed so far (dedupe analysis)
     break_reason       = f'page_cap({max_pages})'
+    consecutive_empty  = 0       # resilient pagination: tolerate transient empties
 
     for page_idx0 in range(max_pages):
         page_idx = page_idx0 + 1
@@ -1065,21 +1160,57 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
         seen_handles |= page_handle_set
         seen += len(tweets)
 
-        # Break conditions in priority order — log exactly which fired.
+        # Track consecutive empty pages for resilient pagination.
         if len(tweets) == 0:
-            break_reason = 'empty_page'
-            break
-        if parsed_has_next is False:
-            break_reason = f'has_next_page=False(raw={raw_has_next!r})'
-            break
-        if not new_cursor:
-            break_reason = f'no_next_cursor(src={cursor_src!r})'
-            break
-        if same_as_sent:
-            # API echoed back what we sent — sending it again refetches the same
-            # page. Stop cleanly and report so the symptom is visible upstream.
-            break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
-            break
+            consecutive_empty += 1
+        else:
+            consecutive_empty = 0
+
+        if TWITTER_PAGINATION_RESILIENT:
+            # has_next_page=False is advisory: a single cursor can return an
+            # empty page + has_next=False while a LATER cursor still yields the
+            # reply. Keep paging while the cursor advances; stop only on a dead
+            # cursor, a stalled cursor, or after enough consecutive empties.
+            cursor_advanced = bool(new_cursor) and not same_as_sent
+            if len(tweets) == 0:
+                retrying = cursor_advanced and consecutive_empty < TWITTER_EMPTY_PAGE_TOLERANCE
+                print(
+                    f'[twitter] empty page detected p={page_idx} '
+                    f'cursor_advanced={cursor_advanced} has_next_raw={raw_has_next!r} '
+                    f'retry={retrying} consecutive_empty={consecutive_empty}'
+                )
+            if not new_cursor:
+                break_reason = f'no_next_cursor(src={cursor_src!r})'
+                break
+            if same_as_sent:
+                break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
+                break
+            if consecutive_empty >= TWITTER_EMPTY_PAGE_TOLERANCE:
+                print(
+                    f'[twitter] pagination giving up after {consecutive_empty} '
+                    f'consecutive empty pages, total scanned={pages}, '
+                    f'total tweets={seen}'
+                )
+                break_reason = f'empty_page_tolerance({TWITTER_EMPTY_PAGE_TOLERANCE})'
+                break
+            # has_next=False but cursor is live and under tolerance → keep paging.
+        else:
+            # Original trust-the-flag behavior. Break conditions in priority
+            # order — log exactly which fired.
+            if len(tweets) == 0:
+                break_reason = 'empty_page'
+                break
+            if parsed_has_next is False:
+                break_reason = f'has_next_page=False(raw={raw_has_next!r})'
+                break
+            if not new_cursor:
+                break_reason = f'no_next_cursor(src={cursor_src!r})'
+                break
+            if same_as_sent:
+                # API echoed back what we sent — sending it again refetches the
+                # same page. Stop cleanly and report so the symptom is visible.
+                break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
+                break
 
         sent_cursor = new_cursor
 
