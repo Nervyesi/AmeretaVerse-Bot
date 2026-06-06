@@ -3141,11 +3141,12 @@ def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_i
     the bottom (deprioritized) so they only see it again after everything else.
     Skipped submissions are never recorded, so skip behavior is unchanged.
     """
-    params = [pool_id]
     select_deprioritized = '0 AS is_deprioritized'
     join_deprioritized = ''
     already_engaged_clause = ''
     order_clause = 'ORDER BY RANDOM()'
+    join_params: list = []
+    where_params: list = []
     if exclude_user_id is not None:
         uid = str(exclude_user_id)
         select_deprioritized = (
@@ -3157,7 +3158,7 @@ def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_i
                 AND d.guild_id = s.guild_id
                 AND d.user_id = ?
         """
-        params.append(uid)  # d.user_id
+        join_params.append(uid)  # d.user_id (JOIN clause — textually the FIRST ?)
         already_engaged_clause = """
             AND s.submitter_user_id != ?
             AND NOT EXISTS (
@@ -3167,13 +3168,16 @@ def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_i
                   AND a.points_earned > 0
             )
         """
-        params.extend([uid, uid])  # submitter check, engaged-with-points check
+        where_params.extend([uid, uid])  # submitter check, engaged-with-points check
         # Non-deprioritized first, deprioritized last; preserve random secondary order.
         order_clause = 'ORDER BY is_deprioritized ASC, RANDOM()'
-    params.append(limit)
-    with get_connection() as conn:
-        rows = conn.execute(
-            f"""SELECT s.*, {select_deprioritized}
+    # Bind params MUST follow the textual order of the ? placeholders in the SQL:
+    #   JOIN (d.user_id) -> WHERE (s.pool_id) -> already_engaged (submitter, engager) -> LIMIT.
+    # The JOIN precedes the WHERE, so the join's user_id binds BEFORE pool_id. The
+    # previous code seeded params with pool_id first, so pool_id bound to d.user_id
+    # and the user-id string bound to s.pool_id; WHERE s.pool_id never matched and
+    # /engage returned zero tasks.
+    query = f"""SELECT s.*, {select_deprioritized}
                 FROM engage_submissions s
                 {join_deprioritized}
                 WHERE s.pool_id = ?
@@ -3181,9 +3185,13 @@ def list_active_engage_submissions(pool_id: int, limit: int = 10, exclude_user_i
                   AND (s.expires_at IS NULL OR s.expires_at > datetime('now'))
                   {already_engaged_clause}
                 {order_clause}
-                LIMIT ?""",
-            params,
-        ).fetchall()
+                LIMIT ?"""
+    params = [*join_params, pool_id, *where_params, limit]
+    # Temporary diagnostics (one deploy cycle): prove the EXACT SQL + binds in prod.
+    print(f'[engage] list_active SQL: {" ".join(query.split())}')
+    print(f'[engage] list_active params: {params}')
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
     result = [dict(r) for r in rows]
     print(
         f'[engage] list_active: pool={pool_id} exclude_user={exclude_user_id!r} '
