@@ -149,6 +149,23 @@ TWITTER_PER_USER_PROBE_CACHE = (
 TWITTER_EMPTY_PAGE_TOLERANCE = max(
     1, int(os.getenv('TWITTER_EMPTY_PAGE_TOLERANCE', '3') or 3)
 )
+# ── Cursor advance guard (stuck-page fix) ────────────────────────────────────
+# Additional protection layered ON TOP of TWITTER_PAGINATION_RESILIENT (it does
+# NOT replace it): before each page call we snapshot the cursor we are about to
+# send; after the call we compare it to the cursor the API hands back. If they
+# are identical the cursor is stuck (sending it again just refetches the same
+# page — the "stuck on the same page" bug), so we break with a labelled reason.
+# If the API returns no further cursor AND the page was empty, pagination has
+# genuinely ended. Set TWITTER_CURSOR_ADVANCE_GUARD=false to disable (rollback).
+TWITTER_CURSOR_ADVANCE_GUARD = (
+    (os.getenv('TWITTER_CURSOR_ADVANCE_GUARD', 'true') or 'true').strip().lower() == 'true'
+)
+# Per-page pagination tracing. OFF by default (it is noisy for production); turn
+# on temporarily to confirm cursors actually advance page-to-page. One line per
+# page call with the in/out cursor tails. Set TWITTER_DEBUG_PAGINATION=true.
+TWITTER_DEBUG_PAGINATION = (
+    (os.getenv('TWITTER_DEBUG_PAGINATION', 'false') or 'false').strip().lower() == 'true'
+)
 
 print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'retweeters cap={_RETWEETERS_MAX_PAGES} '
@@ -159,7 +176,9 @@ print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'tweetside_confident_min={_TWEETSIDE_CONFIDENT_FALSE_MIN} '
       f'pagination_resilient={TWITTER_PAGINATION_RESILIENT} '
       f'per_user_probe_cache={TWITTER_PER_USER_PROBE_CACHE} '
-      f'empty_page_tol={TWITTER_EMPTY_PAGE_TOLERANCE}')
+      f'empty_page_tol={TWITTER_EMPTY_PAGE_TOLERANCE} '
+      f'cursor_advance_guard={TWITTER_CURSOR_ADVANCE_GUARD} '
+      f'debug_pagination={TWITTER_DEBUG_PAGINATION}')
 
 
 # ── User-tweets cache (single fetch reused across one finalize batch) ────────
@@ -772,6 +791,27 @@ async def _fetch_user_recent_tweets(
             f'same_as_sent={same_as_sent}'
         )
 
+        # ── Cursor advance guard (TWITTER_CURSOR_ADVANCE_GUARD) ──────────────
+        # prev_cursor is the cursor we just sent for THIS page. Additive
+        # protection layered on the resilient/non-resilient stop logic below.
+        prev_cursor = sent_cursor
+        if TWITTER_DEBUG_PAGINATION:
+            print(
+                f"[twitter] user_tweets p={page_idx} @{target} via {endpoint} "
+                f"cursor_in_tail={(prev_cursor or 'NONE')[-12:]} "
+                f"cursor_out_tail={(new_cursor or 'NONE')[-12:]} "
+                f"tweets={len(tweets)} has_next={parsed_has_next}"
+            )
+        if TWITTER_CURSOR_ADVANCE_GUARD:
+            if new_cursor is not None and prev_cursor is not None and new_cursor == prev_cursor:
+                print('[twitter] cursor stuck (same as previous), breaking')
+                break_reason = 'cursor_advance_guard(stuck_same_as_previous)'
+                break
+            if not new_cursor and len(tweets) == 0:
+                print('[twitter] pagination genuinely ended')
+                break_reason = 'cursor_advance_guard(genuinely_ended)'
+                break
+
         # Stop conditions in priority order. The cursor is the source of
         # truth: production logs show /user/last_tweets returns
         # has_next_page=False on page 1 WITH a real next_cursor that DOES
@@ -1165,6 +1205,29 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
             consecutive_empty += 1
         else:
             consecutive_empty = 0
+
+        # ── Cursor advance guard (TWITTER_CURSOR_ADVANCE_GUARD) ──────────────
+        # prev_cursor is the cursor we just sent for THIS page. Compare it to
+        # the cursor the API handed back. Additive protection that runs ahead
+        # of the resilient/non-resilient break logic below; the match loop has
+        # already executed so a reply on this page is never skipped.
+        prev_cursor = sent_cursor
+        if TWITTER_DEBUG_PAGINATION:
+            print(
+                f"[twitter] tweetside p={page_idx} tweet_id={tweet_id} "
+                f"cursor_in_tail={(prev_cursor or 'NONE')[-12:]} "
+                f"cursor_out_tail={(new_cursor or 'NONE')[-12:]} "
+                f"replies={len(tweets)} has_next={parsed_has_next}"
+            )
+        if TWITTER_CURSOR_ADVANCE_GUARD:
+            if new_cursor is not None and prev_cursor is not None and new_cursor == prev_cursor:
+                print('[twitter] cursor stuck (same as previous), breaking')
+                break_reason = 'cursor_advance_guard(stuck_same_as_previous)'
+                break
+            if not new_cursor and len(tweets) == 0:
+                print('[twitter] pagination genuinely ended')
+                break_reason = 'cursor_advance_guard(genuinely_ended)'
+                break
 
         if TWITTER_PAGINATION_RESILIENT:
             # has_next_page=False is advisory: a single cursor can return an
