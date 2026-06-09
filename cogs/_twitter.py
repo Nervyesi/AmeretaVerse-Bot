@@ -193,6 +193,16 @@ _DEEP_EMPTY_PAGE_TOLERANCE = (
 TWITTER_CONVERSATION_FALLBACK = (
     (os.getenv('TWITTER_CONVERSATION_FALLBACK', 'false') or 'false').strip().lower() == 'true'
 )
+# TWITTER_MENTIONS_FALLBACK: last resort discovery. When the tweetside, userside
+# and conversation checks have all missed, scan the target tweet author's
+# mention timeline (a firehose indexed view that catches replies the replies
+# endpoint drops) and confirm each candidate with a direct id lookup. Default
+# off so it stays completely inert until explicitly enabled.
+TWITTER_MENTIONS_FALLBACK = (
+    (os.getenv('TWITTER_MENTIONS_FALLBACK', 'false') or 'false').strip().lower() == 'true'
+)
+# How many mention timeline pages to scan, newest first, before giving up.
+_MENTIONS_MAX_PAGES = max(1, int(os.getenv('TWITTER_MENTIONS_MAX_PAGES', '5') or 5))
 
 print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'retweeters cap={_RETWEETERS_MAX_PAGES} '
@@ -209,7 +219,9 @@ print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'trace_verify={TWITTER_TRACE_VERIFY} '
       f'deep_pagination={TWITTER_DEEP_PAGINATION} '
       f'deep_empty_tol={_DEEP_EMPTY_PAGE_TOLERANCE} '
-      f'conversation_fallback={TWITTER_CONVERSATION_FALLBACK}')
+      f'conversation_fallback={TWITTER_CONVERSATION_FALLBACK} '
+      f'mentions_fallback={TWITTER_MENTIONS_FALLBACK} '
+      f'mentions_max_pages={_MENTIONS_MAX_PAGES}')
 
 
 # ── User-tweets cache (single fetch reused across one finalize batch) ────────
@@ -1156,6 +1168,44 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             )
             return {'verified': True, 'reason': 'found_comment_conversation'}
 
+    # EXTRA FALLBACK: mentions based discovery (TWITTER_MENTIONS_FALLBACK).
+    # The tweetside, userside and conversation checks have all missed. The
+    # target author's mention timeline is indexed from a different pipeline and
+    # can surface the reply those endpoints drop. We fetch the target tweet for
+    # its author and createdAt, resolve the replying user's id, then scan and
+    # confirm. This whole block is inert when the flag is off, so behavior with
+    # the flag off is identical to before.
+    if TWITTER_MENTIONS_FALLBACK:
+        target_obj = None
+        fetched = await fetch_tweets_by_ids([tweet_id])
+        api_calls += 1
+        if fetched:
+            target_obj = fetched[0]
+        expected_user_id = ''
+        info = await lookup_twitter_user_by_login(target)
+        api_calls += 1
+        if info:
+            expected_user_id = _id_str(info.get('id'))
+        if target_obj is not None:
+            ms = await check_comment_mentionside(target_obj, expected_user_id, target)
+            api_calls += int(ms.get('api_calls') or 0)
+            if ms.get('verified') is True:
+                fallback_via = f'{fallback_via}+mentions'
+                fallback_result = 'match'
+                _log_verify_summary(
+                    'check_comment', tweet_id, target,
+                    primary_via=primary_via, primary_result=primary_result,
+                    fallback_via=fallback_via, fallback_result=fallback_result,
+                    api_calls=api_calls, result='match',
+                )
+                return {'verified': True, 'reason': 'found_comment_mentionside'}
+        else:
+            # The summary line must appear every time the fallback runs, even on
+            # the skip path where we could not fetch the target tweet.
+            print(f'[twitter] mentionside target_tweet={tweet_id} '
+                  f'target_user={target} pages_scanned=0 candidates_found=0 '
+                  f'result=skipped_no_target_tweet')
+
     # Tweet-side did NOT match. The production evidence shows /tweet/replies
     # returns inconsistent single-reply snapshots on identical calls — so
     # tweet-side "no match" is NOT a confident signal on its own. Trust it
@@ -1506,6 +1556,333 @@ async def _check_comment_conversation(tweet_id: str, target: str) -> dict:
           f'after {pages} pages, {seen} replies, {elapsed:.1f}s')
     return {'verified': False, 'reason': 'no_comment_conversation',
             'seen': seen, 'pages': pages, 'api_calls': pages}
+
+
+# Author id and chronological helpers for the mentions based fallback.
+# These are additive and only used by the mentions fallback path.
+
+def _author_id(obj, _depth: int = 0) -> str:
+    """Return the AUTHOR id of a tweet object as a string.
+
+    The top level id of a tweet is the tweet id, not the author, so we read
+    explicit author id fields at the top level and otherwise descend into the
+    known nested user containers. Returns an empty string when no author id is
+    present."""
+    if not isinstance(obj, dict) or _depth > 4:
+        return ''
+    if _depth == 0:
+        for f in ('author_id', 'authorId', 'user_id', 'userId', 'author_id_str'):
+            v = obj.get(f)
+            if v not in (None, '', 0, '0'):
+                return _id_str(v)
+    for key in _NESTED_USER_KEYS:
+        nested = obj.get(key)
+        if isinstance(nested, dict):
+            for f in ('id', 'id_str', 'userId', 'user_id', 'rest_id'):
+                v = nested.get(f)
+                if v not in (None, '', 0, '0'):
+                    return _id_str(v)
+            deep = _author_id(nested, _depth + 1)
+            if deep:
+                return deep
+    return ''
+
+
+def _parse_tweet_time(value) -> Optional[float]:
+    """Best effort parse of a tweet createdAt into a unix timestamp.
+
+    Handles the Twitter style string (for example Tue Jun 10 07:00:00 +0000
+    2026) and ISO 8601. Returns None when the value is missing or unparseable,
+    in which case callers must not use it for the chronological early stop."""
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip()
+    try:
+        import email.utils as _eut
+        dt = _eut.parsedate_to_datetime(s)
+        if dt is not None:
+            return dt.timestamp()
+    except Exception:
+        pass
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return None
+
+
+_IN_REPLY_TO_USER_ID_FIELDS = (
+    'inReplyToUserId', 'in_reply_to_user_id', 'in_reply_to_user_id_str',
+)
+
+
+def _mention_reply_matches(
+    tw: dict, target_id: str, target_author_id: str,
+    expected_user_id: str, expected_username: str,
+) -> tuple[bool, str]:
+    """Decide whether a mention timeline tweet is the reply we are verifying.
+
+    Returns (is_match, decided_by) where decided_by names the specific field
+    that determined the outcome so the trace log can record exactly why a tweet
+    was accepted or rejected.
+
+    A tweet matches when its author is the expected replying user AND it links
+    to the target tweet. Author identity prefers the author id compared as
+    strings and falls back to a case insensitive userName comparison only when
+    the id is missing. Reply linkage is satisfied by inReplyToId equal to the
+    target tweet id, or by conversationId equal to the target tweet id together
+    with inReplyToUserId equal to the target tweet author id."""
+    if not isinstance(tw, dict) or not target_id:
+        return False, 'no_tweet_or_target'
+
+    # Author identity.
+    a_id = _author_id(tw)
+    if expected_user_id:
+        if _id_str(a_id) != _id_str(expected_user_id):
+            return False, f'author_id_mismatch(got={a_id or "none"})'
+        author_ok_by = 'author_id'
+    else:
+        a_handle = normalize_username(_primary_handle(tw))
+        if a_handle != normalize_username(expected_username):
+            return False, f'author_handle_mismatch(got={a_handle or "none"})'
+        author_ok_by = 'author_handle'
+
+    # Reply linkage, direct in reply to id first.
+    in_reply = ''
+    for f in _REPLY_TO_ID_FIELDS:
+        v = _id_str(tw.get(f))
+        if v:
+            in_reply = v
+            break
+    if in_reply and in_reply == _id_str(target_id):
+        return True, f'{author_ok_by}_plus_inReplyToId'
+
+    # Conversation plus in reply to user id.
+    conv = ''
+    for f in _CONVERSATION_ID_FIELDS:
+        v = _id_str(tw.get(f))
+        if v:
+            conv = v
+            break
+    irt_user = ''
+    for f in _IN_REPLY_TO_USER_ID_FIELDS:
+        v = _id_str(tw.get(f))
+        if v:
+            irt_user = v
+            break
+    if (conv and conv == _id_str(target_id)
+            and target_author_id and irt_user == _id_str(target_author_id)):
+        return True, f'{author_ok_by}_plus_conversationId_plus_inReplyToUserId'
+
+    return False, (
+        f'no_reply_link(inReplyToId={in_reply or "none"},'
+        f'conversationId={conv or "none"},inReplyToUserId={irt_user or "none"})'
+    )
+
+
+async def fetch_user_mentions(
+    user_name: str, cursor: Optional[str] = None, since_time: Optional[str] = None,
+) -> dict:
+    """Fetch one page of a user's mention timeline from /twitter/user/mentions.
+
+    Returns {'tweets': list, 'has_next_page': bool, 'next_cursor': Optional[str]}.
+    On any error returns an empty list and no next page. sinceTime is only sent
+    when the caller provides it, so an endpoint that rejects the parameter is
+    never hit by default."""
+    target = normalize_username(user_name)
+    if not target:
+        return {'tweets': [], 'has_next_page': False, 'next_cursor': None}
+
+    params: dict = {'userName': target}
+    if cursor:
+        params['cursor'] = cursor
+    if since_time:
+        params['sinceTime'] = since_time
+
+    data = await _api_get('/twitter/user/mentions', params, timeout=30.0)
+    if data is None:
+        return {'tweets': [], 'has_next_page': False, 'next_cursor': None}
+
+    tweets = data.get('tweets') or data.get('replies') or data.get('data') or []
+    if not isinstance(tweets, list):
+        tweets = []
+
+    raw_has_next = data.get('has_next_page')
+    if raw_has_next is None:
+        raw_has_next = data.get('hasNextPage')
+    parsed_has_next = _parse_has_next(raw_has_next)
+    next_cursor, cursor_src = _read_next_cursor(data, cursor)
+
+    if TWITTER_TRACE_VERIFY:
+        print(
+            f"[twitter_trace] mentions_page user={target} sent_cursor="
+            f"{_cursor_preview(cursor)} tweets={len(tweets)} "
+            f"has_next={parsed_has_next} next_cursor={_cursor_preview(next_cursor)} "
+            f"src={cursor_src!r}"
+        )
+
+    return {
+        'tweets': tweets,
+        'has_next_page': bool(parsed_has_next),
+        'next_cursor': next_cursor,
+    }
+
+
+async def fetch_tweets_by_ids(ids) -> list:
+    """Direct lookup of tweets by id via /twitter/tweets.
+
+    Accepts a list of ids or a single id and sends them as a comma separated
+    tweet_ids parameter. Returns the list under the response 'tweets' key, or an
+    empty list on error. Direct id lookup returns fresh data and is used to
+    confirm a candidate found in the mention listing."""
+    if isinstance(ids, (list, tuple, set)):
+        id_list = [str(i).strip() for i in ids if str(i).strip()]
+    elif ids:
+        id_list = [str(ids).strip()]
+    else:
+        id_list = []
+    if not id_list:
+        return []
+
+    data = await _api_get('/twitter/tweets', {'tweet_ids': ','.join(id_list)}, timeout=30.0)
+    if data is None:
+        return []
+    tweets = data.get('tweets')
+    if not isinstance(tweets, list):
+        tweets = data.get('data') if isinstance(data.get('data'), list) else []
+    return tweets
+
+
+async def check_comment_mentionside(
+    target_tweet: dict, expected_user_id: str, expected_username: str,
+) -> dict:
+    """Mentions based comment verification.
+
+    Scans the target tweet author's mention timeline newest first, looking for a
+    reply by the expected user that links to the target tweet, then confirms the
+    candidate with a direct id lookup before accepting it. target_tweet must
+    carry at least its id, its author userName, its author id and createdAt.
+
+    Returns a structured result: a match carries verified True, the matched
+    tweet id and method 'mentionside'; otherwise verified False with a reason.
+    Always emits a single production summary line, and when TWITTER_TRACE_VERIFY
+    is on it logs every accept and reject with the field that decided it."""
+    target_id = ''
+    target_author_handle = ''
+    target_author_id = ''
+    target_created: Optional[float] = None
+    if isinstance(target_tweet, dict):
+        target_id = _id_str(target_tweet.get('id') or target_tweet.get('id_str'))
+        target_author_handle = _primary_handle(target_tweet)
+        target_author_id = _author_id(target_tweet)
+        target_created = _parse_tweet_time(
+            target_tweet.get('createdAt') or target_tweet.get('created_at')
+        )
+    exp_user = normalize_username(expected_username)
+
+    pages = 0
+    candidates = 0
+    api_calls = 0
+    matched_id: Optional[str] = None
+    result = 'no_match'
+
+    if not target_id or not target_author_handle:
+        print(f'[twitter] mentionside target_tweet={target_id or "?"} '
+              f'target_user={exp_user} pages_scanned=0 candidates_found=0 '
+              f'result=skipped_no_target_fields')
+        return {'verified': False, 'reason': 'mentionside_no_target_fields',
+                'method': 'mentionside', 'pages': 0, 'candidates': 0, 'api_calls': 0}
+
+    started_at = time.monotonic()
+    deadline   = started_at + _PAGINATION_BUDGET_S
+    cursor: Optional[str] = None
+
+    for page_idx0 in range(_MENTIONS_MAX_PAGES):
+        if time.monotonic() > deadline:
+            break
+        page_idx = page_idx0 + 1
+
+        res = await fetch_user_mentions(target_author_handle, cursor=cursor)
+        api_calls += 1
+        tweets = res.get('tweets') or []
+        pages += 1
+
+        page_oldest: Optional[float] = None
+        for tw in tweets:
+            t_created = _parse_tweet_time(
+                tw.get('createdAt') or tw.get('created_at')
+            )
+            if t_created is not None:
+                page_oldest = (t_created if page_oldest is None
+                               else min(page_oldest, t_created))
+
+            is_match, decided = _mention_reply_matches(
+                tw, target_id, target_author_id, expected_user_id, expected_username,
+            )
+            cand_id = _id_str(tw.get('id') or tw.get('id_str'))
+            if not is_match:
+                if TWITTER_TRACE_VERIFY:
+                    print(f"[twitter_trace] mentionside reject page={page_idx} "
+                          f"tweet_id={cand_id or 'none'} decided_by={decided}")
+                continue
+
+            candidates += 1
+            if TWITTER_TRACE_VERIFY:
+                print(f"[twitter_trace] mentionside accept page={page_idx} "
+                      f"tweet_id={cand_id} decided_by={decided}")
+
+            # Confirm the candidate with a direct id lookup. This guards against
+            # transient field gaps in the mention listing.
+            confirmed = await fetch_tweets_by_ids([cand_id])
+            api_calls += 1
+            conf_tw = confirmed[0] if confirmed else None
+            if conf_tw is None:
+                if TWITTER_TRACE_VERIFY:
+                    print(f"[twitter_trace] mentionside confirm_reject "
+                          f"tweet_id={cand_id} decided_by=confirm_lookup_empty")
+                continue
+            c_match, c_decided = _mention_reply_matches(
+                conf_tw, target_id, target_author_id,
+                expected_user_id, expected_username,
+            )
+            if c_match:
+                matched_id = cand_id
+                result = 'match'
+                if TWITTER_TRACE_VERIFY:
+                    print(f"[twitter_trace] mentionside confirm_accept "
+                          f"tweet_id={cand_id} decided_by={c_decided}")
+                break
+            if TWITTER_TRACE_VERIFY:
+                print(f"[twitter_trace] mentionside confirm_reject "
+                      f"tweet_id={cand_id} decided_by={c_decided}")
+
+        if matched_id is not None:
+            break
+
+        # Mention timelines are descending chronological, so once the oldest
+        # tweet on the page predates the target tweet nothing older can match.
+        if (target_created is not None and page_oldest is not None
+                and page_oldest < target_created):
+            if TWITTER_TRACE_VERIFY:
+                print(f"[twitter_trace] mentionside early_stop page={page_idx} "
+                      f"page_oldest_predates_target")
+            break
+
+        next_cursor = res.get('next_cursor')
+        if not res.get('has_next_page') or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    print(f'[twitter] mentionside target_tweet={target_id} target_user={exp_user} '
+          f'pages_scanned={pages} candidates_found={candidates} result={result}')
+
+    if matched_id is not None:
+        return {'verified': True, 'reason': 'found_comment_mentionside',
+                'matched_tweet_id': matched_id, 'method': 'mentionside',
+                'pages': pages, 'candidates': candidates, 'api_calls': api_calls}
+    return {'verified': False, 'reason': 'no_comment_mentionside',
+            'method': 'mentionside', 'pages': pages,
+            'candidates': candidates, 'api_calls': api_calls}
 
 
 async def check_retweet(tweet_id: str, target_username: str) -> dict:
