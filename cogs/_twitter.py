@@ -166,6 +166,33 @@ TWITTER_CURSOR_ADVANCE_GUARD = (
 TWITTER_DEBUG_PAGINATION = (
     (os.getenv('TWITTER_DEBUG_PAGINATION', 'false') or 'false').strip().lower() == 'true'
 )
+# ── Round-3 diagnosis toggles (failing verify for specific users) ────────────
+# TWITTER_TRACE_VERIFY: aggressive per-page trace of who/what each scan saw and
+# whether the target matched. Very noisy — default off; turn on only to capture
+# a failing verify, then turn back off.
+TWITTER_TRACE_VERIFY = (
+    (os.getenv('TWITTER_TRACE_VERIFY', 'false') or 'false').strip().lower() == 'true'
+)
+# TWITTER_DEEP_PAGINATION: when a target's recent reply lives many pages deep,
+# the default caps/tolerance bail too early. When on, both /tweet/replies and
+# /user/last_tweets page caps are DOUBLED and the empty-page tolerance is lifted
+# to at least 5. Costs more API spend — default off, enable per-investigation.
+TWITTER_DEEP_PAGINATION = (
+    (os.getenv('TWITTER_DEEP_PAGINATION', 'false') or 'false').strip().lower() == 'true'
+)
+# Effective empty-page tolerance once deep mode is considered. Kept as a module
+# value so every loop applies the same lifted tolerance consistently.
+_DEEP_EMPTY_PAGE_TOLERANCE = (
+    max(TWITTER_EMPTY_PAGE_TOLERANCE, 5) if TWITTER_DEEP_PAGINATION
+    else TWITTER_EMPTY_PAGE_TOLERANCE
+)
+# TWITTER_CONVERSATION_FALLBACK: extra safety net. When both user-side and the
+# direct tweet-side scans miss, re-scan /twitter/tweet/replies keyed by
+# conversationId + includeReplies — some replies live deeper in the thread than
+# the direct replies list. Default off so it can be A/B tested.
+TWITTER_CONVERSATION_FALLBACK = (
+    (os.getenv('TWITTER_CONVERSATION_FALLBACK', 'false') or 'false').strip().lower() == 'true'
+)
 
 print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'retweeters cap={_RETWEETERS_MAX_PAGES} '
@@ -178,7 +205,11 @@ print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'per_user_probe_cache={TWITTER_PER_USER_PROBE_CACHE} '
       f'empty_page_tol={TWITTER_EMPTY_PAGE_TOLERANCE} '
       f'cursor_advance_guard={TWITTER_CURSOR_ADVANCE_GUARD} '
-      f'debug_pagination={TWITTER_DEBUG_PAGINATION}')
+      f'debug_pagination={TWITTER_DEBUG_PAGINATION} '
+      f'trace_verify={TWITTER_TRACE_VERIFY} '
+      f'deep_pagination={TWITTER_DEEP_PAGINATION} '
+      f'deep_empty_tol={_DEEP_EMPTY_PAGE_TOLERANCE} '
+      f'conversation_fallback={TWITTER_CONVERSATION_FALLBACK}')
 
 
 # ── User-tweets cache (single fetch reused across one finalize batch) ────────
@@ -697,6 +728,7 @@ async def _fetch_user_recent_tweets(
     endpoint: str = '/twitter/user/last_tweets',
     extra_params: Optional[dict] = None,
     max_pages: Optional[int] = None,
+    trace_target_id: Optional[str] = None,
 ) -> list:
     """Return the user's recent tweets, paginated.
 
@@ -705,6 +737,9 @@ async def _fetch_user_recent_tweets(
     (endpoint, normalized_username, frozen(extra_params)) so different
     endpoint requests for the same user don't poison each other.
     max_pages overrides the module default for cheap user-side retweet checks.
+    trace_target_id (diagnostics only) is the target tweet id the caller is
+    looking for — used solely to emit a per-page matches_target trace when
+    TWITTER_TRACE_VERIFY is on; it does not change pagination or matching.
     """
     target = normalize_username(username)
     if not target:
@@ -713,6 +748,11 @@ async def _fetch_user_recent_tweets(
         extra_params = {}
     cache_key = (endpoint, target, frozenset((k, str(v)) for k, v in extra_params.items()))
     max_pages = max_pages if max_pages is not None else _USER_TWEETS_MAX_PAGES
+    # Deep mode (TWITTER_DEEP_PAGINATION): double the page cap and lift the
+    # empty-page tolerance. When off, both equal the existing values exactly.
+    if TWITTER_DEEP_PAGINATION:
+        max_pages = max_pages * 2
+    empty_tol = _DEEP_EMPTY_PAGE_TOLERANCE
 
     # Cache check — under the lock so two concurrent verifies share the result.
     async with _user_tweets_lock:
@@ -791,6 +831,24 @@ async def _fetch_user_recent_tweets(
             f'same_as_sent={same_as_sent}'
         )
 
+        if TWITTER_TRACE_VERIFY:
+            reply_targets: list = []
+            for tw in tweets:
+                if _is_reply_tweet(tw):
+                    for f in _REPLY_TO_ID_FIELDS:
+                        v = tw.get(f)
+                        if v not in (None, '', 0, '0'):
+                            reply_targets.append(_id_str(v))
+                            break
+            matches_target = bool(trace_target_id) and any(
+                _tweet_replies_to(tw, trace_target_id) for tw in tweets
+            )
+            print(
+                f"[twitter_trace] userside p={page_idx} user={target} "
+                f"target_tweet={trace_target_id} reply_count={len(tweets)} "
+                f"matches_target={matches_target} all_reply_targets={reply_targets[:10]}"
+            )
+
         # ── Cursor advance guard (TWITTER_CURSOR_ADVANCE_GUARD) ──────────────
         # prev_cursor is the cursor we just sent for THIS page. Additive
         # protection layered on the resilient/non-resilient stop logic below.
@@ -838,19 +896,19 @@ async def _fetch_user_recent_tweets(
             # while the cursor advances; stop only after TWITTER_EMPTY_PAGE_
             # TOLERANCE consecutive empties (cursor-dead/stalled handled above).
             if len(tweets) == 0:
-                retrying = consecutive_empty < TWITTER_EMPTY_PAGE_TOLERANCE
+                retrying = consecutive_empty < empty_tol
                 print(
                     f'[twitter] empty page detected p={page_idx} '
                     f'cursor_advanced=True has_next_raw={raw_has_next!r} '
                     f'retry={retrying} consecutive_empty={consecutive_empty}'
                 )
-            if consecutive_empty >= TWITTER_EMPTY_PAGE_TOLERANCE:
+            if consecutive_empty >= empty_tol:
                 print(
                     f'[twitter] pagination giving up after {consecutive_empty} '
                     f'consecutive empty pages, total scanned={pages}, '
                     f'total tweets={len(all_tweets)}'
                 )
-                break_reason = f'empty_page_tolerance({TWITTER_EMPTY_PAGE_TOLERANCE})'
+                break_reason = f'empty_page_tolerance({empty_tol})'
                 break
             # has_next=False with a live, advancing cursor is advisory — continue.
         else:
@@ -877,6 +935,8 @@ async def _fetch_user_recent_tweets(
 
         sent_cursor = new_cursor
 
+    if break_reason.startswith('page_cap'):
+        print(f'[twitter] max_pages limit reached (deep_mode={TWITTER_DEEP_PAGINATION})')
     elapsed = time.monotonic() - started_at
     print(f'[twitter] user_tweets done @{target} via {endpoint}: '
           f'tweets={len(all_tweets)} pages={pages} '
@@ -972,6 +1032,13 @@ def _log_verify_summary(
         f'fallback={fallback_via} fallback_result={fallback_result} '
         f'api_calls={api_calls} result={result}'
     )
+    if TWITTER_TRACE_VERIFY:
+        print(
+            f"[twitter_trace] verify_end fn={fn_name} tweet_id={tweet_id} "
+            f"target={target} result={result} "
+            f"method_tried=primary:{primary_via}|fallback:{fallback_via} "
+            f"pages_total~={api_calls}"
+        )
 
 
 async def check_comment(tweet_id: str, target_username: str) -> dict:
@@ -1001,6 +1068,8 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
     """
     print(f'[twitter] check_comment: tweet={tweet_id} target={target_username} '
           f'order=userside_first(probe_eager)')
+    if TWITTER_TRACE_VERIFY:
+        print(f"[twitter_trace] verify_start tweet_id={tweet_id} target={target_username}")
     target = normalize_username(target_username)
     if not target or not tweet_id:
         return {'verified': None, 'reason': 'missing_input'}
@@ -1025,6 +1094,7 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             endpoint=probe['path'],
             extra_params=probe['extra_params'],
             max_pages=_USER_TWEETS_MAX_PAGES,
+            trace_target_id=target_id_s,
         )
         # Approximate per-page cost: ~20 tweets per page.
         api_calls += max(1, (len(tweets) + 19) // 20)
@@ -1035,6 +1105,7 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
                 break
 
         if matched_tweet_id is not None:
+            print(f'[twitter] match found method=userside page=n/a reply_id={matched_tweet_id}')
             print(f'[twitter] check_comment: USERSIDE MATCH @{target} '
                   f'reply_tweet={matched_tweet_id} target_tweet={target_id_s} '
                   f'(scanned={len(tweets)})')
@@ -1066,6 +1137,24 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             api_calls=api_calls, result='match',
         )
         return {'verified': True, 'reason': 'found_comment_tweetside'}
+
+    # ── EXTRA FALLBACK: conversation-thread scan (TWITTER_CONVERSATION_FALLBACK)
+    # Neither user-side nor the direct tweet-side replies list matched. Some
+    # replies live deeper in the conversation thread than the direct list, so
+    # re-scan keyed by conversationId + includeReplies. Default-off, additive.
+    if TWITTER_CONVERSATION_FALLBACK:
+        conv = await _check_comment_conversation(tweet_id, target)
+        api_calls += int(conv.get('api_calls') or conv.get('pages') or 0)
+        if conv.get('verified') is True:
+            fallback_via = f'{fallback_via}+conversation'
+            fallback_result = 'match'
+            _log_verify_summary(
+                'check_comment', tweet_id, target,
+                primary_via=primary_via, primary_result=primary_result,
+                fallback_via=fallback_via, fallback_result=fallback_result,
+                api_calls=api_calls, result='match',
+            )
+            return {'verified': True, 'reason': 'found_comment_conversation'}
 
     # Tweet-side did NOT match. The production evidence shows /tweet/replies
     # returns inconsistent single-reply snapshots on identical calls — so
@@ -1118,7 +1207,10 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
     sent_cursor: Optional[str] = None
     seen               = 0
     pages              = 0
-    max_pages          = _REPLIES_MAX_PAGES
+    # Deep mode (TWITTER_DEEP_PAGINATION): double the cap, lift empty tolerance.
+    # When off both equal the existing values exactly.
+    max_pages          = _REPLIES_MAX_PAGES * 2 if TWITTER_DEEP_PAGINATION else _REPLIES_MAX_PAGES
+    empty_tol          = _DEEP_EMPTY_PAGE_TOLERANCE
     started_at         = time.monotonic()
     deadline           = started_at + _PAGINATION_BUDGET_S
     api_call_succeeded = False
@@ -1187,9 +1279,19 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
             f'same_as_sent={same_as_sent}'
         )
 
+        if TWITTER_TRACE_VERIFY:
+            authors = [_primary_handle(t) for t in tweets]
+            print(
+                f"[twitter_trace] tweetside p={page_idx} tweet_id={tweet_id} "
+                f"target={target} reply_count={len(tweets)} reply_authors={authors[:10]} "
+                f"match_found={any(_matches_target(t, target) for t in tweets)}"
+            )
+
         # Match against the target — short-circuits the whole verify.
         for t in tweets:
             if _matches_target(t, target):
+                reply_id = _id_str(t.get('id') or t.get('id_str'))
+                print(f'[twitter] match found method=tweetside page={page_idx} reply_id={reply_id}')
                 print(f'[twitter] check_comment tweetside: MATCH for @{target} on page {page_idx} '
                       f'(scanned {seen + len(tweets)} replies)')
                 return {'verified': True, 'reason': 'found_comment',
@@ -1236,7 +1338,7 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
             # cursor, a stalled cursor, or after enough consecutive empties.
             cursor_advanced = bool(new_cursor) and not same_as_sent
             if len(tweets) == 0:
-                retrying = cursor_advanced and consecutive_empty < TWITTER_EMPTY_PAGE_TOLERANCE
+                retrying = cursor_advanced and consecutive_empty < empty_tol
                 print(
                     f'[twitter] empty page detected p={page_idx} '
                     f'cursor_advanced={cursor_advanced} has_next_raw={raw_has_next!r} '
@@ -1248,13 +1350,13 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
             if same_as_sent:
                 break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
                 break
-            if consecutive_empty >= TWITTER_EMPTY_PAGE_TOLERANCE:
+            if consecutive_empty >= empty_tol:
                 print(
                     f'[twitter] pagination giving up after {consecutive_empty} '
                     f'consecutive empty pages, total scanned={pages}, '
                     f'total tweets={seen}'
                 )
-                break_reason = f'empty_page_tolerance({TWITTER_EMPTY_PAGE_TOLERANCE})'
+                break_reason = f'empty_page_tolerance({empty_tol})'
                 break
             # has_next=False but cursor is live and under tolerance → keep paging.
         else:
@@ -1277,6 +1379,8 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
 
         sent_cursor = new_cursor
 
+    if break_reason.startswith('page_cap'):
+        print(f'[twitter] max_pages limit reached (deep_mode={TWITTER_DEEP_PAGINATION})')
     elapsed = time.monotonic() - started_at
     print(f'[twitter] check_comment tweetside: stop reason={break_reason} '
           f'after {pages} pages, {seen} replies, {elapsed:.1f}s')
@@ -1289,6 +1393,118 @@ async def _check_comment_tweetside(tweet_id: str, target: str) -> dict:
             f'total={len(scanned_usernames)} unique={len(seen_handles)}'
         )
     return {'verified': False, 'reason': 'no_comment_found',
+            'seen': seen, 'pages': pages, 'api_calls': pages}
+
+
+async def _check_comment_conversation(tweet_id: str, target: str) -> dict:
+    """Conversation-thread reply scan (TWITTER_CONVERSATION_FALLBACK).
+
+    Pages /twitter/tweet/replies keyed by conversationId + includeReplies so
+    replies that live deeper in the thread than the direct replies list are
+    still seen. Mirrors the resilient pagination + cursor-advance-guard +
+    deep-mode behavior of the direct tweet-side scan. Expects target already
+    normalized. Returns the same shape as _check_comment_tweetside."""
+    sent_cursor: Optional[str] = None
+    seen               = 0
+    pages              = 0
+    max_pages          = _REPLIES_MAX_PAGES * 2 if TWITTER_DEEP_PAGINATION else _REPLIES_MAX_PAGES
+    empty_tol          = _DEEP_EMPTY_PAGE_TOLERANCE
+    started_at         = time.monotonic()
+    deadline           = started_at + _PAGINATION_BUDGET_S
+    api_call_succeeded = False
+    consecutive_empty  = 0
+    break_reason       = f'page_cap({max_pages})'
+
+    for page_idx0 in range(max_pages):
+        page_idx = page_idx0 + 1
+        if time.monotonic() > deadline:
+            break_reason = f'time_budget({_PAGINATION_BUDGET_S}s)'
+            break
+
+        params: dict = {'tweetId': str(tweet_id),
+                        'conversationId': str(tweet_id),
+                        'includeReplies': 'true'}
+        if sent_cursor:
+            params['cursor'] = sent_cursor
+
+        data = await _api_get('/twitter/tweet/replies', params, timeout=30.0)
+        if data is None:
+            if not api_call_succeeded:
+                return {'verified': None, 'reason': 'api_error',
+                        'seen': 0, 'pages': 0, 'api_calls': 1}
+            break_reason = 'api_error_midstream'
+            break
+
+        api_call_succeeded = True
+        pages += 1
+        tweets = data.get('tweets') or data.get('replies') or data.get('data') or []
+        if not isinstance(tweets, list):
+            tweets = []
+
+        raw_has_next = data.get('has_next_page')
+        if raw_has_next is None:
+            raw_has_next = data.get('hasNextPage')
+        parsed_has_next = _parse_has_next(raw_has_next)
+        new_cursor, cursor_src = _read_next_cursor(data, sent_cursor)
+        same_as_sent = (
+            new_cursor is not None and sent_cursor is not None
+            and new_cursor == sent_cursor
+        )
+
+        print(
+            f'[twitter] check_comment conversation p{page_idx}: '
+            f'replies={len(tweets)} has_next_parsed={parsed_has_next} '
+            f'next_cursor={_cursor_preview(new_cursor)} src={cursor_src!r} '
+            f'same_as_sent={same_as_sent}'
+        )
+        if TWITTER_TRACE_VERIFY:
+            authors = [_primary_handle(t) for t in tweets]
+            print(
+                f"[twitter_trace] conversation p={page_idx} tweet_id={tweet_id} "
+                f"target={target} reply_count={len(tweets)} reply_authors={authors[:10]} "
+                f"match_found={any(_matches_target(t, target) for t in tweets)}"
+            )
+
+        for t in tweets:
+            if _matches_target(t, target):
+                reply_id = _id_str(t.get('id') or t.get('id_str'))
+                print(f'[twitter] match found method=conversation page={page_idx} reply_id={reply_id}')
+                return {'verified': True, 'reason': 'found_comment_conversation',
+                        'seen': seen + len(tweets), 'pages': page_idx,
+                        'api_calls': page_idx}
+
+        seen += len(tweets)
+        if len(tweets) == 0:
+            consecutive_empty += 1
+        else:
+            consecutive_empty = 0
+
+        if TWITTER_CURSOR_ADVANCE_GUARD:
+            if new_cursor is not None and sent_cursor is not None and new_cursor == sent_cursor:
+                break_reason = 'cursor_advance_guard(stuck_same_as_previous)'
+                break
+            if not new_cursor and len(tweets) == 0:
+                break_reason = 'cursor_advance_guard(genuinely_ended)'
+                break
+
+        if not new_cursor:
+            break_reason = f'no_next_cursor(src={cursor_src!r})'
+            break
+        if same_as_sent:
+            break_reason = 'cursor_not_advancing(api_returned_same_cursor)'
+            break
+        if consecutive_empty >= empty_tol:
+            break_reason = f'empty_page_tolerance({empty_tol})'
+            break
+
+        sent_cursor = new_cursor
+
+    if break_reason.startswith('page_cap'):
+        print(f'[twitter] max_pages limit reached (deep_mode={TWITTER_DEEP_PAGINATION})')
+    elapsed = time.monotonic() - started_at
+    print(f'[twitter] check_comment conversation: stop reason={break_reason} '
+          f'after {pages} pages, {seen} replies, {elapsed:.1f}s')
+    return {'verified': False, 'reason': 'no_comment_conversation',
             'seen': seen, 'pages': pages, 'api_calls': pages}
 
 
