@@ -203,6 +203,17 @@ TWITTER_MENTIONS_FALLBACK = (
 )
 # How many mention timeline pages to scan, newest first, before giving up.
 _MENTIONS_MAX_PAGES = max(1, int(os.getenv('TWITTER_MENTIONS_MAX_PAGES', '5') or 5))
+# TWITTER_TWEET_TIMELINE_FALLBACK: primary userside method. /twitter/user/tweet_timeline
+# reads the profile page data source, which stays fresh for high volume accounts
+# whose /user/last_tweets search index goes stale (TwitterAPI.io confirmed the
+# two endpoints read different sources). When on, this runs at the very start of
+# the userside chain and the existing last_tweets path becomes its fallback.
+# Default off so it stays inert until explicitly enabled.
+TWITTER_TWEET_TIMELINE_FALLBACK = (
+    (os.getenv('TWITTER_TWEET_TIMELINE_FALLBACK', 'false') or 'false').strip().lower() == 'true'
+)
+# How many tweet_timeline pages to scan, newest first, before giving up.
+_TIMELINE_MAX_PAGES = max(1, int(os.getenv('TWITTER_TIMELINE_MAX_PAGES', '5') or 5))
 
 print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'retweeters cap={_RETWEETERS_MAX_PAGES} '
@@ -221,7 +232,9 @@ print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'deep_empty_tol={_DEEP_EMPTY_PAGE_TOLERANCE} '
       f'conversation_fallback={TWITTER_CONVERSATION_FALLBACK} '
       f'mentions_fallback={TWITTER_MENTIONS_FALLBACK} '
-      f'mentions_max_pages={_MENTIONS_MAX_PAGES}')
+      f'mentions_max_pages={_MENTIONS_MAX_PAGES} '
+      f'tweet_timeline_fallback={TWITTER_TWEET_TIMELINE_FALLBACK} '
+      f'timeline_max_pages={_TIMELINE_MAX_PAGES}')
 
 
 # ── User-tweets cache (single fetch reused across one finalize batch) ────────
@@ -1093,6 +1106,59 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
     fallback_via    = 'skipped'
     fallback_result = 'skipped'
 
+    # Lazily resolved shared context for the id based userside paths (timeline
+    # and mentions). Both need the target tweet object and the replying user's
+    # numeric id. We resolve once and reuse so we never pay for the target tweet
+    # fetch or the user id lookup twice in a single verify.
+    _idside_ctx = {'resolved': False, 'target_obj': None, 'expected_user_id': ''}
+
+    async def _resolve_idside_context() -> dict:
+        nonlocal api_calls
+        if _idside_ctx['resolved']:
+            return _idside_ctx
+        _idside_ctx['resolved'] = True
+        fetched = await fetch_tweets_by_ids([tweet_id])
+        api_calls += 1
+        if fetched:
+            _idside_ctx['target_obj'] = fetched[0]
+        info = await lookup_twitter_user_by_login(target)
+        api_calls += 1
+        if info:
+            _idside_ctx['expected_user_id'] = _id_str(info.get('id'))
+        return _idside_ctx
+
+    # PRIMARY USERSIDE (TWITTER_TWEET_TIMELINE_FALLBACK): /twitter/user/tweet_timeline
+    # reads the profile page data source, which stays fresh for high volume
+    # accounts whose /user/last_tweets search index goes stale. We try it at the
+    # very start of the userside chain so the roughly ten percent of users that
+    # last_tweets cannot see are matched here, before spending the probe,
+    # tweetside, conversation and mentions budget. Falls through to the existing
+    # last_tweets userside path on error, empty or no match. Inert when the flag
+    # is off, so behavior with the flag off is identical to before.
+    if TWITTER_TWEET_TIMELINE_FALLBACK:
+        ctx = await _resolve_idside_context()
+        if ctx['target_obj'] is not None and ctx['expected_user_id']:
+            tl = await check_comment_timelineside(
+                ctx['target_obj'], ctx['expected_user_id'], target)
+            api_calls += int(tl.get('api_calls') or 0)
+            if tl.get('verified') is True:
+                primary_via = 'user_side_via_tweet_timeline'
+                print(f'[twitter] match found method=timelineside '
+                      f"reply_id={tl.get('matched_tweet_id')}")
+                _log_verify_summary(
+                    'check_comment', tweet_id, target,
+                    primary_via=primary_via, primary_result='match',
+                    fallback_via='skipped', fallback_result='skipped',
+                    api_calls=api_calls, result='match',
+                )
+                return {'verified': True, 'reason': 'found_comment_timelineside'}
+        else:
+            # The summary line must appear every time the fallback runs, even on
+            # the skip path where we could not fetch the target tweet or the id.
+            print(f'[twitter] timelineside target_tweet={tweet_id} '
+                  f'target_user={target} pages_scanned=0 candidates_found=0 '
+                  f'result=skipped_no_target_or_userid')
+
     # ── EAGER probe (cached per process). At the first comment verify this
     # spends 1+ API calls to find a replies-capable endpoint; every later
     # verify reads the cached winner instantly.
@@ -1176,16 +1242,11 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
     # confirm. This whole block is inert when the flag is off, so behavior with
     # the flag off is identical to before.
     if TWITTER_MENTIONS_FALLBACK:
-        target_obj = None
-        fetched = await fetch_tweets_by_ids([tweet_id])
-        api_calls += 1
-        if fetched:
-            target_obj = fetched[0]
-        expected_user_id = ''
-        info = await lookup_twitter_user_by_login(target)
-        api_calls += 1
-        if info:
-            expected_user_id = _id_str(info.get('id'))
+        # Reuse the shared id based context so the target tweet fetch and the
+        # user id lookup are not repeated if the timeline path already ran them.
+        ctx = await _resolve_idside_context()
+        target_obj = ctx['target_obj']
+        expected_user_id = ctx['expected_user_id']
         if target_obj is not None:
             ms = await check_comment_mentionside(target_obj, expected_user_id, target)
             api_calls += int(ms.get('api_calls') or 0)
@@ -1882,6 +1943,207 @@ async def check_comment_mentionside(
                 'pages': pages, 'candidates': candidates, 'api_calls': api_calls}
     return {'verified': False, 'reason': 'no_comment_mentionside',
             'method': 'mentionside', 'pages': pages,
+            'candidates': candidates, 'api_calls': api_calls}
+
+
+async def fetch_user_tweet_timeline(
+    user_id, include_replies: bool = True, include_parent_tweet: bool = False,
+    cursor: Optional[str] = None,
+) -> dict:
+    """Fetch one page of a user's profile page timeline from
+    /twitter/user/tweet_timeline.
+
+    This endpoint reads the profile page data source, which stays fresh for high
+    volume accounts whose /user/last_tweets search index goes stale. The required
+    identifier is the numeric userId, not the userName.
+
+    Returns {'tweets': list, 'has_next_page': bool, 'next_cursor': Optional[str]}.
+    Empty list and no next page on any error. The tweets list can arrive nested
+    under data.tweets or at the top level, so we parse defensively with the same
+    helper the last_tweets path uses."""
+    uid = _id_str(user_id)
+    if not uid:
+        return {'tweets': [], 'has_next_page': False, 'next_cursor': None}
+
+    params: dict = {
+        'userId': uid,
+        'includeReplies': 'true' if include_replies else 'false',
+        'includeParentTweet': 'true' if include_parent_tweet else 'false',
+    }
+    if cursor:
+        params['cursor'] = cursor
+
+    data = await _api_get('/twitter/user/tweet_timeline', params, timeout=30.0)
+    if data is None:
+        return {'tweets': [], 'has_next_page': False, 'next_cursor': None}
+
+    # Defensive parse: the documented shape nests the tweets list under
+    # data.tweets, but tolerate the top level shapes too. _extract_tweets_from_payload
+    # already probes both nested and top level carriers and reports which path
+    # matched, which we surface in the trace line.
+    tweets, extract_path = _extract_tweets_from_payload(data)
+    if not isinstance(tweets, list):
+        tweets = []
+
+    raw_has_next = data.get('has_next_page')
+    if raw_has_next is None:
+        raw_has_next = data.get('hasNextPage')
+    parsed_has_next = _parse_has_next(raw_has_next)
+    next_cursor, cursor_src = _read_next_cursor(data, cursor)
+    # has_next_page and next_cursor are siblings of data at the top level in the
+    # documented shape, but tolerate a nested envelope just in case.
+    if next_cursor is None and isinstance(data.get('data'), dict):
+        next_cursor, cursor_src = _read_next_cursor(data['data'], cursor)
+        if parsed_has_next is None:
+            inner_has_next = data['data'].get('has_next_page')
+            if inner_has_next is None:
+                inner_has_next = data['data'].get('hasNextPage')
+            parsed_has_next = _parse_has_next(inner_has_next)
+
+    if TWITTER_TRACE_VERIFY:
+        print(
+            f"[twitter_trace] timeline_page userId={uid} sent_cursor="
+            f"{_cursor_preview(cursor)} tweets={len(tweets)} path={extract_path!r} "
+            f"has_next={parsed_has_next} next_cursor={_cursor_preview(next_cursor)} "
+            f"src={cursor_src!r}"
+        )
+
+    return {
+        'tweets': tweets,
+        'has_next_page': bool(parsed_has_next),
+        'next_cursor': next_cursor,
+    }
+
+
+async def check_comment_timelineside(
+    target_tweet: dict, expected_user_id: str, expected_username: str,
+) -> dict:
+    """Timeline based comment verification.
+
+    Queries the replying user's profile page timeline by numeric userId via
+    /twitter/user/tweet_timeline, which stays fresh for high volume accounts
+    whose /user/last_tweets search index has gone stale. Looks for a reply by
+    the expected user that links to the target tweet, newest first, then
+    confirms the candidate with a direct id lookup before accepting it.
+
+    target_tweet must carry at least its id, its author id and createdAt. Author
+    identity is by numeric id, which is the whole point of this path: it works
+    for accounts whose userName keyed last_tweets view is frozen.
+
+    Returns a structured result: a match carries verified True, the matched
+    tweet id and method 'timelineside'; otherwise verified False with a reason.
+    Always emits a single production summary line, and when TWITTER_TRACE_VERIFY
+    is on it logs every page and every accept or reject with the field that
+    decided it."""
+    target_id = ''
+    target_author_id = ''
+    target_created: Optional[float] = None
+    if isinstance(target_tweet, dict):
+        target_id = _id_str(target_tweet.get('id') or target_tweet.get('id_str'))
+        target_author_id = _author_id(target_tweet)
+        target_created = _parse_tweet_time(
+            target_tweet.get('createdAt') or target_tweet.get('created_at'))
+    exp_user = normalize_username(expected_username)
+    exp_uid  = _id_str(expected_user_id)
+
+    pages = 0
+    candidates = 0
+    api_calls = 0
+    matched_id: Optional[str] = None
+    result = 'no_match'
+
+    if not target_id or not exp_uid:
+        print(f'[twitter] timelineside target_tweet={target_id or "?"} '
+              f'target_user={exp_user} pages_scanned=0 candidates_found=0 '
+              f'result=skipped_no_target_or_userid')
+        return {'verified': False, 'reason': 'timelineside_no_target_or_userid',
+                'method': 'timelineside', 'pages': 0, 'candidates': 0, 'api_calls': 0}
+
+    started_at = time.monotonic()
+    deadline   = started_at + _PAGINATION_BUDGET_S
+    cursor: Optional[str] = None
+
+    for page_idx0 in range(_TIMELINE_MAX_PAGES):
+        if time.monotonic() > deadline:
+            break
+        page_idx = page_idx0 + 1
+
+        res = await fetch_user_tweet_timeline(exp_uid, include_replies=True, cursor=cursor)
+        api_calls += 1
+        tweets = res.get('tweets') or []
+        pages += 1
+
+        page_oldest: Optional[float] = None
+        for tw in tweets:
+            t_created = _parse_tweet_time(
+                tw.get('createdAt') or tw.get('created_at'))
+            if t_created is not None:
+                page_oldest = (t_created if page_oldest is None
+                               else min(page_oldest, t_created))
+
+            is_match, decided = _mention_reply_matches(
+                tw, target_id, target_author_id, exp_uid, expected_username)
+            cand_id = _id_str(tw.get('id') or tw.get('id_str'))
+            if not is_match:
+                if TWITTER_TRACE_VERIFY:
+                    print(f"[twitter_trace] timelineside reject page={page_idx} "
+                          f"tweet_id={cand_id or 'none'} decided_by={decided}")
+                continue
+
+            candidates += 1
+            if TWITTER_TRACE_VERIFY:
+                print(f"[twitter_trace] timelineside accept page={page_idx} "
+                      f"tweet_id={cand_id} decided_by={decided}")
+
+            # Confirm the candidate with a direct id lookup. This guards against
+            # transient field gaps in the timeline listing.
+            confirmed = await fetch_tweets_by_ids([cand_id])
+            api_calls += 1
+            conf_tw = confirmed[0] if confirmed else None
+            if conf_tw is None:
+                if TWITTER_TRACE_VERIFY:
+                    print(f"[twitter_trace] timelineside confirm_reject "
+                          f"tweet_id={cand_id} decided_by=confirm_lookup_empty")
+                continue
+            c_match, c_decided = _mention_reply_matches(
+                conf_tw, target_id, target_author_id, exp_uid, expected_username)
+            if c_match:
+                matched_id = cand_id
+                result = 'match'
+                if TWITTER_TRACE_VERIFY:
+                    print(f"[twitter_trace] timelineside confirm_accept "
+                          f"tweet_id={cand_id} decided_by={c_decided}")
+                break
+            if TWITTER_TRACE_VERIFY:
+                print(f"[twitter_trace] timelineside confirm_reject "
+                      f"tweet_id={cand_id} decided_by={c_decided}")
+
+        if matched_id is not None:
+            break
+
+        # Timelines are descending chronological, so once the oldest tweet on
+        # the page predates the target tweet nothing older can match.
+        if (target_created is not None and page_oldest is not None
+                and page_oldest < target_created):
+            if TWITTER_TRACE_VERIFY:
+                print(f"[twitter_trace] timelineside early_stop page={page_idx} "
+                      f"page_oldest_predates_target")
+            break
+
+        next_cursor = res.get('next_cursor')
+        if not res.get('has_next_page') or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    print(f'[twitter] timelineside target_tweet={target_id} target_user={exp_user} '
+          f'pages_scanned={pages} candidates_found={candidates} result={result}')
+
+    if matched_id is not None:
+        return {'verified': True, 'reason': 'found_comment_timelineside',
+                'matched_tweet_id': matched_id, 'method': 'timelineside',
+                'pages': pages, 'candidates': candidates, 'api_calls': api_calls}
+    return {'verified': False, 'reason': 'no_comment_timelineside',
+            'method': 'timelineside', 'pages': pages,
             'candidates': candidates, 'api_calls': api_calls}
 
 
