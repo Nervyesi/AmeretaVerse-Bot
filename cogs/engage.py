@@ -163,6 +163,33 @@ def _compute_earned(results: dict, claims: dict, ratios: dict, total: int) -> in
     return earned
 
 
+def _clean_tweet_url(raw) -> str:
+    """Return a clean, single token tweet URL safe to drop into a Discord
+    markdown link.
+
+    Some submissions were stored with extra text in front of the URL, for
+    example a copied timestamp like 'Saturday, June 13, 2026 12:29 https://...'.
+    The submit validators match a status id anywhere in the string, so that
+    junk passed validation and was stored verbatim, then broke the markdown
+    link because of the embedded spaces. We rebuild the canonical
+    https://x.com/<author>/status/<id> form from the parts our existing
+    extractors already recognize. A value that is already a clean single token
+    URL is returned untouched so well formed rows keep their original casing.
+    If the value cannot be parsed we fall back to the first URL looking token,
+    then to the stripped raw value, so a link is always produced."""
+    raw = (raw or '').strip()
+    if raw.startswith(('http://', 'https://')) and ' ' not in raw:
+        return raw
+    tweet_id = extract_tweet_id(raw)
+    author   = extract_author_from_tweet_url(raw)
+    if tweet_id and author:
+        return f'https://x.com/{author}/status/{tweet_id}'
+    for tok in raw.split():
+        if tok.startswith(('http://', 'https://')):
+            return tok
+    return raw
+
+
 def _session_embed(session: dict, pool: dict) -> discord.Embed:
     idx   = session['index']
     queue = session['queue']
@@ -181,7 +208,7 @@ def _session_embed(session: dict, pool: dict) -> discord.Embed:
     embed = discord.Embed(
         title  = f'Engage — {idx + 1} / {len(queue)}',
         description = (
-            f'**[Open Tweet]({sub["tweet_url"]})**\n'
+            f'**[Open Tweet]({_clean_tweet_url(sub.get("tweet_url"))})**\n'
             f'By: @{sub.get("submitter_x_username") or "unknown"}\n\n'
             f'**Selected tasks:** {sel_str}\n\n'
             'Toggle tasks below. Click ✅ Done & Next (or ✅ Finish on the last tweet).'
@@ -407,7 +434,7 @@ def _session_intro_embed(session: dict, pool: dict) -> discord.Embed:
     list_lines = []
     for i, sub in enumerate(queue, 1):
         submitter = sub.get('submitter_x_username') or 'unknown'
-        url       = sub.get('tweet_url') or ''
+        url       = _clean_tweet_url(sub.get('tweet_url'))
         list_lines.append(f'**{i}.** [@{submitter}]({url})')
 
     description = (
@@ -803,13 +830,19 @@ class EngageCog(commands.Cog, name='Engage'):
             )
             return
 
+        # Canonicalize before storing so pasted junk (for example a copied
+        # timestamp in front of the URL) never reaches the DB. The render side
+        # sanitizes too, as defense in depth, but cleaning at ingestion keeps
+        # the stored value correct in the first place.
+        clean_url = _clean_tweet_url(tweet_url)
+
         # Deduct cost BEFORE creating submission (atomic)
         upsert_engage_user_points(str(guild_id), pool['pool_id'], str(user_id),
                                   delta_points=-cost, delta_submitted=1)
         try:
             sub = create_engage_submission(
                 str(guild_id), pool['pool_id'], str(user_id),
-                tweet_url.strip(), tweet_id, x_username,
+                clean_url, tweet_id, x_username,
                 cost, pool.get('ttl_hours'),
             )
         except Exception as e:
