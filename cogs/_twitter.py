@@ -214,6 +214,18 @@ TWITTER_TWEET_TIMELINE_FALLBACK = (
 )
 # How many tweet_timeline pages to scan, newest first, before giving up.
 _TIMELINE_MAX_PAGES = max(1, int(os.getenv('TWITTER_TIMELINE_MAX_PAGES', '5') or 5))
+# TWITTER_USE_ONLY_TIMELINESIDE: the simplified comment verify chain. When true
+# (the default), check_comment runs ONLY the timelineside method: resolve the
+# target tweet and the replying user's id, scan /twitter/user/tweet_timeline,
+# and return that verdict. Production monitoring confirmed timelineside matched
+# 50+ verifies in 1 to 5 pages each with verify time around 3 seconds, so the
+# legacy last_tweets, tweetside, conversation and mentions paths are redundant
+# spend. When false, the full legacy multi method chain runs exactly as before
+# this change. Set TWITTER_USE_ONLY_TIMELINESIDE=false in Railway to roll back
+# to the legacy chain without a redeploy.
+TWITTER_USE_ONLY_TIMELINESIDE = (
+    (os.getenv('TWITTER_USE_ONLY_TIMELINESIDE', 'true') or 'true').strip().lower() == 'true'
+)
 
 print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'retweeters cap={_RETWEETERS_MAX_PAGES} '
@@ -234,7 +246,8 @@ print(f'[twitter] replies cap={_REPLIES_MAX_PAGES} '
       f'mentions_fallback={TWITTER_MENTIONS_FALLBACK} '
       f'mentions_max_pages={_MENTIONS_MAX_PAGES} '
       f'tweet_timeline_fallback={TWITTER_TWEET_TIMELINE_FALLBACK} '
-      f'timeline_max_pages={_TIMELINE_MAX_PAGES}')
+      f'timeline_max_pages={_TIMELINE_MAX_PAGES} '
+      f'use_only_timelineside={TWITTER_USE_ONLY_TIMELINESIDE}')
 
 
 # ── User-tweets cache (single fetch reused across one finalize batch) ────────
@@ -1069,7 +1082,13 @@ def _log_verify_summary(
 async def check_comment(tweet_id: str, target_username: str) -> dict:
     """Verify @target_username replied to tweet_id.
 
-    Order: USER-SIDE FIRST via a probed replies-bearing endpoint, TWEET-SIDE
+    TWITTER_USE_ONLY_TIMELINESIDE (default true) selects the chain. When true
+    the chain is timelineside only: resolve the target tweet and the replying
+    user's id, scan /twitter/user/tweet_timeline, return that verdict. When
+    false the legacy multi method chain below runs exactly as it did before
+    this flag existed, which is the no redeploy rollback path.
+
+    Legacy chain order: USER-SIDE FIRST via a probed replies-bearing endpoint, TWEET-SIDE
     as safety-net fallback. The probe runs ONCE per process at the first
     comment verify; the winner is cached. Production proved:
       • /twitter/user/last_tweets with includeReplies=true returns user replies
@@ -1092,7 +1111,7 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
       probe unavailable, tweet_side None                      -> None  (inconclusive)
     """
     print(f'[twitter] check_comment: tweet={tweet_id} target={target_username} '
-          f'order=userside_first(probe_eager)')
+          f'order={"timelineside_only" if TWITTER_USE_ONLY_TIMELINESIDE else "userside_first(probe_eager)"}')
     if TWITTER_TRACE_VERIFY:
         print(f"[twitter_trace] verify_start tweet_id={tweet_id} target={target_username}")
     target = normalize_username(target_username)
@@ -1127,6 +1146,52 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             _idside_ctx['expected_user_id'] = _id_str(info.get('id'))
         return _idside_ctx
 
+    # ── SIMPLIFIED CHAIN (TWITTER_USE_ONLY_TIMELINESIDE, default true) ───────
+    # Production monitoring proved timelineside alone matches reliably in 1 to 5
+    # pages, so by default we run only it and return its verdict. Everything
+    # below this block is the legacy multi method chain, kept intact and run
+    # only when the flag is false, which gives the owner a no redeploy rollback
+    # from Railway.
+    if TWITTER_USE_ONLY_TIMELINESIDE:
+        ctx = await _resolve_idside_context()
+        if ctx['target_obj'] is None or not ctx['expected_user_id']:
+            # Could not fetch the target tweet or resolve the user id. That is
+            # an API level failure, not evidence the comment is absent, so the
+            # verdict is inconclusive and the caller must not flag.
+            print(f'[twitter] timelineside target_tweet={tweet_id} '
+                  f'target_user={target} pages_scanned=0 candidates_found=0 '
+                  f'result=skipped_no_target_or_userid')
+            _log_verify_summary(
+                'check_comment', tweet_id, target,
+                primary_via='user_side_via_tweet_timeline', primary_result='skipped',
+                fallback_via='skipped', fallback_result='skipped',
+                api_calls=api_calls, result='inconclusive',
+            )
+            return {'verified': None, 'reason': 'timelineside_context_unresolved'}
+
+        tl = await check_comment_timelineside(
+            ctx['target_obj'], ctx['expected_user_id'], target)
+        api_calls += int(tl.get('api_calls') or 0)
+        if tl.get('verified') is True:
+            print(f'[twitter] match found method=timelineside '
+                  f"reply_id={tl.get('matched_tweet_id')}")
+            _log_verify_summary(
+                'check_comment', tweet_id, target,
+                primary_via='user_side_via_tweet_timeline', primary_result='match',
+                fallback_via='skipped', fallback_result='skipped',
+                api_calls=api_calls, result='match',
+            )
+            return {'verified': True, 'reason': 'found_comment_timelineside'}
+        _log_verify_summary(
+            'check_comment', tweet_id, target,
+            primary_via='user_side_via_tweet_timeline', primary_result='no_match',
+            fallback_via='skipped', fallback_result='skipped',
+            api_calls=api_calls, result='no_match',
+        )
+        return {'verified': False,
+                'reason': tl.get('reason') or 'no_comment_timelineside'}
+
+    # ── LEGACY CHAIN (runs only when TWITTER_USE_ONLY_TIMELINESIDE=false) ────
     # PRIMARY USERSIDE (TWITTER_TWEET_TIMELINE_FALLBACK): /twitter/user/tweet_timeline
     # reads the profile page data source, which stays fresh for high volume
     # accounts whose /user/last_tweets search index goes stale. We try it at the
