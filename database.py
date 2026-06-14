@@ -2991,6 +2991,38 @@ def get_engage_action(submission_id: int, engager_user_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def get_engage_submission_by_tweet(guild_id, tweet_id, submitter_user_id=None) -> dict | None:
+    """Return the engage submission for (guild, tweet), most recent first.
+
+    When submitter_user_id is given the match is additionally scoped to that
+    submitter, used by /my-engagers-list so a caller only sees their own tweet.
+    All ids are bound as strings to match the string snowflake storage."""
+    clause = ''
+    params = [str(guild_id), str(tweet_id)]
+    if submitter_user_id is not None:
+        clause = ' AND submitter_user_id=?'
+        params.append(str(submitter_user_id))
+    with get_connection() as conn:
+        row = conn.execute(
+            f"""SELECT * FROM engage_submissions
+                WHERE guild_id=? AND tweet_id=?{clause}
+                ORDER BY submitted_at DESC LIMIT 1""",
+            params,
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_engage_engagers(guild_id, submission_id: int) -> list:
+    """All engage_actions rows for a submission, guild scoped. One row per
+    engager (UNIQUE(submission_id, engager_user_id))."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM engage_actions WHERE guild_id=? AND submission_id=?",
+            (str(guild_id), submission_id),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def upsert_engage_action(
     guild_id: str, pool_id: int, submission_id: int, engager_user_id: str,
     engager_x_username: str,

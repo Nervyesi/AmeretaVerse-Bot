@@ -56,6 +56,14 @@ from database import (
 from cogs._utils import resolve_channel, resolve_role
 from cogs._branding import build_branded_embed, PREMIUM_GUILD_IDS
 from cogs._twitter import extract_tweet_id
+from cogs._engagers_view import (
+    GOLD as ENGAGERS_GOLD,
+    PAGE_SIZE as ENGAGERS_PAGE_SIZE,
+    sort_engagers,
+    build_page_embed,
+    EngagersView,
+    _NO_PING,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MANUAL_CHECK_DAILY_LIMIT = 10
@@ -1288,13 +1296,50 @@ class RaidsCog(commands.Cog, name='Raids'):
         ts        = datetime.now().strftime('%Y%m%d_%H%M')
         filename  = f'raid_{display_num}_participants_{ts}.csv'
 
-        await interaction.followup.send(
+        # Clean paginated embed read directly in Discord, with the CSV kept as an
+        # attachment so the spreadsheet export workflow is preserved. Same shared
+        # format, sort order and pager as the engage engagers commands.
+        title   = 'Engagers for this raid'
+        entries = sort_engagers(_build_raid_engager_entries(guild_id, raid_id, resolved))
+        embed   = await build_page_embed(
+            interaction.guild, interaction.client, entries, 0, title, ENGAGERS_GOLD,
+        )
+
+        send_kwargs = dict(
             content=(
-                f'✅ **Raid #{display_num}** — {len(csv_rows)} participants exported.\n'
-                'Open in Google Sheets (File → Import → Upload) or Excel.'
+                f'✅ **Raid #{display_num}** · {len(csv_rows)} participants. '
+                'CSV attached (open in Google Sheets via File, Import, Upload, or in Excel).'
             ),
+            embed=embed,
             file=discord.File(io.BytesIO(csv_bytes), filename=filename),
             ephemeral=True,
+            allowed_mentions=_NO_PING,
+        )
+        view = None
+        if len(entries) > ENGAGERS_PAGE_SIZE:
+            view = EngagersView(
+                entries=entries, title=title,
+                original_user_id=interaction.user.id, color=ENGAGERS_GOLD,
+            )
+            send_kwargs['view'] = view
+            send_kwargs['wait'] = True
+
+        msg = await interaction.followup.send(**send_kwargs)
+        if view is not None:
+            view.message = msg
+
+        log_event(
+            guild_id, 'bot_activity', 'raid_engagers_list',
+            f'Viewed engagers for raid #{display_num}',
+            actor_user_id=interaction.user.id,
+            actor_username=str(interaction.user),
+            module='raid', severity='info',
+            details={
+                'tweet_id': resolved.get('tweet_id'),
+                'raid_id': raid_id,
+                'engager_count': len(entries),
+                'is_admin': True,
+            },
         )
 
     @raid_group.command(name='leaderboard', description='Top raiders in this server')
@@ -2134,6 +2179,70 @@ def _build_raiders_csv_rows(guild_id: int, raid_id: int, raid: dict) -> tuple:
             rows.append(row)
 
     return fieldnames, rows
+
+
+def _build_raid_engager_entries(guild_id, raid_id: int, raid: dict) -> list:
+    """Per engager entries for the shared paginated list, mirroring the CSV
+    builder's enabled/claimed/verified logic. A task badge appears only when it
+    was enabled for the raid, claimed by the engager, and not conclusively
+    verified false. Completeness is the count of such badges. Raid participation
+    stores no reply permalink, so the comment badge carries no [reply] link."""
+    try:
+        allowed = json.loads(raid.get('tasks_json') or '{}')
+    except Exception:
+        allowed = {'like': True, 'comment': True, 'retweet': True}
+    if not any(allowed.values()):
+        allowed = {'like': True, 'comment': True, 'retweet': True}
+
+    entries = []
+    with get_connection() as conn:
+        parts = conn.execute("""
+            SELECT p.*, u.username, u.x_username
+            FROM raid_participation p
+            LEFT JOIN users u ON CAST(u.user_id AS TEXT) = CAST(p.user_id AS TEXT)
+            WHERE p.guild_id=? AND p.raid_id=?
+            ORDER BY p.created_at ASC
+        """, (str(guild_id), raid_id)).fetchall()
+
+        for p in parts:
+            p = dict(p)
+            try:
+                claimed = json.loads(p.get('tasks_claimed') or '{}')
+                if isinstance(claimed, list):
+                    claimed = {t: True for t in claimed}
+            except Exception:
+                claimed = {}
+
+            verif_rows = conn.execute("""
+                SELECT task, verified FROM raid_verification_log
+                WHERE guild_id=? AND raid_id=? AND user_id=?
+                ORDER BY checked_at DESC
+            """, (str(guild_id), raid_id, p['user_id'])).fetchall()
+            verif_map = {}
+            for v in verif_rows:
+                if v['task'] not in verif_map:
+                    verif_map[v['task']] = v['verified']
+
+            badges       = []
+            completeness = 0
+            for task in ('like', 'comment', 'retweet'):
+                if not allowed.get(task):
+                    continue
+                if not claimed.get(task):
+                    continue
+                if verif_map.get(task) == 0:   # conclusively not done
+                    continue
+                completeness += 1
+                badges.append(f'✅ {task}')
+
+            entries.append({
+                'user_id':      str(p.get('user_id')),
+                'x_handle':     (p.get('x_username') or '').lstrip('@').strip(),
+                'badges':       badges,
+                'completeness': completeness,
+                'ts':           p.get('created_at') or '',
+            })
+    return entries
 
 
 async def setup(bot):

@@ -38,6 +38,8 @@ from database import (
     reset_engage_pool_daily,
     get_user_daily_engage_submissions,
     get_engage_action,
+    get_engage_submission_by_tweet,
+    list_engage_engagers,
     upsert_engage_action,
     mark_engage_deprioritized,
     add_engage_verification_log,
@@ -56,6 +58,14 @@ from cogs._twitter import (
     lookup_twitter_user_by_login,
 )
 from cogs._branding import build_branded_embed
+from cogs._engagers_view import (
+    GOLD as ENGAGERS_GOLD,
+    PAGE_SIZE as ENGAGERS_PAGE_SIZE,
+    sort_engagers,
+    build_page_embed,
+    EngagersView,
+    _NO_PING,
+)
 from cogs.raidbot import LIVE_VERIFICATION_GUILD_IDS, _normalize_point_ratio
 
 AMERETAVERSE_GUILD_ID = 1199707792706117642
@@ -701,6 +711,64 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
             await interaction.response.edit_message(content=None, embed=embed, view=None)
 
 
+# ── Engagers list helpers (shared paginated format) ─────────────────────────
+
+def _build_engage_entries(guild_id, submission: dict) -> list:
+    """Build the per engager entry dicts for the shared paginated list.
+
+    A task badge appears only when it was ENABLED for the submission's pool, the
+    engager CLAIMED it, and it was not conclusively verified false. Completeness
+    is the count of such badges. Engage stores no reply permalink (the verify
+    flow never captures the matched reply id and cogs/_twitter.py is off limits),
+    so the comment badge carries no [reply] link here."""
+    pool    = get_engage_pool_by_id(submission['pool_id'])
+    enabled = _pool_allowed_tasks(pool) if pool else {'like': True, 'comment': True, 'retweet': True}
+    rows    = list_engage_engagers(guild_id, submission['submission_id'])
+
+    entries = []
+    for r in rows:
+        badges       = []
+        completeness = 0
+        for task in ('like', 'comment', 'retweet'):
+            if not enabled.get(task):
+                continue
+            if not r.get(f'{task}_claimed'):
+                continue
+            if r.get(f'{task}_verified') == 0:   # conclusively not done
+                continue
+            completeness += 1
+            badges.append(f'✅ {task}')
+        entries.append({
+            'user_id':      str(r.get('engager_user_id')),
+            'x_handle':     (r.get('engager_x_username') or '').lstrip('@').strip(),
+            'badges':       badges,
+            'completeness': completeness,
+            'ts':           r.get('created_at') or '',
+        })
+    return entries
+
+
+async def _send_engagers_list(interaction: discord.Interaction, entries: list, title: str) -> None:
+    entries = sort_engagers(entries)
+    embed   = await build_page_embed(
+        interaction.guild, interaction.client, entries, 0, title, ENGAGERS_GOLD,
+    )
+    if len(entries) > ENGAGERS_PAGE_SIZE:
+        view = EngagersView(
+            entries=entries, title=title,
+            original_user_id=interaction.user.id, color=ENGAGERS_GOLD,
+        )
+        msg = await interaction.followup.send(
+            embed=embed, view=view, ephemeral=True,
+            allowed_mentions=_NO_PING, wait=True,
+        )
+        view.message = msg
+    else:
+        await interaction.followup.send(
+            embed=embed, ephemeral=True, allowed_mentions=_NO_PING,
+        )
+
+
 # ── Cog ────────────────────────────────────────────────────────────────────
 
 class EngageCog(commands.Cog, name='Engage'):
@@ -929,6 +997,92 @@ class EngageCog(commands.Cog, name='Engage'):
         )
         embed.set_footer(text=f'{pool_name} Pool')
         await interaction.response.send_message(embed=embed)
+
+    # ── /my-engagers-list ──────────────────────────────────────────────────
+
+    @app_commands.command(
+        name='my-engagers-list',
+        description='See who engaged with a tweet you submitted to the engage pool.',
+    )
+    @app_commands.describe(tweet_url='Full tweet URL of your submission: https://x.com/.../status/...')
+    async def my_engagers_list_cmd(self, interaction: discord.Interaction, tweet_url: str):
+        guild_id = interaction.guild_id or 0
+        tweet_id = extract_tweet_id(tweet_url)
+        if not tweet_id:
+            await interaction.response.send_message(
+                '❌ Invalid tweet URL. Please use the full https://x.com/.../status/... link.',
+                ephemeral=True,
+            )
+            return
+
+        submission = get_engage_submission_by_tweet(
+            guild_id, tweet_id, submitter_user_id=interaction.user.id,
+        )
+        if not submission:
+            await interaction.response.send_message(
+                "That tweet wasn't submitted by you, or it isn't in any active "
+                "or closed engage pool you own.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        entries = _build_engage_entries(guild_id, submission)
+        log_event(
+            guild_id, 'bot_activity', 'engage_engagers_list',
+            f'Viewed engagers for own tweet {tweet_id}',
+            actor_user_id=interaction.user.id,
+            actor_username=str(interaction.user),
+            module='engage', severity='info',
+            details={'tweet_id': tweet_id, 'engager_count': len(entries), 'is_admin': False},
+        )
+        await _send_engagers_list(interaction, entries, 'Engagers for your tweet')
+
+    # ── /engagers-list (admin) ─────────────────────────────────────────────
+
+    @app_commands.command(
+        name='engagers-list',
+        description='Admin: see who engaged with any submitted tweet in this server.',
+    )
+    @app_commands.describe(tweet_url='Full tweet URL of the submission: https://x.com/.../status/...')
+    async def engagers_list_cmd(self, interaction: discord.Interaction, tweet_url: str):
+        perms    = getattr(interaction.user, 'guild_permissions', None)
+        is_admin = bool(perms and (perms.administrator or perms.manage_guild))
+        if not is_admin:
+            await interaction.response.send_message(
+                '⚠️ Admin only. You need the Manage Server permission.',
+                ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id or 0
+        tweet_id = extract_tweet_id(tweet_url)
+        if not tweet_id:
+            await interaction.response.send_message(
+                '❌ Invalid tweet URL. Please use the full https://x.com/.../status/... link.',
+                ephemeral=True,
+            )
+            return
+
+        submission = get_engage_submission_by_tweet(guild_id, tweet_id)
+        if not submission:
+            await interaction.response.send_message(
+                'No submission found for that tweet in this server.',
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        entries = _build_engage_entries(guild_id, submission)
+        log_event(
+            guild_id, 'bot_activity', 'engage_engagers_list',
+            f'Admin viewed engagers for tweet {tweet_id}',
+            actor_user_id=interaction.user.id,
+            actor_username=str(interaction.user),
+            module='engage', severity='info',
+            details={'tweet_id': tweet_id, 'engager_count': len(entries), 'is_admin': True},
+        )
+        await _send_engagers_list(interaction, entries, 'Engagers for submission')
 
     # ── Background tasks ───────────────────────────────────────────────────
 
