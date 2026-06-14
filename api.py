@@ -5608,6 +5608,371 @@ async def engage_pool_update(
     return updated
 
 
+# ── Wallet Collection endpoints (inside the Engage module) ────────────────────
+# Wallet Collections live under the Engage module's access gate, so admins who
+# can see Engage can manage wallet collections. Paths mirror the codebase
+# convention (/api/servers/{server_id}/...). Snowflakes stay strings throughout.
+
+from cogs._wallet_validation import SUPPORTED_CHAINS as _WALLET_CHAINS
+
+
+class _WalletCollectionCreate(BaseModel):
+    name: str
+    blockchain: Optional[str] = 'evm'
+    channel_id: Optional[str] = ''
+    required_role_id: Optional[str] = None
+    ping_role_ids: Optional[object] = None
+    embed_title: Optional[str] = None
+    embed_description: Optional[str] = None
+    embed_color: Optional[str] = None
+    button_label: Optional[str] = None
+    modal_title: Optional[str] = None
+    modal_field_label: Optional[str] = None
+    modal_placeholder: Optional[str] = None
+
+
+class _WalletCollectionUpdate(BaseModel):
+    name: Optional[str] = None
+    blockchain: Optional[str] = None
+    channel_id: Optional[str] = None
+    required_role_id: Optional[str] = None
+    ping_role_ids: Optional[object] = None
+    embed_title: Optional[str] = None
+    embed_description: Optional[str] = None
+    embed_color: Optional[str] = None
+    button_label: Optional[str] = None
+    modal_title: Optional[str] = None
+    modal_field_label: Optional[str] = None
+    modal_placeholder: Optional[str] = None
+
+
+def _wallet_collection_to_dict(c: dict) -> dict:
+    """Hydrate a collection row for the dashboard: parse ping_role_ids JSON,
+    expose color as '#RRGGBB', stringify snowflakes, surface submission_count."""
+    try:
+        ping = json.loads(c.get('ping_role_ids') or '[]')
+        if not isinstance(ping, list):
+            ping = []
+    except (TypeError, ValueError):
+        ping = []
+    color_int = c.get('embed_color')
+    color_hex = f'#{int(color_int):06x}' if color_int is not None else None
+    return {
+        'id':                int(c['id']),
+        'guild_id':          str(c['guild_id']),
+        'name':              c.get('name') or '',
+        'channel_id':        c.get('channel_id') or '',
+        'message_id':        c.get('message_id') or '',
+        'ping_role_ids':     [str(r) for r in ping if str(r).strip()],
+        'required_role_id':  str(c['required_role_id']) if c.get('required_role_id') else None,
+        'blockchain':        c.get('blockchain') or 'evm',
+        'embed_title':       c.get('embed_title') or '',
+        'embed_description': c.get('embed_description') or '',
+        'embed_color':       color_hex,
+        'button_label':      c.get('button_label') or '',
+        'modal_title':       c.get('modal_title') or '',
+        'modal_field_label': c.get('modal_field_label') or '',
+        'modal_placeholder': c.get('modal_placeholder') or '',
+        'status':            c.get('status') or 'draft',
+        'created_at':        c.get('created_at'),
+        'updated_at':        c.get('updated_at'),
+        'submission_count':  int(c.get('submission_count') or 0),
+    }
+
+
+def _wallet_normalize_payload(payload: dict) -> dict:
+    """Validate + normalize the create/update field set into DB column values.
+    Raises HTTPException(400) on bad input."""
+    out: dict = {}
+    if 'name' in payload and payload['name'] is not None:
+        name = (payload['name'] or '').strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='name cannot be empty')
+        out['name'] = name[:100]
+    if 'blockchain' in payload and payload['blockchain'] is not None:
+        chain = (payload['blockchain'] or '').strip().lower()
+        if chain not in _WALLET_CHAINS:
+            raise HTTPException(status_code=400,
+                detail=f'Unsupported blockchain. Choose one of: {", ".join(_WALLET_CHAINS)}')
+        out['blockchain'] = chain
+    if 'channel_id' in payload:
+        v = payload['channel_id']
+        out['channel_id'] = None if v in ('', None) else str(v).lstrip('#').strip()
+    if 'required_role_id' in payload:
+        v = payload['required_role_id']
+        out['required_role_id'] = None if v in ('', None) else str(v).strip()
+    if 'ping_role_ids' in payload and payload['ping_role_ids'] is not None:
+        out['ping_role_ids'] = _normalize_role_id_list(
+            payload['ping_role_ids'], field='ping_role_ids')
+    if 'embed_color' in payload:
+        col = _coerce_giveaway_color(payload['embed_color'])
+        out['embed_color'] = col
+    for key, limit in (
+        ('embed_title', 256), ('embed_description', 4000),
+        ('button_label', 80), ('modal_title', 45),
+        ('modal_field_label', 45), ('modal_placeholder', 100),
+    ):
+        if key in payload and payload[key] is not None:
+            out[key] = (payload[key] or '')[:limit]
+    return out
+
+
+@app.get('/api/servers/{server_id}/wallet-collections')
+async def wallet_collections_list(server_id: int, user: dict = Depends(get_current_user)):
+    require_module_access(user, server_id, 'engage')
+    from database import list_wallet_collections
+    rows = list_wallet_collections(server_id)
+    return {'collections': [_wallet_collection_to_dict(r) for r in rows]}
+
+
+@app.post('/api/servers/{server_id}/wallet-collections')
+async def wallet_collections_create(
+    server_id: int,
+    body: _WalletCollectionCreate,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'engage')
+    rate_limit(f'wallet_coll_create:{server_id}', 30, 60.0)
+    from database import (
+        create_wallet_collection, get_wallet_collection, WalletCollectionNameExists,
+    )
+
+    payload = body.model_dump(exclude_unset=True)
+    norm = _wallet_normalize_payload(payload)
+    if not norm.get('name'):
+        raise HTTPException(status_code=400, detail='name is required')
+    norm.setdefault('blockchain', 'evm')
+
+    try:
+        cid = create_wallet_collection(server_id, **norm)
+    except WalletCollectionNameExists:
+        raise HTTPException(status_code=409, detail='A collection with that name already exists.')
+
+    log_event(
+        server_id, 'admin_action', 'wallet_collection_created',
+        f'Wallet collection "{norm["name"]}" created by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='engage', severity='info',
+        details={'collection_id': cid, 'blockchain': norm.get('blockchain')},
+    )
+    return _wallet_collection_to_dict(get_wallet_collection(cid, server_id))
+
+
+@app.get('/api/servers/{server_id}/wallet-collections/{collection_id}')
+async def wallet_collections_get(
+    server_id: int, collection_id: int, user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'engage')
+    from database import get_wallet_collection
+    c = get_wallet_collection(collection_id, server_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail='Wallet collection not found')
+    return _wallet_collection_to_dict(c)
+
+
+@app.patch('/api/servers/{server_id}/wallet-collections/{collection_id}')
+async def wallet_collections_update(
+    server_id: int, collection_id: int,
+    body: _WalletCollectionUpdate,
+    user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'engage')
+    rate_limit(f'wallet_coll_update:{server_id}', 120, 60.0)
+    from database import (
+        get_wallet_collection, update_wallet_collection, WalletCollectionNameExists,
+    )
+    c = get_wallet_collection(collection_id, server_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail='Wallet collection not found')
+
+    payload = body.model_dump(exclude_unset=True)
+    norm = _wallet_normalize_payload(payload)
+    if norm:
+        try:
+            update_wallet_collection(collection_id, server_id, **norm)
+        except WalletCollectionNameExists:
+            raise HTTPException(status_code=409, detail='A collection with that name already exists.')
+
+    fresh = get_wallet_collection(collection_id, server_id)
+
+    # If already posted, refresh the live embed so dashboard edits flow through.
+    live_edit = None
+    if fresh and fresh.get('message_id') and fresh.get('channel_id') and bot.is_ready():
+        guild = bot.get_guild(server_id)
+        if guild is not None:
+            try:
+                from cogs._utils import resolve_channel
+                from cogs.wallet_collection import (
+                    build_wallet_collection_embed, build_wallet_collection_view,
+                )
+                channel = resolve_channel(guild, fresh.get('channel_id'))
+                if channel is not None and fresh.get('status') != 'closed':
+                    msg = await channel.fetch_message(int(fresh['message_id']))
+                    await msg.edit(
+                        embed=build_wallet_collection_embed(fresh),
+                        view=build_wallet_collection_view(fresh),
+                    )
+                    live_edit = 'edited'
+            except Exception as e:  # noqa: BLE001
+                print(f'[wallet] live-edit failed cid={collection_id} guild={server_id}: '
+                      f'{type(e).__name__}: {e}')
+                live_edit = 'error'
+
+    log_event(
+        server_id, 'admin_action', 'wallet_collection_edited',
+        f'Wallet collection #{collection_id} edited by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='engage', severity='info',
+        details={'collection_id': collection_id, 'changed': sorted(norm.keys()),
+                 'live_edit': live_edit},
+    )
+    out = _wallet_collection_to_dict(fresh)
+    out['live_edit'] = live_edit
+    return out
+
+
+@app.delete('/api/servers/{server_id}/wallet-collections/{collection_id}')
+async def wallet_collections_delete(
+    server_id: int, collection_id: int, user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'engage')
+    rate_limit(f'wallet_coll_delete:{server_id}', 30, 60.0)
+    from database import get_wallet_collection, delete_wallet_collection
+    c = get_wallet_collection(collection_id, server_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail='Wallet collection not found')
+
+    delete_wallet_collection(collection_id, server_id)
+    log_event(
+        server_id, 'admin_action', 'wallet_collection_deleted',
+        f'Wallet collection "{c.get("name")}" deleted by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='engage', severity='info',
+        details={'collection_id': collection_id},
+    )
+    return {'ok': True, 'deleted': collection_id}
+
+
+@app.get('/api/servers/{server_id}/wallet-collections/{collection_id}/submissions')
+async def wallet_collections_submissions(
+    server_id: int, collection_id: int, user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'engage')
+    from database import get_wallet_collection, list_wallet_submissions
+    c = get_wallet_collection(collection_id, server_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail='Wallet collection not found')
+
+    rows = list_wallet_submissions(collection_id, server_id)
+
+    # Best-effort Discord username resolution from the bot's guild cache. We do
+    # not HTTP-fetch absent members here to keep the dashboard load fast; the
+    # frontend falls back to the user id when the name is unknown.
+    guild = bot.get_guild(server_id) if bot.is_ready() else None
+    out = []
+    for r in rows:
+        uid = str(r.get('user_id'))
+        username = None
+        if guild is not None:
+            try:
+                m = guild.get_member(int(uid))
+                if m is not None:
+                    username = m.name
+            except (TypeError, ValueError):
+                pass
+        out.append({
+            'id':             int(r['id']),
+            'user_id':        uid,
+            'username':       username,
+            'wallet_address': r.get('wallet_address') or '',
+            'submitted_at':   r.get('submitted_at'),
+            'updated_at':     r.get('updated_at'),
+        })
+    return {'submissions': out, 'total': len(out)}
+
+
+@app.post('/api/servers/{server_id}/wallet-collections/{collection_id}/post')
+async def wallet_collections_post(
+    server_id: int, collection_id: int, user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'engage')
+    rate_limit(f'wallet_coll_post:{server_id}', 30, 60.0)
+    from database import get_wallet_collection
+    c = get_wallet_collection(collection_id, server_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail='Wallet collection not found')
+    if not (c.get('channel_id') or '').strip():
+        raise HTTPException(status_code=400, detail='Set a target channel before posting.')
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        raise HTTPException(status_code=404, detail='Bot is not in this server')
+
+    from cogs.wallet_collection import post_collection_embed
+    try:
+        msg = await post_collection_embed(c, guild)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f'Channel not found: {c.get("channel_id")}')
+    except discord.Forbidden:
+        raise HTTPException(status_code=400, detail='Bot lacks permission to send in that channel')
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e))
+
+    log_event(
+        server_id, 'admin_action', 'wallet_collection_posted',
+        f'Wallet collection "{c.get("name")}" posted by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='engage', severity='info',
+        details={'collection_id': collection_id, 'channel_id': c.get('channel_id'),
+                 'message_id': str(msg.id)},
+    )
+    return _wallet_collection_to_dict(get_wallet_collection(collection_id, server_id))
+
+
+@app.post('/api/servers/{server_id}/wallet-collections/{collection_id}/close')
+async def wallet_collections_close(
+    server_id: int, collection_id: int, user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'engage')
+    rate_limit(f'wallet_coll_close:{server_id}', 30, 60.0)
+    from database import get_wallet_collection, update_wallet_collection
+    c = get_wallet_collection(collection_id, server_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail='Wallet collection not found')
+
+    update_wallet_collection(collection_id, server_id, status='closed')
+
+    edited = False
+    if (c.get('channel_id') or '').strip() and (c.get('message_id') or '').strip() and bot.is_ready():
+        guild = bot.get_guild(server_id)
+        if guild is not None:
+            try:
+                from cogs._utils import resolve_channel
+                from cogs.wallet_collection import build_closed_view
+                channel = resolve_channel(guild, c.get('channel_id'))
+                if channel is not None:
+                    msg = await channel.fetch_message(int(c['message_id']))
+                    await msg.edit(view=build_closed_view(c))
+                    edited = True
+            except Exception as e:  # noqa: BLE001
+                print(f'[wallet] close edit failed cid={collection_id}: {type(e).__name__}: {e}')
+
+    log_event(
+        server_id, 'admin_action', 'wallet_collection_closed',
+        f'Wallet collection "{c.get("name")}" closed by {user.get("username")}',
+        actor_user_id=user.get('user_id') or user.get('id'),
+        actor_username=user.get('username'),
+        module='engage', severity='info',
+        details={'collection_id': collection_id, 'button_disabled': edited},
+    )
+    return _wallet_collection_to_dict(get_wallet_collection(collection_id, server_id))
+
+
 # ── Settings module ──────────────────────────────────────────────────────────
 
 @app.get('/api/servers/{server_id}/settings')

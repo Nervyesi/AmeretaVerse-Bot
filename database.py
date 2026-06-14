@@ -1233,6 +1233,48 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_radar_topic_guild
                 ON radar_topic_settings(guild_id);
+
+            -- Wallet Collection (inside the Engage module): an admin creates a
+            -- collection, the bot posts a gated embed+button, members submit a
+            -- wallet that is validated against the configured chain, and the
+            -- project owner reads the collected wallets from the dashboard or
+            -- /wallet-list. Per-guild isolated. channel_id/message_id stay NULL
+            -- until the embed is posted. draft -> posted -> closed lifecycle.
+            CREATE TABLE IF NOT EXISTS wallet_collections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                channel_id TEXT,
+                message_id TEXT,
+                ping_role_ids TEXT,
+                required_role_id TEXT,
+                blockchain TEXT NOT NULL,
+                embed_title TEXT NOT NULL,
+                embed_description TEXT NOT NULL,
+                embed_color INTEGER,
+                button_label TEXT NOT NULL,
+                modal_title TEXT NOT NULL,
+                modal_field_label TEXT NOT NULL,
+                modal_placeholder TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(guild_id, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS wallet_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                collection_id INTEGER NOT NULL,
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                wallet_address TEXT NOT NULL,
+                submitted_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(collection_id, user_id),
+                FOREIGN KEY (collection_id) REFERENCES wallet_collections(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_wallet_subs_collection ON wallet_submissions(collection_id);
+            CREATE INDEX IF NOT EXISTS idx_wallet_subs_guild ON wallet_submissions(guild_id, user_id);
         """)
 
         # ── One-time idempotent migration: legacy radar_settings → radar_topic_settings(crypto) ──
@@ -2052,6 +2094,193 @@ def list_due_giveaways(now_iso: str) -> list:
             (now_iso,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Wallet Collection helpers (inside the Engage module) ───────────────────
+# Per-guild scoped: every query filters on guild_id. wallet_collections has a
+# UNIQUE(guild_id, name) constraint; the create path relies on IntegrityError
+# to surface duplicate names. wallet_submissions enforces one wallet per user
+# per collection via UNIQUE(collection_id, user_id), and the submit path upserts
+# through that constraint so a member can resubmit to update their address.
+
+# Defaults applied at create time so a collection is always postable once a
+# channel is set. Brand gold matches the rest of the bot.
+_WALLET_BRAND_GOLD = 0xC8A84E
+
+
+class WalletCollectionNameExists(Exception):
+    """Raised when a (guild_id, name) collection already exists."""
+
+
+def list_wallet_collections(guild_id) -> list:
+    """All collections for a guild, newest first, each with submission_count."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT c.*,
+                      (SELECT COUNT(*) FROM wallet_submissions s
+                        WHERE s.collection_id = c.id) AS submission_count
+                 FROM wallet_collections c
+                WHERE c.guild_id = ?
+                ORDER BY c.id DESC""",
+            (str(guild_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_wallet_collection(collection_id: int, guild_id) -> dict | None:
+    """A single collection scoped to its guild, with submission_count."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT c.*,
+                      (SELECT COUNT(*) FROM wallet_submissions s
+                        WHERE s.collection_id = c.id) AS submission_count
+                 FROM wallet_collections c
+                WHERE c.id = ? AND c.guild_id = ?""",
+            (int(collection_id), str(guild_id)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_wallet_collection_by_name(guild_id, name: str) -> dict | None:
+    """Case-insensitive name lookup within a guild (names are unique per guild).
+    Used by the slash commands which take the admin-given name."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT c.*,
+                      (SELECT COUNT(*) FROM wallet_submissions s
+                        WHERE s.collection_id = c.id) AS submission_count
+                 FROM wallet_collections c
+                WHERE c.guild_id = ? AND LOWER(c.name) = LOWER(?)""",
+            (str(guild_id), (name or '').strip()),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_wallet_collection(guild_id, **fields) -> int:
+    """Create a collection. name + blockchain are required; everything else
+    falls back to a sensible default so the row is valid immediately. Raises
+    WalletCollectionNameExists on a duplicate (guild_id, name)."""
+    name = (fields.get('name') or '').strip()
+    if not name:
+        raise ValueError('name is required')
+    blockchain = (fields.get('blockchain') or 'evm').strip()
+
+    row = {
+        'guild_id':          str(guild_id),
+        'name':              name,
+        'channel_id':        fields.get('channel_id') or None,
+        'message_id':        None,
+        'ping_role_ids':     fields.get('ping_role_ids') or '[]',
+        'required_role_id':  fields.get('required_role_id') or None,
+        'blockchain':        blockchain,
+        'embed_title':       fields.get('embed_title')       or 'Submit Your Wallet',
+        'embed_description': fields.get('embed_description')  or 'Click the button below to submit your wallet address.',
+        'embed_color':       fields.get('embed_color') if fields.get('embed_color') is not None else _WALLET_BRAND_GOLD,
+        'button_label':      fields.get('button_label')      or 'Submit Wallet',
+        'modal_title':       fields.get('modal_title')       or 'Submit Your Wallet',
+        'modal_field_label': fields.get('modal_field_label') or 'Your wallet address',
+        'modal_placeholder': fields.get('modal_placeholder') or '',
+        'status':            'draft',
+    }
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """INSERT INTO wallet_collections (
+                       guild_id, name, channel_id, message_id, ping_role_ids,
+                       required_role_id, blockchain, embed_title, embed_description,
+                       embed_color, button_label, modal_title, modal_field_label,
+                       modal_placeholder, status
+                   ) VALUES (
+                       :guild_id, :name, :channel_id, :message_id, :ping_role_ids,
+                       :required_role_id, :blockchain, :embed_title, :embed_description,
+                       :embed_color, :button_label, :modal_title, :modal_field_label,
+                       :modal_placeholder, :status
+                   )""",
+                row,
+            )
+            return int(cur.lastrowid)
+    except sqlite3.IntegrityError as e:
+        if 'UNIQUE' in str(e):
+            raise WalletCollectionNameExists(name) from e
+        raise
+
+
+_WALLET_COLLECTION_EDITABLE = (
+    'name', 'channel_id', 'message_id', 'ping_role_ids', 'required_role_id',
+    'blockchain', 'embed_title', 'embed_description', 'embed_color',
+    'button_label', 'modal_title', 'modal_field_label', 'modal_placeholder',
+    'status',
+)
+
+
+def update_wallet_collection(collection_id: int, guild_id, **fields) -> bool:
+    """Update whitelisted columns on a guild-scoped collection. Always bumps
+    updated_at. Raises WalletCollectionNameExists if a name change collides."""
+    updates = {k: v for k, v in fields.items() if k in _WALLET_COLLECTION_EDITABLE}
+    if not updates:
+        return False
+    set_clause = ', '.join(f'{k} = ?' for k in updates)
+    params = list(updates.values()) + [int(collection_id), str(guild_id)]
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                f"UPDATE wallet_collections SET {set_clause}, "
+                f"updated_at = datetime('now') WHERE id = ? AND guild_id = ?",
+                params,
+            )
+            return (cur.rowcount or 0) > 0
+    except sqlite3.IntegrityError as e:
+        if 'UNIQUE' in str(e):
+            raise WalletCollectionNameExists(updates.get('name')) from e
+        raise
+
+
+def delete_wallet_collection(collection_id: int, guild_id) -> bool:
+    """Hard delete a collection and its submissions (ON DELETE CASCADE handles
+    the children, but PRAGMA foreign_keys is off by default in sqlite3, so we
+    delete submissions explicitly first to be safe)."""
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM wallet_submissions WHERE collection_id = ? AND guild_id = ?",
+            (int(collection_id), str(guild_id)),
+        )
+        cur = conn.execute(
+            "DELETE FROM wallet_collections WHERE id = ? AND guild_id = ?",
+            (int(collection_id), str(guild_id)),
+        )
+        return (cur.rowcount or 0) > 0
+
+
+def list_wallet_submissions(collection_id: int, guild_id) -> list:
+    """All submissions for a collection, oldest first (submission order)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM wallet_submissions
+                WHERE collection_id = ? AND guild_id = ?
+                ORDER BY submitted_at ASC, id ASC""",
+            (int(collection_id), str(guild_id)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_wallet_submission(collection_id: int, guild_id, user_id, wallet_address: str) -> str:
+    """Insert or update one user's wallet for a collection. Returns 'insert'
+    or 'update' so the caller can log/respond accordingly."""
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM wallet_submissions WHERE collection_id = ? AND user_id = ?",
+            (int(collection_id), str(user_id)),
+        ).fetchone()
+        conn.execute(
+            """INSERT INTO wallet_submissions
+                   (collection_id, guild_id, user_id, wallet_address)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(collection_id, user_id) DO UPDATE SET
+                   wallet_address = excluded.wallet_address,
+                   updated_at     = datetime('now')""",
+            (int(collection_id), str(guild_id), str(user_id), wallet_address),
+        )
+    return 'update' if existing else 'insert'
 
 
 # ── Radar helpers (Phase 1 — crypto wiring; non-crypto schema is reserved) ──

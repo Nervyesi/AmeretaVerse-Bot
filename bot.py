@@ -11,6 +11,7 @@ async def setup_hook():
     await bot.load_extension('cogs.forms')
     await bot.load_extension('cogs.raidbot')
     await bot.load_extension('cogs.engage')
+    await bot.load_extension('cogs.wallet_collection')
     await bot.load_extension('cogs.protection')
     await bot.load_extension('cogs.analytics')
     await bot.load_extension('cogs.voice_tracker')
