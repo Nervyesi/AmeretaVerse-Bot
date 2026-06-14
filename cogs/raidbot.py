@@ -61,6 +61,7 @@ from cogs._engagers_view import (
     PAGE_SIZE as ENGAGERS_PAGE_SIZE,
     sort_engagers,
     build_page_embed,
+    comment_badge,
     EngagersView,
     _NO_PING,
 )
@@ -528,17 +529,27 @@ async def _live_verify_and_award(
 
     total_credited = dict(already); total_credited.update(newly)
     cumulative_pts = sum(total_credited.values())
+    # Matched comment reply id (captured by check_comment) so the engagers list
+    # can link to the reply. None unless the comment verified true on this
+    # attempt; on re-verify we only overwrite when a fresh id was found.
+    comment_reply_id = (
+        results.get('comment', {}).get('reply_id')
+        if results.get('comment', {}).get('verified') is True else None
+    )
     if existing_part:
-        update_raid_participation(
-            existing_part['participation_id'],
+        _update_fields = dict(
             tasks_claimed=json.dumps({t: True for t in total_credited}),
             points_earned=cumulative_pts,
             verification_status='verified',
         )
+        if comment_reply_id:
+            _update_fields['reply_tweet_id'] = comment_reply_id
+        update_raid_participation(existing_part['participation_id'], **_update_fields)
     elif total_credited:
         create_raid_participation(
             guild_id, raid_id, user_id,
             json.dumps({t: True for t in total_credited}), cumulative_pts,
+            reply_tweet_id=comment_reply_id,
         )
 
     for task, r in results.items():
@@ -2223,6 +2234,8 @@ def _build_raid_engager_entries(guild_id, raid_id: int, raid: dict) -> list:
                 if v['task'] not in verif_map:
                     verif_map[v['task']] = v['verified']
 
+            handle       = (p.get('x_username') or '').lstrip('@').strip()
+            reply_id     = p.get('reply_tweet_id')
             badges       = []
             completeness = 0
             for task in ('like', 'comment', 'retweet'):
@@ -2233,14 +2246,18 @@ def _build_raid_engager_entries(guild_id, raid_id: int, raid: dict) -> list:
                 if verif_map.get(task) == 0:   # conclusively not done
                     continue
                 completeness += 1
-                badges.append(f'✅ {task}')
+                if task == 'comment':
+                    badges.append(comment_badge(handle, reply_id))
+                else:
+                    badges.append(f'✅ {task}')
 
             entries.append({
-                'user_id':      str(p.get('user_id')),
-                'x_handle':     (p.get('x_username') or '').lstrip('@').strip(),
-                'badges':       badges,
-                'completeness': completeness,
-                'ts':           p.get('created_at') or '',
+                'user_id':        str(p.get('user_id')),
+                'x_handle':       handle,
+                'badges':         badges,
+                'completeness':   completeness,
+                'ts':             p.get('created_at') or '',
+                'reply_tweet_id': reply_id,
             })
     return entries
 

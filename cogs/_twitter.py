@@ -1181,7 +1181,8 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
                 fallback_via='skipped', fallback_result='skipped',
                 api_calls=api_calls, result='match',
             )
-            return {'verified': True, 'reason': 'found_comment_timelineside'}
+            return {'verified': True, 'reason': 'found_comment_timelineside',
+                    'reply_id': tl.get('matched_tweet_id')}
         _log_verify_summary(
             'check_comment', tweet_id, target,
             primary_via='user_side_via_tweet_timeline', primary_result='no_match',
@@ -1216,7 +1217,8 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
                     fallback_via='skipped', fallback_result='skipped',
                     api_calls=api_calls, result='match',
                 )
-                return {'verified': True, 'reason': 'found_comment_timelineside'}
+                return {'verified': True, 'reason': 'found_comment_timelineside',
+                        'reply_id': tl.get('matched_tweet_id')}
         else:
             # The summary line must appear every time the fallback runs, even on
             # the skip path where we could not fetch the target tweet or the id.
@@ -1259,7 +1261,8 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
                 api_calls=api_calls, result='match',
             )
             return {'verified': True,
-                    'reason': f'found_comment_userside_via_{probe["name"]}'}
+                    'reason': f'found_comment_userside_via_{probe["name"]}',
+                    'reply_id': matched_tweet_id}
 
         primary_result = 'no_match'
         print(f'[twitter] check_comment: userside no match in {len(tweets)} '
@@ -1279,7 +1282,8 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
             fallback_via=fallback_via, fallback_result=fallback_result,
             api_calls=api_calls, result='match',
         )
-        return {'verified': True, 'reason': 'found_comment_tweetside'}
+        return {'verified': True, 'reason': 'found_comment_tweetside',
+                'reply_id': None}
 
     # ── EXTRA FALLBACK: conversation-thread scan (TWITTER_CONVERSATION_FALLBACK)
     # Neither user-side nor the direct tweet-side replies list matched. Some
@@ -1297,7 +1301,8 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
                 fallback_via=fallback_via, fallback_result=fallback_result,
                 api_calls=api_calls, result='match',
             )
-            return {'verified': True, 'reason': 'found_comment_conversation'}
+            return {'verified': True, 'reason': 'found_comment_conversation',
+                    'reply_id': None}
 
     # EXTRA FALLBACK: mentions based discovery (TWITTER_MENTIONS_FALLBACK).
     # The tweetside, userside and conversation checks have all missed. The
@@ -1324,7 +1329,8 @@ async def check_comment(tweet_id: str, target_username: str) -> dict:
                     fallback_via=fallback_via, fallback_result=fallback_result,
                     api_calls=api_calls, result='match',
                 )
-                return {'verified': True, 'reason': 'found_comment_mentionside'}
+                return {'verified': True, 'reason': 'found_comment_mentionside',
+                        'reply_id': ms.get('matched_tweet_id')}
         else:
             # The summary line must appear every time the fallback runs, even on
             # the skip path where we could not fetch the target tweet.

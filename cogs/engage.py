@@ -63,6 +63,7 @@ from cogs._engagers_view import (
     PAGE_SIZE as ENGAGERS_PAGE_SIZE,
     sort_engagers,
     build_page_embed,
+    comment_badge,
     EngagersView,
     _NO_PING,
 )
@@ -567,6 +568,14 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
             def _flag(v):
                 return 1 if v is True else (0 if v is False else -1)
 
+            # Persist the matched comment reply id (captured by check_comment) so
+            # the engagers list can link to the reply. None unless a comment was
+            # claimed and verified true on this attempt.
+            comment_reply_id = (
+                results.get('comment', {}).get('reply_id')
+                if claims.get('comment') and comment_v is True else None
+            )
+
             upsert_engage_action(
                 str(guild_id), pool_id, sub_id, str(user_id), x_username,
                 int(bool(claims.get('like'))),
@@ -576,6 +585,7 @@ async def _finalize(interaction: discord.Interaction, user_id: int) -> None:
                 _flag(comment_v) if claims.get('comment') else None,
                 _flag(retweet_v) if claims.get('retweet') else None,
                 earned, source,
+                reply_tweet_id=comment_reply_id,
             )
         else:
             results = None
@@ -727,6 +737,8 @@ def _build_engage_entries(guild_id, submission: dict) -> list:
 
     entries = []
     for r in rows:
+        handle       = (r.get('engager_x_username') or '').lstrip('@').strip()
+        reply_id     = r.get('reply_tweet_id')
         badges       = []
         completeness = 0
         for task in ('like', 'comment', 'retweet'):
@@ -737,13 +749,17 @@ def _build_engage_entries(guild_id, submission: dict) -> list:
             if r.get(f'{task}_verified') == 0:   # conclusively not done
                 continue
             completeness += 1
-            badges.append(f'✅ {task}')
+            if task == 'comment':
+                badges.append(comment_badge(handle, reply_id))
+            else:
+                badges.append(f'✅ {task}')
         entries.append({
-            'user_id':      str(r.get('engager_user_id')),
-            'x_handle':     (r.get('engager_x_username') or '').lstrip('@').strip(),
-            'badges':       badges,
-            'completeness': completeness,
-            'ts':           r.get('created_at') or '',
+            'user_id':        str(r.get('engager_user_id')),
+            'x_handle':       handle,
+            'badges':         badges,
+            'completeness':   completeness,
+            'ts':             r.get('created_at') or '',
+            'reply_tweet_id': reply_id,
         })
     return entries
 

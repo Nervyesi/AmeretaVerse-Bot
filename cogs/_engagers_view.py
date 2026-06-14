@@ -59,6 +59,16 @@ async def _resolve_discord_name(guild, client, user_id: str) -> str:
     return '(left server)'
 
 
+def comment_badge(x_handle: str, reply_tweet_id) -> str:
+    """The verified comment badge. When the reply tweet id was captured at verify
+    time and the engager's handle is known, the word reply links straight to the
+    reply on X. Older rows from before reply ids were captured have no id, so the
+    plain badge is shown. NULL or empty inputs never raise."""
+    if reply_tweet_id and x_handle:
+        return f'✅ comment ([reply](https://x.com/{x_handle}/status/{reply_tweet_id}))'
+    return '✅ comment'
+
+
 def _format_line(global_index: int, discord_name: str, x_handle: str, badges: list) -> str:
     handle = f'[@{x_handle}](https://x.com/{x_handle})' if x_handle else '(no X handle)'
     tasks  = ' · '.join(badges) if badges else '(no tasks recorded)'

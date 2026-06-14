@@ -552,6 +552,12 @@ def init_db():
             # covers (guild_id, asset_identifier, alert_type, sent_at).
             "ALTER TABLE radar_alerts_log ADD COLUMN magnitude REAL",
             "ALTER TABLE radar_alerts_log ADD COLUMN direction TEXT",
+            # Engagers list: the matched comment reply tweet id, captured at
+            # verify time so the engagers embeds can link straight to the reply.
+            # NULL on older rows from before this change. Twitter ids are
+            # snowflake-precision, so stored as TEXT.
+            "ALTER TABLE engage_actions ADD COLUMN reply_tweet_id TEXT",
+            "ALTER TABLE raid_participation ADD COLUMN reply_tweet_id TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -2680,18 +2686,21 @@ def get_participation_by_id(participation_id: int) -> dict | None:
 def create_raid_participation(
     guild_id: int, raid_id: int, user_id: int,
     tasks_claimed: str, points_earned: int,
+    reply_tweet_id: str = None,
 ) -> int:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO raid_participation (guild_id, raid_id, user_id, tasks_claimed, points_earned) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (guild_id, raid_id, user_id, tasks_claimed, points_earned),
+            "INSERT INTO raid_participation (guild_id, raid_id, user_id, tasks_claimed, points_earned, reply_tweet_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, raid_id, user_id, tasks_claimed, points_earned,
+             str(reply_tweet_id) if reply_tweet_id else None),
         )
         return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
 
 
 def update_raid_participation(participation_id: int, **fields) -> bool:
-    allowed = {'tasks_claimed', 'points_earned', 'verified_at', 'verification_status', 'flag_reason'}
+    allowed = {'tasks_claimed', 'points_earned', 'verified_at', 'verification_status',
+               'flag_reason', 'reply_tweet_id'}
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return False
@@ -3030,6 +3039,7 @@ def upsert_engage_action(
     like_verified, comment_verified, retweet_verified,
     points_earned: int, verification_source: str,
     flagged: int = 0, flag_reason: str = None,
+    reply_tweet_id: str = None,
 ) -> None:
     with get_connection() as conn:
         conn.execute(
@@ -3037,8 +3047,8 @@ def upsert_engage_action(
                (guild_id, pool_id, submission_id, engager_user_id, engager_x_username,
                 like_claimed, comment_claimed, retweet_claimed,
                 like_verified, comment_verified, retweet_verified,
-                points_earned, verification_source, flagged, flag_reason)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                points_earned, verification_source, flagged, flag_reason, reply_tweet_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(submission_id, engager_user_id) DO UPDATE SET
                  like_claimed=excluded.like_claimed,
                  comment_claimed=excluded.comment_claimed,
@@ -3049,11 +3059,13 @@ def upsert_engage_action(
                  points_earned=excluded.points_earned,
                  verification_source=excluded.verification_source,
                  flagged=excluded.flagged,
-                 flag_reason=excluded.flag_reason""",
+                 flag_reason=excluded.flag_reason,
+                 reply_tweet_id=COALESCE(excluded.reply_tweet_id, reply_tweet_id)""",
             (str(guild_id), pool_id, submission_id, str(engager_user_id), engager_x_username,
              like_claimed, comment_claimed, retweet_claimed,
              like_verified, comment_verified, retweet_verified,
-             points_earned, verification_source, flagged, flag_reason),
+             points_earned, verification_source, flagged, flag_reason,
+             str(reply_tweet_id) if reply_tweet_id else None),
         )
 
 
