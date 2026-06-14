@@ -34,13 +34,111 @@ from database import (
     count_giveaway_entries,
     get_giveaway_entry,
     enter_giveaway_atomic,
+    enter_giveaway_atomic_engage,
+    resolve_primary_engage_pool_id,
     claim_giveaway_for_draw,
     list_due_giveaways,
+    get_user_x_username,
     log_event,
     GiveawayInsufficientPoints,
     GiveawayAlreadyEntered,
 )
 from cogs._branding import build_branded_embed
+# Task verification reuses the existing TwitterAPI.io chain. check_retweet and
+# extract_tweet_id live in cogs/_twitter.py (off limits, called only). The
+# follow check lives in the sibling cogs/_twitter_follow.py (new helper, does
+# not touch _twitter.py). Likes are self-attested per the owner's decision.
+from cogs._twitter import check_retweet, extract_tweet_id, normalize_username
+from cogs._twitter_follow import check_user_follows
+
+GOLD     = 0xC8A84E
+_NO_PING = discord.AllowedMentions(roles=False, users=False, everyone=False)
+
+_VALID_TASK_TYPES = {
+    'twitter_follow', 'twitter_like', 'twitter_retweet',
+    'discord_member', 'discord_role',
+}
+
+
+def _entry_tasks(g: dict) -> list:
+    """Parse + validate the giveaway's entry_tasks JSON into clean task dicts.
+    A malformed column, a non-list, or a giveaway from before this feature all
+    yield [] so the entry flow stays exactly as it was (backward compatible)."""
+    raw = g.get('entry_tasks') or '[]'
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        ttype  = str(t.get('type', '')).strip()
+        target = str(t.get('target', '')).strip()
+        if ttype not in _VALID_TASK_TYPES or not target:
+            continue
+        out.append({'type': ttype, 'target': target,
+                    'label': str(t.get('label', '')).strip()})
+    return out
+
+
+def _task_default_label(t: dict) -> str:
+    ttype, target = t['type'], t['target']
+    if ttype == 'twitter_follow':
+        return f'Follow @{normalize_username(target)} on X'
+    if ttype == 'twitter_like':
+        return 'Like the post on X'
+    if ttype == 'twitter_retweet':
+        return 'Retweet the post on X'
+    if ttype == 'discord_member':
+        return 'Join the required Discord server'
+    if ttype == 'discord_role':
+        return 'Hold the required role in the Discord server'
+    return 'Complete the task'
+
+
+def _task_link(t: dict) -> str | None:
+    ttype, target = t['type'], t['target']
+    if ttype == 'twitter_follow':
+        return f'https://x.com/{normalize_username(target)}'
+    if ttype in ('twitter_like', 'twitter_retweet'):
+        if target.startswith(('http://', 'https://')):
+            return target
+        tid = extract_tweet_id(target) or (target if target.isdigit() else None)
+        return f'https://x.com/i/status/{tid}' if tid else None
+    # Discord tasks: we only have a guild id (and maybe role id), not an
+    # invite, so no link is rendered.
+    return None
+
+
+def _render_tasks_embed(g: dict, results: list | None = None) -> discord.Embed:
+    """The ephemeral task list shown on Enter. Before verification (results is
+    None) each task gets a neutral bullet; after, a per-task verdict marker.
+    Separators are middle dots, never dashes."""
+    tasks = _entry_tasks(g)
+    lines: list[str] = []
+    for i, t in enumerate(tasks, 1):
+        label = t['label'] or _task_default_label(t)
+        link  = _task_link(t)
+        if results is None:
+            marker = '🔹'
+        else:
+            ok = results[i - 1]['ok']
+            marker = '✅' if ok is True else ('⚠️' if ok is None else '❌')
+        line = f'{i}. {marker} {label}'
+        if link:
+            line += f' · [open]({link})'
+        lines.append(line)
+
+    title = (g.get('title') or 'Giveaway')[:200]
+    intro = 'Complete these tasks to enter:' if results is None else 'Task results:'
+    return discord.Embed(
+        title=f'🎟️ {title}',
+        description=intro + '\n\n' + ('\n'.join(lines) if lines else 'No tasks.'),
+        color=GOLD,
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -158,12 +256,16 @@ def build_giveaway_embed(guild_id: int, g: dict, entry_count: int) -> discord.Em
     winners_n = max(1, int(g.get('winner_count') or 1))
     cost      = max(0, int(g.get('entry_cost_points') or 0))
     role_ids  = _allowed_role_ids(g)
+    cost_unit = 'engage points' if (g.get('cost_source') or 'community') == 'engage' else 'community points'
 
     meta_lines: list[str] = []
     meta_lines.append(f'**Winners:** {winners_n}')
     meta_lines.append('**Entry cost:** ' + (
-        f'{cost:,} community points' if cost > 0 else 'Free'
+        f'{cost:,} {cost_unit}' if cost > 0 else 'Free'
     ))
+    task_n = len(_entry_tasks(g))
+    if task_n:
+        meta_lines.append(f'**Tasks:** {task_n} to enter')
     if role_ids:
         mentions = ' '.join(f'<@&{rid}>' for rid in role_ids[:8])
         meta_lines.append(f'**Required roles:** {mentions}')
@@ -305,6 +407,47 @@ class GiveawayStatusButton(
         await cog.handle_status(interaction, self.giveaway_id)
 
 
+# ── Ephemeral tasks view (not persistent — one entry interaction) ─────────────
+
+class GiveawayTasksView(discord.ui.View):
+    """Shown ephemerally when a gated giveaway is entered. 'I’ve done all tasks'
+    verifies once and enters on success; 'Cancel' closes. Locked to the clicker
+    and lives for one entry attempt (5 minute timeout)."""
+
+    def __init__(self, cog: 'Giveaway', giveaway_id: int, original_user_id: int):
+        super().__init__(timeout=300)
+        self.cog              = cog
+        self.giveaway_id      = int(giveaway_id)
+        self.original_user_id = int(original_user_id)
+
+        verify = discord.ui.Button(
+            style=discord.ButtonStyle.success, label='I’ve done all tasks', emoji='✅',
+        )
+        verify.callback = self._verify_cb
+        self.add_item(verify)
+
+        cancel = discord.ui.Button(style=discord.ButtonStyle.secondary, label='Cancel')
+        cancel.callback = self._cancel_cb
+        self.add_item(cancel)
+
+    async def _verify_cb(self, interaction: discord.Interaction):
+        if interaction.user.id != self.original_user_id:
+            await interaction.response.send_message('This is not your entry.', ephemeral=True)
+            return
+        # Defer the component update so the (multi-second) verification has room.
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            pass
+        await self.cog.handle_verify_and_enter(interaction, self.giveaway_id, self)
+
+    async def _cancel_cb(self, interaction: discord.Interaction):
+        if interaction.user.id != self.original_user_id:
+            await interaction.response.send_message('This is not your entry.', ephemeral=True)
+            return
+        await interaction.response.edit_message(content='Entry cancelled.', embed=None, view=None)
+
+
 # ── Cog ──────────────────────────────────────────────────────────────────────
 
 class Giveaway(commands.Cog):
@@ -409,46 +552,70 @@ class Giveaway(commands.Cog):
             )
             return
 
-        cost = max(0, int(g.get('entry_cost_points') or 0))
+        # Tasks gating. When the giveaway has entry tasks, do NOT charge or
+        # enter yet — present the task list and let the user verify. Giveaways
+        # with no tasks keep the exact original flow via _finalize_entry.
+        tasks = _entry_tasks(g)
+        if tasks:
+            embed = _render_tasks_embed(g)
+            embed.description += (
+                '\n\nClick **I’ve done all tasks** to verify, or **Cancel** to close.'
+            )
+            view = GiveawayTasksView(self, giveaway_id, user.id)
+            await interaction.followup.send(
+                embed=embed, view=view, ephemeral=True, allowed_mentions=_NO_PING,
+            )
+            return
+
+        ok, text = await self._finalize_entry(interaction, g, guild_id, user)
+        await self._ephemeral(interaction, text)
+
+    # ── Shared entry finalize (cost source aware) ────────────────────────
+
+    async def _finalize_entry(self, interaction: discord.Interaction, g: dict,
+                              guild_id: int, user) -> tuple[bool, str]:
+        """Charge the configured cost source and insert the entry atomically.
+        Returns (ok, message). Used by the no-tasks path and the post-verify
+        path. cost_source selects the pool only when cost > 0; 'community' keeps
+        the legacy raid_user_points behavior, 'engage' charges the guild's
+        primary engage pool."""
+        giveaway_id = int(g['id'])
+        cost        = max(0, int(g.get('entry_cost_points') or 0))
+        cost_source = (g.get('cost_source') or 'community').strip().lower()
+        if cost_source not in ('community', 'engage'):
+            cost_source = 'community'
+        unit = 'engage points' if cost_source == 'engage' else 'community points'
 
         try:
-            res = enter_giveaway_atomic(giveaway_id, guild_id, user.id, cost)
+            if cost > 0 and cost_source == 'engage':
+                pool_id = resolve_primary_engage_pool_id(guild_id)
+                if not pool_id:
+                    return False, 'Engage points are not set up in this server. Contact an admin.'
+                res = enter_giveaway_atomic_engage(giveaway_id, guild_id, user.id, cost, pool_id)
+            else:
+                res = enter_giveaway_atomic(giveaway_id, guild_id, user.id, cost)
         except GiveawayInsufficientPoints as e:
             need = max(0, e.required - e.balance)
-            await self._ephemeral(
-                interaction,
-                f'You need **{need:,}** more community points to enter '
-                f'(balance: {e.balance:,}, cost: {e.required:,}).',
-            )
             log_event(guild_id, 'admin_action', 'giveaway_entry_skipped',
                       f'Giveaway #{giveaway_id} entry skipped: insufficient_points',
                       module='giveaway', severity='info',
                       details={'giveaway_id': giveaway_id, 'user_id': user.id,
-                               'reason': 'insufficient_points',
+                               'reason': 'insufficient_points', 'cost_source': cost_source,
                                'balance': e.balance, 'required': e.required})
-            return
+            return False, (f'You need **{need:,}** more {unit} to enter '
+                           f'(balance: {e.balance:,}, cost: {e.required:,}).')
         except GiveawayAlreadyEntered:
             total = count_giveaway_entries(giveaway_id, guild_id)
-            await self._ephemeral(
-                interaction,
-                f'You are already entered. Good luck!\n**Entries:** {total:,}',
-            )
-            return
+            return False, f'You are already entered. Good luck!\n**Entries:** {total:,}'
         except Exception as exc:  # noqa: BLE001
             print(f'[giveaway] enter failure gid={giveaway_id} user={user.id}: '
                   f'{type(exc).__name__}: {exc}')
-            await self._ephemeral(interaction, 'Could not record your entry. Try again shortly.')
-            return
+            return False, 'Could not record your entry. Try again shortly.'
 
         total = count_giveaway_entries(giveaway_id, guild_id)
         odds  = f'1 in {total:,}' if total > 0 else '—'
         balance_line = (
-            f'\n**Balance:** {res["new_balance"]:,} community points'
-            if cost > 0 else ''
-        )
-        await self._ephemeral(
-            interaction,
-            f'You are in! 🎉\n**Entries:** {total:,}\n**Your odds:** {odds}{balance_line}',
+            f'\n**Balance:** {res["new_balance"]:,} {unit}' if cost > 0 else ''
         )
 
         log_event(guild_id, 'admin_action', 'giveaway_entered',
@@ -456,11 +623,149 @@ class Giveaway(commands.Cog):
                   actor_user_id=user.id, actor_username=str(user),
                   module='giveaway', severity='info',
                   details={'giveaway_id': giveaway_id, 'user_id': user.id,
-                           'cost': cost, 'entries_after': total})
+                           'cost': cost, 'cost_source': cost_source, 'entries_after': total})
 
-        # Schedule a debounced embed refresh so the entries count stays live
-        # without rate-limiting Discord on a flood.
-        await self._schedule_refresh(int(g['id']), guild_id)
+        await self._schedule_refresh(giveaway_id, guild_id)
+        return True, f'You are in! 🎉\n**Entries:** {total:,}\n**Your odds:** {odds}{balance_line}'
+
+    # ── Task verification + gated entry ──────────────────────────────────
+
+    def _check_discord_member(self, target_guild_id: str, user_id: int):
+        """True member / False not member / None unverifiable (bot not in guild)."""
+        try:
+            gid = int(str(target_guild_id).strip())
+        except (TypeError, ValueError):
+            return False
+        guild = self.bot.get_guild(gid)
+        if guild is None:
+            return None
+        return guild.get_member(int(user_id)) is not None
+
+    def _check_discord_role(self, target: str, user_id: int):
+        """target is 'guild_id:role_id'. True has role / False not / None unverifiable."""
+        raw = str(target or '').strip()
+        if ':' not in raw:
+            return False
+        gid_s, role_s = raw.split(':', 1)
+        try:
+            gid = int(gid_s.strip())
+        except (TypeError, ValueError):
+            return False
+        role_id = role_s.strip()
+        guild = self.bot.get_guild(gid)
+        if guild is None:
+            return None
+        member = guild.get_member(int(user_id))
+        if member is None:
+            return False
+        return any(str(r.id) == role_id for r in member.roles)
+
+    async def _verify_all_tasks(self, interaction: discord.Interaction, g: dict) -> dict:
+        """Run every task once. Returns either {'status':'need_handle'} or
+        {'status':'done', 'results':[...], 'all_passed':bool, 'any_unverifiable':bool}.
+        Each result: {'task', 'ok': True|False|None, 'source': 'api_verified'|'self_attested'}."""
+        tasks = _entry_tasks(g)
+        needs_handle = any(t['type'] in ('twitter_follow', 'twitter_retweet') for t in tasks)
+        handle = get_user_x_username(interaction.user.id) if needs_handle else None
+        if needs_handle and not handle:
+            return {'status': 'need_handle'}
+
+        results: list[dict] = []
+        for t in tasks:
+            ttype, target = t['type'], t['target']
+            if ttype == 'twitter_like':
+                # Self-attested per owner decision: clicking verify passes it.
+                results.append({'task': t, 'ok': True, 'source': 'self_attested'})
+            elif ttype == 'twitter_follow':
+                r = await check_user_follows(target, handle)
+                results.append({'task': t, 'ok': r.get('verified') is True, 'source': 'api_verified'})
+            elif ttype == 'twitter_retweet':
+                tid = extract_tweet_id(target) or (target if target.isdigit() else None)
+                if not tid:
+                    results.append({'task': t, 'ok': False, 'source': 'api_verified'})
+                else:
+                    r = await check_retweet(tid, handle)
+                    results.append({'task': t, 'ok': r.get('verified') is True, 'source': 'api_verified'})
+            elif ttype == 'discord_member':
+                results.append({'task': t, 'ok': self._check_discord_member(target, interaction.user.id),
+                                'source': 'api_verified'})
+            elif ttype == 'discord_role':
+                results.append({'task': t, 'ok': self._check_discord_role(target, interaction.user.id),
+                                'source': 'api_verified'})
+            else:
+                results.append({'task': t, 'ok': False, 'source': 'unknown'})
+
+        all_passed       = bool(results) and all(r['ok'] is True for r in results)
+        any_unverifiable = any(r['ok'] is None for r in results)
+        return {'status': 'done', 'results': results,
+                'all_passed': all_passed, 'any_unverifiable': any_unverifiable}
+
+    async def handle_verify_and_enter(self, interaction: discord.Interaction,
+                                      giveaway_id: int, view: 'GiveawayTasksView'):
+        """Verify tasks once and, if all pass, charge + enter. Edits the
+        ephemeral task message in place. One verify per click; no recheck."""
+        guild_id = interaction.guild_id or 0
+        user     = interaction.user
+
+        g = get_giveaway(giveaway_id, guild_id)
+        if g is None or (g.get('status') or 'draft') != 'active':
+            await interaction.edit_original_response(
+                content='This giveaway is not accepting entries anymore.', embed=None, view=None)
+            return
+        ends = _parse_iso(g.get('ends_at'))
+        if ends and datetime.now(timezone.utc) >= ends:
+            await interaction.edit_original_response(
+                content='This giveaway just ended. Winners are being drawn.', embed=None, view=None)
+            return
+        if get_giveaway_entry(giveaway_id, guild_id, user.id):
+            await interaction.edit_original_response(
+                content='You are already entered. Good luck!', embed=None, view=None)
+            return
+
+        vres = await self._verify_all_tasks(interaction, g)
+        cost_source = (g.get('cost_source') or 'community')
+
+        if vres['status'] == 'need_handle':
+            embed = _render_tasks_embed(g)
+            embed.description += ('\n\nYou need to link your X account first. '
+                                  'Use `/setx <username>` to link it, then try again.')
+            await interaction.edit_original_response(embed=embed, view=view)
+            log_event(guild_id, 'admin_action', 'giveaway_entry_attempt',
+                      f'Giveaway #{giveaway_id} entry blocked: no_x_handle',
+                      actor_user_id=user.id, actor_username=str(user),
+                      module='giveaway', severity='info',
+                      details={'giveaway_id': giveaway_id, 'user_id': str(user.id),
+                               'tasks_checked': 0, 'tasks_passed': 0,
+                               'cost_source': cost_source, 'outcome': 'no_x_handle'})
+            return
+
+        results       = vres['results']
+        tasks_checked = len(results)
+        tasks_passed  = sum(1 for r in results if r['ok'] is True)
+
+        if vres['all_passed']:
+            ok, text = await self._finalize_entry(interaction, g, guild_id, user)
+            embed = _render_tasks_embed(g, results)
+            embed.description += f'\n\n{"✅ " if ok else ""}{text}'
+            await interaction.edit_original_response(embed=embed, view=None if ok else view)
+            outcome = 'entered' if ok else 'failed_entry'
+        else:
+            embed = _render_tasks_embed(g, results)
+            note = 'Complete the missing tasks and try again.'
+            if vres['any_unverifiable']:
+                note += ("\nSome checks couldn’t run because AVbot isn’t in that server. "
+                         'Contact the giveaway admin.')
+            embed.description += f'\n\n{note}'
+            await interaction.edit_original_response(embed=embed, view=view)
+            outcome = 'partial_unverifiable' if vres['any_unverifiable'] else 'failed_tasks'
+
+        log_event(guild_id, 'admin_action', 'giveaway_entry_attempt',
+                  f'Giveaway #{giveaway_id} entry attempt by {user}: {outcome}',
+                  actor_user_id=user.id, actor_username=str(user),
+                  module='giveaway', severity='info',
+                  details={'giveaway_id': giveaway_id, 'user_id': str(user.id),
+                           'tasks_checked': tasks_checked, 'tasks_passed': tasks_passed,
+                           'cost_source': cost_source, 'outcome': outcome})
 
     # ── Status button handler ───────────────────────────────────────────
 
@@ -484,7 +789,11 @@ class Giveaway(commands.Cog):
         if g.get('status') == 'active' and ends_unix:
             lines.append(f'**Ends:** <t:{ends_unix}:R>')
         cost = max(0, int(g.get('entry_cost_points') or 0))
-        lines.append('**Entry cost:** ' + (f'{cost:,} community points' if cost > 0 else 'Free'))
+        cost_unit = 'engage points' if (g.get('cost_source') or 'community') == 'engage' else 'community points'
+        lines.append('**Entry cost:** ' + (f'{cost:,} {cost_unit}' if cost > 0 else 'Free'))
+        task_n = len(_entry_tasks(g))
+        if task_n:
+            lines.append(f'**Tasks:** {task_n} required to enter')
         if already:
             odds = f'1 in {total:,}' if total > 0 else '—'
             lines.append(f'\n✅ You are entered. Your odds: **{odds}**')

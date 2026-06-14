@@ -490,6 +490,14 @@ def init_db():
             # legacy) is kept for back-compat; readers prefer mention_role_ids
             # when set, otherwise fall back to wrapping the legacy id.
             "ALTER TABLE giveaways ADD COLUMN mention_role_ids TEXT NOT NULL DEFAULT '[]'",
+            # giveaway entry gating + cost source. entry_tasks is a JSON array of
+            # task objects (twitter_follow/like/retweet, discord_member/role);
+            # empty/NULL => no tasks (existing behavior, fully back-compat).
+            # cost_source picks which point pool pays the entry cost when cost>0:
+            # 'community' (raid_user_points, default/legacy) or 'engage'
+            # (engage_user_points on the guild's primary pool).
+            "ALTER TABLE giveaways ADD COLUMN entry_tasks TEXT",
+            "ALTER TABLE giveaways ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'community'",
             # Radar Phase 1 polish: per-guild role mentions for digest + alerts,
             # plus manual-digest-send quota counters. JSON-array strings parsed
             # via the existing tolerant role-id parser shared by giveaway /
@@ -1103,7 +1111,13 @@ def init_db():
                 started_at          TIMESTAMP DEFAULT NULL,
                 ended_at            TIMESTAMP DEFAULT NULL,
                 winners_json        TEXT NOT NULL DEFAULT '[]',
-                random_seed         TEXT DEFAULT NULL
+                random_seed         TEXT DEFAULT NULL,
+                -- Entry gating + cost source. entry_tasks is a JSON array of task
+                -- objects; empty/NULL means no tasks (legacy behavior). cost_source
+                -- picks which point pool pays a non-zero entry cost. Also added via
+                -- the idempotent ALTER block so existing DBs gain them on boot.
+                entry_tasks         TEXT,
+                cost_source         TEXT NOT NULL DEFAULT 'community'
             );
             CREATE INDEX IF NOT EXISTS idx_giveaways_guild_status ON giveaways(guild_id, status);
             CREATE INDEX IF NOT EXISTS idx_giveaways_guild_ends   ON giveaways(guild_id, ends_at);
@@ -1818,6 +1832,7 @@ _GIVEAWAY_EDITABLE = (
     'mention_role_id', 'mention_role_ids',
     'status', 'started_at', 'ended_at',
     'winners_json', 'random_seed',
+    'entry_tasks', 'cost_source',
 )
 
 
@@ -2014,16 +2029,118 @@ def enter_giveaway_atomic(
             pass
 
 
+def resolve_primary_engage_pool_id(guild_id) -> int | None:
+    """The single engage pool that the Giveaway 'engage' cost source charges
+    and refunds for a guild.
+
+    Most guilds have exactly one (default) pool, which is returned directly.
+    AmeretaVerse main runs multiple pools; there we prefer the 'community' pool,
+    falling back to the lowest pool_id, so the choice is deterministic (the same
+    pool is picked at charge time and refund time). Returns None if the guild
+    has no pools and is the multi-pool guild (caller decides what to do)."""
+    gid = str(guild_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT pool_id, name FROM engage_pools WHERE guild_id=? ORDER BY pool_id ASC",
+            (gid,),
+        ).fetchall()
+    if not rows:
+        if gid == _ENGAGE_AMERETAVERSE_GID:
+            return None
+        return ensure_default_pool(gid)['pool_id']
+    for r in rows:
+        if (r['name'] or '').lower() == 'community':
+            return int(r['pool_id'])
+    return int(rows[0]['pool_id'])
+
+
+def enter_giveaway_atomic_engage(
+    giveaway_id: int, guild_id: int, user_id: int, cost: int, pool_id: int,
+) -> dict:
+    """Engage-points twin of enter_giveaway_atomic. Atomically deducts `cost`
+    engage points from engage_user_points(pool_id, user_id) (with an in-txn
+    balance check, so it never clamps a deduction to a free entry) AND inserts
+    the entry row. Either both succeed or neither.
+
+    Returns {'entry_id', 'points_charged', 'new_balance', 'pool_id'}.
+    Raises GiveawayInsufficientPoints / GiveawayAlreadyEntered like the
+    community path."""
+    cost = max(0, int(cost))
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute('BEGIN IMMEDIATE')
+
+        new_balance = 0
+        if cost > 0:
+            row = conn.execute(
+                "SELECT points FROM engage_user_points WHERE pool_id=? AND user_id=?",
+                (int(pool_id), str(user_id)),
+            ).fetchone()
+            balance = int(row['points']) if row else 0
+            if balance < cost:
+                conn.execute('ROLLBACK')
+                raise GiveawayInsufficientPoints(balance, cost)
+            conn.execute(
+                "UPDATE engage_user_points SET points = points - ? "
+                " WHERE pool_id=? AND user_id=?",
+                (cost, int(pool_id), str(user_id)),
+            )
+            new_balance = balance - cost
+
+        try:
+            cur = conn.execute(
+                """INSERT INTO giveaway_entries
+                     (giveaway_id, guild_id, user_id, points_charged)
+                   VALUES (?,?,?,?)""",
+                (int(giveaway_id), int(guild_id), int(user_id), cost),
+            )
+        except sqlite3.IntegrityError:
+            conn.execute('ROLLBACK')
+            raise GiveawayAlreadyEntered()
+
+        conn.execute('COMMIT')
+        return {
+            'entry_id':       int(cur.lastrowid),
+            'points_charged': cost,
+            'new_balance':    new_balance,
+            'pool_id':        int(pool_id),
+        }
+    except Exception:
+        try:
+            conn.execute('ROLLBACK')
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
 def refund_giveaway_entries(giveaway_id: int, guild_id: int) -> dict:
     """Refund the points_charged of every entry on this giveaway, atomically.
 
-    Used when an active paid giveaway is cancelled. Refunds go through the
-    same raid_user_points table the entry charged — so users who entered and
-    then left the guild still receive their points back if they ever return,
-    and the audit log of changes stays in one place.
+    Used when an active paid giveaway is cancelled. Refunds are routed back to
+    whichever pool the entry charged, read from the giveaway's cost_source:
+    'community' goes to raid_user_points (default/legacy), 'engage' goes to the
+    guild's primary engage pool (the same pool enter_giveaway_atomic_engage
+    charged). Keeps the audit of changes in the matching point system.
 
     Returns {'refunded_users': N, 'refunded_points': total}.
     """
+    cost_source = 'community'
+    engage_pool_id = None
+    with get_connection() as conn:
+        grow = conn.execute(
+            "SELECT cost_source FROM giveaways WHERE id=? AND guild_id=?",
+            (int(giveaway_id), int(guild_id)),
+        ).fetchone()
+    if grow and (grow['cost_source'] or 'community') == 'engage':
+        cost_source = 'engage'
+        engage_pool_id = resolve_primary_engage_pool_id(guild_id)
+
     conn = get_connection()
     try:
         conn.isolation_level = None
@@ -2042,15 +2159,25 @@ def refund_giveaway_entries(giveaway_id: int, guild_id: int) -> dict:
             pts  = int(r['points_charged'] or 0)
             if pts <= 0:
                 continue
-            conn.execute(
-                """INSERT INTO raid_user_points
-                     (guild_id, user_id, total_points, raids_completed, last_active)
-                   VALUES (?, ?, ?, 0, datetime('now'))
-                   ON CONFLICT(guild_id, user_id) DO UPDATE SET
-                       total_points = total_points + ?,
-                       last_active  = datetime('now')""",
-                (int(guild_id), uid, pts, pts),
-            )
+            if cost_source == 'engage' and engage_pool_id is not None:
+                conn.execute(
+                    """INSERT INTO engage_user_points
+                         (guild_id, pool_id, user_id, points, total_engaged, total_submitted)
+                       VALUES (?, ?, ?, ?, 0, 0)
+                       ON CONFLICT(pool_id, user_id) DO UPDATE SET
+                           points = points + ?""",
+                    (str(guild_id), int(engage_pool_id), str(uid), pts, pts),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO raid_user_points
+                         (guild_id, user_id, total_points, raids_completed, last_active)
+                       VALUES (?, ?, ?, 0, datetime('now'))
+                       ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                           total_points = total_points + ?,
+                           last_active  = datetime('now')""",
+                    (int(guild_id), uid, pts, pts),
+                )
             total += pts
             users += 1
 

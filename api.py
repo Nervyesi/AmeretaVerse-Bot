@@ -14,6 +14,7 @@ The bot instance is shared via shared_bot.py so guild data is available live.
 # SQLite integers and remain typed as int — they are always small and safe.
 
 import os
+import re
 import json
 import time
 import asyncio
@@ -2853,6 +2854,9 @@ async def embeds_delete(
 _GIVEAWAY_LOCKED_WHEN_ACTIVE = {
     'duration_seconds', 'winner_count', 'entry_cost_points',
     'allowed_role_ids', 'mention_role_id', 'mention_role_ids', 'channel_id',
+    # cost_source is locked once live: flipping the pool after entries are
+    # charged would split-brain the cancel refund. entry_tasks stays editable.
+    'cost_source',
 }
 
 _GIVEAWAY_TITLE_MAX        = 256
@@ -2882,6 +2886,10 @@ class _GiveawayCreate(BaseModel):
     mention_role_ids: Optional[object] = None
     mention_role_id:  Optional[str]    = None
     channel_id: Optional[str] = ''
+    # entry_tasks: list of task dicts (twitter_follow/like/retweet,
+    # discord_member/role). cost_source: 'community' | 'engage'.
+    entry_tasks: Optional[object] = None
+    cost_source: Optional[str]    = None
 
 
 class _GiveawayUpdate(BaseModel):
@@ -2898,6 +2906,8 @@ class _GiveawayUpdate(BaseModel):
     mention_role_ids: Optional[object] = None
     mention_role_id:  Optional[str]    = None
     channel_id: Optional[str] = None
+    entry_tasks: Optional[object] = None
+    cost_source: Optional[str]    = None
 
 
 def _check_giveaway_owner(giveaway_id: int, server_id: int) -> dict:
@@ -2905,6 +2915,76 @@ def _check_giveaway_owner(giveaway_id: int, server_id: int) -> dict:
     if g is None:
         raise HTTPException(status_code=404, detail='Giveaway not found')
     return g
+
+
+_GIVEAWAY_TASK_TYPES = {
+    'twitter_follow', 'twitter_like', 'twitter_retweet',
+    'discord_member', 'discord_role',
+}
+_RE_X_USERNAME = re.compile(r'^[A-Za-z0-9_]{1,15}$')
+_RE_SNOWFLAKE  = re.compile(r'^\d{17,19}$')
+_RE_TWEET_ID   = re.compile(r'(?:status/)?(\d{10,25})')
+
+
+def _validate_entry_tasks(value) -> str:
+    """Validate + normalize the entry_tasks payload into a JSON string for
+    storage. Accepts a list of task dicts. Raises HTTPException(400) with an
+    inline-friendly message on any malformed task. Empty/None => '[]'."""
+    if value in (None, ''):
+        return '[]'
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail='entry_tasks must be a JSON array')
+    if not isinstance(value, list):
+        raise HTTPException(status_code=400, detail='entry_tasks must be a list')
+    if len(value) > 10:
+        raise HTTPException(status_code=400, detail='At most 10 entry tasks are allowed')
+
+    out: list[dict] = []
+    for idx, t in enumerate(value, 1):
+        if not isinstance(t, dict):
+            raise HTTPException(status_code=400, detail=f'Task {idx} is not an object')
+        ttype  = str(t.get('type', '')).strip()
+        target = str(t.get('target', '')).strip()
+        label  = str(t.get('label', '') or '').strip()[:200]
+        if ttype not in _GIVEAWAY_TASK_TYPES:
+            raise HTTPException(status_code=400, detail=f'Task {idx}: unknown type "{ttype}"')
+        if not target:
+            raise HTTPException(status_code=400, detail=f'Task {idx}: target is required')
+
+        if ttype == 'twitter_follow':
+            handle = target.lstrip('@')
+            if not _RE_X_USERNAME.match(handle):
+                raise HTTPException(status_code=400,
+                    detail=f'Task {idx}: "{target}" is not a valid X username')
+            target = handle
+        elif ttype in ('twitter_like', 'twitter_retweet'):
+            if not _RE_TWEET_ID.search(target):
+                raise HTTPException(status_code=400,
+                    detail=f'Task {idx}: "{target}" is not a valid tweet URL or ID')
+        elif ttype == 'discord_member':
+            if not _RE_SNOWFLAKE.match(target):
+                raise HTTPException(status_code=400,
+                    detail=f'Task {idx}: "{target}" is not a valid Discord server ID')
+        elif ttype == 'discord_role':
+            parts = target.split(':', 1)
+            if len(parts) != 2 or not _RE_SNOWFLAKE.match(parts[0].strip()) \
+                    or not _RE_SNOWFLAKE.match(parts[1].strip()):
+                raise HTTPException(status_code=400,
+                    detail=f'Task {idx}: role target must be "serverID:roleID" (both numeric)')
+            target = f'{parts[0].strip()}:{parts[1].strip()}'
+
+        out.append({'type': ttype, 'target': target, 'label': label})
+    return json.dumps(out)
+
+
+def _coerce_cost_source(value) -> str:
+    v = (str(value or '').strip().lower()) or 'community'
+    if v not in ('community', 'engage'):
+        raise HTTPException(status_code=400, detail="cost_source must be 'community' or 'engage'")
+    return v
 
 
 def _coerce_giveaway_color(value) -> int | None:
@@ -3049,11 +3129,19 @@ def _giveaway_row_to_dict(g: dict) -> dict:
     if not mentions and g.get('mention_role_id'):
         mentions = [str(g['mention_role_id'])]
     mentions = [str(m) for m in mentions if str(m).strip()]
+    try:
+        entry_tasks = json.loads(g.get('entry_tasks') or '[]')
+        if not isinstance(entry_tasks, list):
+            entry_tasks = []
+    except (ValueError, TypeError):
+        entry_tasks = []
     color_int = g.get('color')
     color_hex = f'#{int(color_int):06x}' if color_int is not None else None
     return {
         'id':                int(g['id']),
         'guild_id':          str(g['guild_id']),
+        'entry_tasks':       entry_tasks,
+        'cost_source':       (g.get('cost_source') or 'community'),
         'channel_id':        g.get('channel_id') or '',
         'message_id':        g.get('message_id') or '',
         'title':             g.get('title') or '',
@@ -3141,6 +3229,15 @@ async def giveaways_create(
     if mention_list_str != '[]':
         db_update_giveaway(gid, server_id, mention_role_ids=mention_list_str)
 
+    # entry_tasks + cost_source (create helper predates these columns).
+    _post_updates: dict = {}
+    if body.entry_tasks is not None:
+        _post_updates['entry_tasks'] = _validate_entry_tasks(body.entry_tasks)
+    if body.cost_source is not None:
+        _post_updates['cost_source'] = _coerce_cost_source(body.cost_source)
+    if _post_updates:
+        db_update_giveaway(gid, server_id, **_post_updates)
+
     log_event(
         server_id, 'admin_action', 'giveaway_created',
         f'Giveaway #{gid} created by {user.get("username")}',
@@ -3206,6 +3303,10 @@ async def giveaways_update(
         updates['winner_count'] = int(payload['winner_count'])
     if 'entry_cost_points' in payload:
         updates['entry_cost_points'] = int(payload['entry_cost_points'])
+    if 'entry_tasks' in payload:
+        updates['entry_tasks'] = _validate_entry_tasks(payload['entry_tasks'])
+    if 'cost_source' in payload:
+        updates['cost_source'] = _coerce_cost_source(payload['cost_source'])
     if 'allowed_role_ids' in payload:
         updates['allowed_role_ids'] = _normalize_role_id_list(
             payload['allowed_role_ids'], field='allowed_role_ids',
