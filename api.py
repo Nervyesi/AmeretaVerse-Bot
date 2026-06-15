@@ -2923,7 +2923,7 @@ _GIVEAWAY_TASK_TYPES = {
     'discord_member', 'discord_role',
 }
 _RE_X_USERNAME = re.compile(r'^[A-Za-z0-9_]{1,15}$')
-_RE_SNOWFLAKE  = re.compile(r'^\d{17,19}$')
+_RE_SNOWFLAKE  = re.compile(r'^\d{17,20}$')
 _RE_TWEET_ID   = re.compile(r'(?:status/)?(\d{10,25})')
 # Flexible invite acceptance + canonical extraction (Issue 5).
 _RE_DISCORD_INVITE = re.compile(r'^(https?://)?(www\.)?discord\.(gg|com/invite)/[a-zA-Z0-9]+/?$', re.IGNORECASE)

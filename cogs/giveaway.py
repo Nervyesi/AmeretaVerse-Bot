@@ -163,60 +163,60 @@ def _unit_marker(unit: dict) -> str:
     return '❌'
 
 
-def _unit_block(unit: dict, client=None, *, marker: str | None = None) -> list:
-    """Lines for one task: a fixed header (optionally marker-prefixed) followed
-    by its indented detail line(s). Discord adds an unverifiable note when its
-    verdict is the bot-not-in-server case."""
+def _unit_line(unit: dict, client=None, *, marker: str | None = None) -> str:
+    """One line per task: an optional verdict marker, the fixed type label
+    (ending in a colon), then the link inline. A discord task that cannot be
+    verified (bot not in server) gets an inline note appended."""
     kind = unit['kind']
     if kind == 'follow':
         handle = normalize_username(unit['target'])
-        header = 'Follow:'
-        details = [f'[@{handle}](https://x.com/{handle})']
+        label  = 'Follow:'
+        detail = f'[@{handle}](https://x.com/{handle})'
     elif kind == 'engagement':
         if unit['has_like'] and unit['has_retweet']:
-            header = 'Like & Retweet:'
+            label = 'Like & Retweet:'
         elif unit['has_like']:
-            header = 'Like:'
+            label = 'Like:'
         else:
-            header = 'Retweet:'
-        link = _tweet_link(unit['target'])
-        details = [f'[this tweet]({link})' if link else 'this tweet']
+            label = 'Retweet:'
+        link   = _tweet_link(unit['target'])
+        detail = f'[this tweet]({link})' if link else 'this tweet'
     elif kind == 'discord':
-        header = _discord_header(client, unit['task'])
-        details = [_discord_invite_detail(unit['task'])]
+        label  = _discord_header(client, unit['task'])
+        detail = _discord_invite_detail(unit['task'])
     else:
-        header = 'Task:'
-        details = []
+        label, detail = 'Task:', ''
 
+    line = f'{label} {detail}'.strip()
     if marker:
-        header = f'{marker} {header}'
-    lines = [header] + [f'  {d}' for d in details]
+        line = f'{marker} {line}'
     if marker and kind == 'discord' and unit['oks'] and unit['oks'][0] is None:
-        lines.append('  Note: bot is not in this server, cannot verify')
-    return lines
+        line += ' (bot is not in this server)'
+    return line
 
 
 def _render_task_blocks(tasks: list, client=None, results: list | None = None) -> str:
-    """Assemble the task blocks into one string: each task is its header line
-    plus indented details, with a blank line between tasks."""
+    """One line per task, no blank lines between them, under a bold Tasks
+    header. Verdict markers are added once results are in."""
     units = _display_units(tasks, results)
-    blocks = []
+    if not units:
+        return ''
+    lines = []
     for u in units:
         marker = _unit_marker(u) if results is not None else None
-        blocks.append('\n'.join(_unit_block(u, client, marker=marker)))
-    return '\n\n'.join(blocks)
+        lines.append(_unit_line(u, client, marker=marker))
+    return '**Tasks**:\n' + '\n'.join(lines)
 
 
 def _render_tasks_embed(g: dict, results: list | None = None, client=None) -> discord.Embed:
-    """The ephemeral task list shown on Enter. Fixed labels; verdict markers
-    once results are in. No dashes as separators."""
+    """The ephemeral task list shown on Enter. Fixed single-line labels; verdict
+    markers once results are in. No dashes as separators."""
     tasks = _entry_tasks(g)
     body  = _render_task_blocks(tasks, client, results)
     title = (g.get('title') or 'Giveaway')[:200]
-    intro = 'Complete these tasks to enter:' if results is None else 'Task results:'
     return discord.Embed(
         title=f'🎟️ {title}',
-        description=intro + '\n\n' + (body if body else 'No tasks.'),
+        description=body if body else '**Tasks**:\nNo tasks.',
         color=GOLD,
     )
 
@@ -413,24 +413,25 @@ def build_giveaway_embed(guild_id: int, g: dict, entry_count: int, client=None) 
         inline=True,
     )
 
-    # Tasks section. Fixed labels, no per-user verdict markers (public view).
-    # Hidden entirely when there are no tasks, so task-free giveaways look
-    # identical to before. Truncates defensively to the 1024 field cap.
+    # Tasks section. One line per task, no verdict markers (public view). The
+    # field name "Tasks" is the bold section label (matching Details / Winners,
+    # which are also fields). Hidden entirely when there are no tasks, so
+    # task-free giveaways look identical to before. Defensive 1024 truncation.
     if tasks:
         units  = _display_units(tasks)
         out    = []
         used   = 0
         shown  = 0
         for u in units:
-            block = '\n'.join(_unit_block(u, client))
-            if shown > 0 and used + len(block) + 2 > 980:
+            line = _unit_line(u, client)
+            if shown > 0 and used + len(line) + 1 > 1000:
                 break
-            out.append(block)
-            used += len(block) + 2
+            out.append(line)
+            used += len(line) + 1
             shown += 1
         if shown < len(units):
             out.append(f'... and {len(units) - shown} more')
-        embed.add_field(name='Tasks', value='\n\n'.join(out)[:1024], inline=False)
+        embed.add_field(name='Tasks', value='\n'.join(out)[:1024], inline=False)
 
     winners = _winner_ids(g)
     if status == 'ended':
