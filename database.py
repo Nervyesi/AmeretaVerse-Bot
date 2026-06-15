@@ -498,6 +498,9 @@ def init_db():
             # (engage_user_points on the guild's primary pool).
             "ALTER TABLE giveaways ADD COLUMN entry_tasks TEXT",
             "ALTER TABLE giveaways ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'community'",
+            # Weighted giveaway draw: tickets computed from Discord role
+            # multipliers at entry time. Existing entries default to 1.
+            "ALTER TABLE giveaway_entries ADD COLUMN ticket_count INTEGER NOT NULL DEFAULT 1",
             # Wallet Collection embed images. Set via the standard upload UI
             # (asset URLs stored as text), gated to premium guilds in the
             # dashboard. NULL on existing rows => no image, brand default color.
@@ -1135,6 +1138,7 @@ def init_db():
                 user_id         INTEGER NOT NULL,
                 entered_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 points_charged  INTEGER NOT NULL DEFAULT 0,
+                ticket_count    INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(giveaway_id, user_id),
                 FOREIGN KEY (giveaway_id) REFERENCES giveaways(id) ON DELETE CASCADE
             );
@@ -1825,6 +1829,108 @@ def delete_embed_message(embed_id: int, guild_id: int) -> bool:
         return c.rowcount > 0
 
 
+# ── Giveaway entry_tasks normalization (shared by API + cog reads) ───────────
+# Canonicalizes the entry_tasks JSON on every read so the dashboard editor and
+# the Discord embeds see one clean shape. Drops the removed custom label field,
+# keeps twitter_follow / twitter_like / twitter_retweet, and migrates the legacy
+# discord_member / discord_role types into the unified 'discord' type (merging a
+# member + role pair on the same server into one task with role_multipliers).
+
+def _clean_role_multipliers(rms) -> list:
+    out = []
+    if isinstance(rms, list):
+        for r in rms:
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get('role_id', '') or '').strip()
+            if not rid:
+                continue
+            try:
+                mult = int(r.get('multiplier', 1))
+            except (TypeError, ValueError):
+                mult = 1
+            mult = max(1, min(100, mult))
+            rtype = str(r.get('type', 'BASE')).strip().upper()
+            if rtype not in ('BASE', 'STACK'):
+                rtype = 'BASE'
+            out.append({'role_id': rid, 'multiplier': mult, 'type': rtype})
+    return out
+
+
+def normalize_entry_tasks(raw) -> list:
+    """Return a clean list of task dicts. Never raises; malformed input yields []."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+
+    out: list[dict] = []
+    legacy_discord_by_server: dict = {}   # server_id -> index in out (legacy merge only)
+
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        ttype = str(t.get('type', '')).strip()
+
+        if ttype == 'twitter_follow':
+            target = str(t.get('target', '') or '').strip()
+            if target:
+                out.append({'type': 'twitter_follow', 'target': target})
+
+        elif ttype in ('twitter_like', 'twitter_retweet'):
+            target = str(t.get('target', '') or '').strip()
+            if target:
+                out.append({'type': ttype, 'target': target})
+
+        elif ttype == 'discord':
+            sid = str(t.get('server_id', '') or t.get('target', '') or '').strip()
+            if not sid:
+                continue
+            out.append({
+                'type': 'discord',
+                'server_id': sid,
+                'invite_url': str(t.get('invite_url', '') or '').strip(),
+                'role_multipliers': _clean_role_multipliers(t.get('role_multipliers')),
+            })
+
+        elif ttype == 'discord_member':
+            sid = str(t.get('target', '') or t.get('server_id', '') or '').strip()
+            if not sid:
+                continue
+            if sid in legacy_discord_by_server:
+                # A discord task for this server already exists; membership adds nothing.
+                idx = legacy_discord_by_server[sid]
+                if not out[idx]['invite_url'] and t.get('invite_url'):
+                    out[idx]['invite_url'] = str(t.get('invite_url')).strip()
+                continue
+            out.append({'type': 'discord', 'server_id': sid,
+                        'invite_url': str(t.get('invite_url', '') or '').strip(),
+                        'role_multipliers': []})
+            legacy_discord_by_server[sid] = len(out) - 1
+
+        elif ttype == 'discord_role':
+            sid, _, rid = str(t.get('target', '') or '').partition(':')
+            sid, rid = sid.strip(), rid.strip()
+            if not sid:
+                continue
+            rm = {'role_id': rid, 'multiplier': 1, 'type': 'BASE'} if rid else None
+            if sid in legacy_discord_by_server:
+                idx = legacy_discord_by_server[sid]
+                if rm:
+                    out[idx]['role_multipliers'].append(rm)
+                if not out[idx]['invite_url'] and t.get('invite_url'):
+                    out[idx]['invite_url'] = str(t.get('invite_url')).strip()
+            else:
+                out.append({'type': 'discord', 'server_id': sid,
+                            'invite_url': str(t.get('invite_url', '') or '').strip(),
+                            'role_multipliers': [rm] if rm else []})
+                legacy_discord_by_server[sid] = len(out) - 1
+
+    return out
+
+
 # ── Giveaway helpers (guild-scoped) ──────────────────────────────────────────
 # Every read and write filters by guild_id. update_giveaway is restricted to
 # whitelisted columns so callers cannot rewrite id/guild_id/winners. Entry
@@ -1968,19 +2074,20 @@ class GiveawayAlreadyEntered(Exception):
 
 
 def enter_giveaway_atomic(
-    giveaway_id: int, guild_id: int, user_id: int, cost: int,
+    giveaway_id: int, guild_id: int, user_id: int, cost: int, ticket_count: int = 1,
 ) -> dict:
     """Atomically deduct `cost` community points (if > 0) AND insert the entry
-    row in one transaction. Either both succeed or neither — the unique index
+    row in one transaction. Either both succeed or neither. The unique index
     catches double-entry races, and a balance check happens INSIDE the
-    transaction to avoid TOCTOU.
+    transaction to avoid TOCTOU. ticket_count is the weighted-draw weight.
 
     Returns {'entry_id', 'points_charged', 'new_balance'} on success.
     Raises:
-      GiveawayInsufficientPoints — user lacks the cost
-      GiveawayAlreadyEntered     — uniqueness collision (idempotent re-click)
+      GiveawayInsufficientPoints (user lacks the cost)
+      GiveawayAlreadyEntered     (uniqueness collision, idempotent re-click)
     """
     cost = max(0, int(cost))
+    ticket_count = max(1, int(ticket_count or 1))
     conn = get_connection()
     try:
         conn.isolation_level = None        # manual transaction
@@ -2009,9 +2116,9 @@ def enter_giveaway_atomic(
         try:
             cur = conn.execute(
                 """INSERT INTO giveaway_entries
-                     (giveaway_id, guild_id, user_id, points_charged)
-                   VALUES (?,?,?,?)""",
-                (int(giveaway_id), int(guild_id), int(user_id), cost),
+                     (giveaway_id, guild_id, user_id, points_charged, ticket_count)
+                   VALUES (?,?,?,?,?)""",
+                (int(giveaway_id), int(guild_id), int(user_id), cost, ticket_count),
             )
         except sqlite3.IntegrityError:
             conn.execute('ROLLBACK')
@@ -2022,6 +2129,7 @@ def enter_giveaway_atomic(
             'entry_id':       int(cur.lastrowid),
             'points_charged': cost,
             'new_balance':    new_balance,
+            'ticket_count':   ticket_count,
         }
     except Exception:
         try:
@@ -2063,6 +2171,7 @@ def resolve_primary_engage_pool_id(guild_id) -> int | None:
 
 def enter_giveaway_atomic_engage(
     giveaway_id: int, guild_id: int, user_id: int, cost: int, pool_id: int,
+    ticket_count: int = 1,
 ) -> dict:
     """Engage-points twin of enter_giveaway_atomic. Atomically deducts `cost`
     engage points from engage_user_points(pool_id, user_id) (with an in-txn
@@ -2073,6 +2182,7 @@ def enter_giveaway_atomic_engage(
     Raises GiveawayInsufficientPoints / GiveawayAlreadyEntered like the
     community path."""
     cost = max(0, int(cost))
+    ticket_count = max(1, int(ticket_count or 1))
     conn = get_connection()
     try:
         conn.isolation_level = None
@@ -2098,9 +2208,9 @@ def enter_giveaway_atomic_engage(
         try:
             cur = conn.execute(
                 """INSERT INTO giveaway_entries
-                     (giveaway_id, guild_id, user_id, points_charged)
-                   VALUES (?,?,?,?)""",
-                (int(giveaway_id), int(guild_id), int(user_id), cost),
+                     (giveaway_id, guild_id, user_id, points_charged, ticket_count)
+                   VALUES (?,?,?,?,?)""",
+                (int(giveaway_id), int(guild_id), int(user_id), cost, ticket_count),
             )
         except sqlite3.IntegrityError:
             conn.execute('ROLLBACK')
@@ -2112,6 +2222,7 @@ def enter_giveaway_atomic_engage(
             'points_charged': cost,
             'new_balance':    new_balance,
             'pool_id':        int(pool_id),
+            'ticket_count':   ticket_count,
         }
     except Exception:
         try:

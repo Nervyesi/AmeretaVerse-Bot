@@ -39,6 +39,7 @@ from database import (
     claim_giveaway_for_draw,
     list_due_giveaways,
     get_user_x_username,
+    normalize_entry_tasks,
     log_event,
     GiveawayInsufficientPoints,
     GiveawayAlreadyEntered,
@@ -54,45 +55,18 @@ from cogs._twitter_follow import check_user_follows
 GOLD     = 0xC8A84E
 _NO_PING = discord.AllowedMentions(roles=False, users=False, everyone=False)
 
-_VALID_TASK_TYPES = {
-    'twitter_follow', 'twitter_like', 'twitter_retweet',
-    'discord_member', 'discord_role',
-}
-_DISCORD_TASK_TYPES = {'discord_member', 'discord_role'}
-
 
 def _entry_tasks(g: dict) -> list:
-    """Parse + validate the giveaway's entry_tasks JSON into clean task dicts.
-    A malformed column, a non-list, or a giveaway from before this feature all
-    yield [] so the entry flow stays exactly as it was (backward compatible).
-    Discord tasks carry an optional invite_url (used only for display)."""
-    raw = g.get('entry_tasks') or '[]'
-    try:
-        data = json.loads(raw) if isinstance(raw, str) else raw
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(data, list):
-        return []
-    out: list[dict] = []
-    for t in data:
-        if not isinstance(t, dict):
-            continue
-        ttype  = str(t.get('type', '')).strip()
-        target = str(t.get('target', '')).strip()
-        if ttype not in _VALID_TASK_TYPES or not target:
-            continue
-        row = {'type': ttype, 'target': target, 'label': str(t.get('label', '')).strip()}
-        if ttype in _DISCORD_TASK_TYPES:
-            row['invite_url'] = str(t.get('invite_url', '') or '').strip()
-        out.append(row)
-    return out
+    """Canonical entry tasks for this giveaway: legacy types migrated to the
+    unified shapes, custom labels dropped. [] when there are none (backward
+    compatible: task-free giveaways behave exactly as before)."""
+    return normalize_entry_tasks(g.get('entry_tasks') or '[]')
 
 
 # ── Task display (shared by verification embed + public embed) ────────────────
-# Like + Retweet on the same tweet merge into one logical unit so the UI shows a
-# single "Like & Retweet" line (Fix 4). Storage stays as separate twitter_like /
-# twitter_retweet rows, so verification logic is untouched and legacy giveaways
-# render merged automatically.
+# Labels are FIXED per task type (no user-supplied label). twitter_like and
+# twitter_retweet on the same tweet merge into one engagement line; the discord
+# type renders server name + per-role multiplier tags resolved from the cache.
 
 def _tweet_link(target: str) -> str | None:
     if target.startswith(('http://', 'https://')):
@@ -129,22 +103,32 @@ def _role_name(client, guild_id, role_id) -> str | None:
     return role.name if role else None
 
 
-def _discord_join_line(client, guild_id, invite_url) -> str:
-    name   = _guild_name(client, guild_id)
-    invite = (invite_url or '').strip()
-    if name and invite:
-        return f'Join the [{name}]({invite}) Server'
-    if name:
-        return f'Join the {name} Server'
-    if invite:
-        return f'Join the [Discord server]({invite})'
-    return 'Join the configured Discord server'
+def _role_tag(client, server_id, rm: dict) -> str:
+    """A single role multiplier tag: BASE -> (Name Nx), STACK -> (Name +N)."""
+    rname = _role_name(client, server_id, rm.get('role_id')) or 'the configured role'
+    mult  = int(rm.get('multiplier') or 1)
+    if str(rm.get('type')).upper() == 'STACK':
+        return f'({rname} +{mult})'
+    return f'({rname} {mult}x)'
 
 
-def _merge_tasks_for_display(tasks: list, results: list | None = None) -> list:
-    """Group flat tasks into logical display units, merging a twitter_like and
-    twitter_retweet that target the same tweet into one engagement unit.
-    results (when given) is 1:1 with tasks and folds into per-unit oks."""
+def _discord_header(client, task: dict) -> str:
+    name = _guild_name(client, task.get('server_id')) or 'the Discord server'
+    rms  = task.get('role_multipliers') or []
+    if not rms:
+        return f'Join Discord ({name}):'
+    tags = ' '.join(_role_tag(client, task.get('server_id'), rm) for rm in rms)
+    return f'Join Discord ({name}) and have the role {tags}:'
+
+
+def _discord_invite_detail(task: dict) -> str:
+    invite = (task.get('invite_url') or '').strip()
+    return f'[{invite}]({invite})' if invite else '(no invite link configured)'
+
+
+def _display_units(tasks: list, results: list | None = None) -> list:
+    """Group canonical tasks into display units (merging like + retweet on the
+    same tweet). results, when given, is 1:1 with tasks and folds into oks."""
     units: list[dict] = []
     eng_by_key: dict = {}
     for i, t in enumerate(tasks):
@@ -154,7 +138,7 @@ def _merge_tasks_for_display(tasks: list, results: list | None = None) -> list:
             key = _tweet_id_key(t['target'])
             u = eng_by_key.get(key)
             if u is None:
-                u = {'kind': 'engagement', 'target': t['target'], 'label': '',
+                u = {'kind': 'engagement', 'target': t['target'],
                      'has_like': False, 'has_retweet': False, 'oks': []}
                 eng_by_key[key] = u
                 units.append(u)
@@ -162,13 +146,11 @@ def _merge_tasks_for_display(tasks: list, results: list | None = None) -> list:
                 u['has_like'] = True
             else:
                 u['has_retweet'] = True
-            if not u['label'] and t.get('label'):
-                u['label'] = t['label']
             u['oks'].append(ok)
-        else:
-            units.append({'kind': ttype, 'target': t['target'],
-                          'label': t.get('label', ''), 'invite_url': t.get('invite_url', ''),
-                          'oks': [ok]})
+        elif ttype == 'twitter_follow':
+            units.append({'kind': 'follow', 'target': t['target'], 'oks': [ok]})
+        elif ttype == 'discord':
+            units.append({'kind': 'discord', 'task': t, 'oks': [ok]})
     return units
 
 
@@ -181,57 +163,105 @@ def _unit_marker(unit: dict) -> str:
     return '❌'
 
 
-def _unit_lines(unit: dict, client=None) -> list:
-    """Display text line(s) for one unit, without number or marker. A
-    discord_role unit returns two lines (join line, then the role line)."""
-    kind  = unit['kind']
-    label = (unit.get('label') or '').strip()
-    if kind == 'twitter_follow':
+def _unit_block(unit: dict, client=None, *, marker: str | None = None) -> list:
+    """Lines for one task: a fixed header (optionally marker-prefixed) followed
+    by its indented detail line(s). Discord adds an unverifiable note when its
+    verdict is the bot-not-in-server case."""
+    kind = unit['kind']
+    if kind == 'follow':
         handle = normalize_username(unit['target'])
-        phrase = label or 'Follow'
-        return [f'{phrase} [@{handle}](https://x.com/{handle})']
-    if kind == 'engagement':
-        link = _tweet_link(unit['target'])
+        header = 'Follow:'
+        details = [f'[@{handle}](https://x.com/{handle})']
+    elif kind == 'engagement':
         if unit['has_like'] and unit['has_retweet']:
-            verb = 'Like & Retweet'
+            header = 'Like & Retweet:'
         elif unit['has_like']:
-            verb = 'Like'
+            header = 'Like:'
         else:
-            verb = 'Retweet'
-        phrase = label or verb
-        anchor = f'[this tweet]({link})' if link else 'this tweet'
-        return [f'{phrase} {anchor}']
-    if kind == 'discord_member':
-        return [_discord_join_line(client, unit['target'], unit.get('invite_url'))]
-    if kind == 'discord_role':
-        raw = str(unit['target'] or '')
-        gid, role_id = (raw.split(':', 1) + [''])[:2]
-        rname = _role_name(client, gid, role_id)
-        role_line = f'And have the {rname} role' if rname else 'And have the configured role'
-        return [_discord_join_line(client, gid, unit.get('invite_url')), role_line]
-    return [label or 'Complete the task']
+            header = 'Retweet:'
+        link = _tweet_link(unit['target'])
+        details = [f'[this tweet]({link})' if link else 'this tweet']
+    elif kind == 'discord':
+        header = _discord_header(client, unit['task'])
+        details = [_discord_invite_detail(unit['task'])]
+    else:
+        header = 'Task:'
+        details = []
+
+    if marker:
+        header = f'{marker} {header}'
+    lines = [header] + [f'  {d}' for d in details]
+    if marker and kind == 'discord' and unit['oks'] and unit['oks'][0] is None:
+        lines.append('  Note: bot is not in this server, cannot verify')
+    return lines
+
+
+def _render_task_blocks(tasks: list, client=None, results: list | None = None) -> str:
+    """Assemble the task blocks into one string: each task is its header line
+    plus indented details, with a blank line between tasks."""
+    units = _display_units(tasks, results)
+    blocks = []
+    for u in units:
+        marker = _unit_marker(u) if results is not None else None
+        blocks.append('\n'.join(_unit_block(u, client, marker=marker)))
+    return '\n\n'.join(blocks)
 
 
 def _render_tasks_embed(g: dict, results: list | None = None, client=None) -> discord.Embed:
-    """The ephemeral task list shown on Enter. Before verification (results is
-    None) each unit gets a neutral bullet; after, a per-unit verdict marker.
-    Discord role units span two lines (join + role). No dashes as separators."""
-    units = _merge_tasks_for_display(_entry_tasks(g), results)
-    lines: list[str] = []
-    for i, u in enumerate(units, 1):
-        ulines = _unit_lines(u, client)
-        marker = _unit_marker(u) if results else '🔹'
-        lines.append(f'{i}. {marker} {ulines[0]}')
-        for extra in ulines[1:]:
-            lines.append(f'   {extra}')
-
+    """The ephemeral task list shown on Enter. Fixed labels; verdict markers
+    once results are in. No dashes as separators."""
+    tasks = _entry_tasks(g)
+    body  = _render_task_blocks(tasks, client, results)
     title = (g.get('title') or 'Giveaway')[:200]
     intro = 'Complete these tasks to enter:' if results is None else 'Task results:'
     return discord.Embed(
         title=f'🎟️ {title}',
-        description=intro + '\n\n' + ('\n'.join(lines) if lines else 'No tasks.'),
+        description=intro + '\n\n' + (body if body else 'No tasks.'),
         color=GOLD,
     )
+
+
+def _discord_task_contribution(role_multipliers: list, user_role_ids: set) -> int:
+    """Ticket contribution for one Discord task given the user's role ids in
+    that server. No roles configured => 0. Otherwise base (max matched BASE, or
+    1 if a STACK matched but no BASE) plus the sum of matched STACK multipliers."""
+    rms = role_multipliers or []
+    if not rms:
+        return 0
+    matched_base = [int(r['multiplier']) for r in rms
+                    if str(r.get('type')).upper() == 'BASE' and str(r.get('role_id')) in user_role_ids]
+    matched_stack = [int(r['multiplier']) for r in rms
+                     if str(r.get('type')).upper() == 'STACK' and str(r.get('role_id')) in user_role_ids]
+    if not matched_base and not matched_stack:
+        return 0
+    base_value = max(matched_base) if matched_base else 1
+    return base_value + sum(matched_stack)
+
+
+def _weighted_draw_no_repeat(items: list, weights: list, k: int, rng) -> list:
+    """Pick up to k distinct items by ticket weight, no repeats. Each item is
+    removed from the pool once drawn so a single user wins at most once even
+    with many tickets. Deterministic for a given rng (seeded for auditability).
+    Falls back to uniform if all weights are non-positive."""
+    pool = [[it, max(1, int(w or 1))] for it, w in zip(items, weights)]
+    winners = []
+    n = min(k, len(pool))
+    for _ in range(n):
+        total = sum(w for _, w in pool)
+        if total <= 0:
+            idx = rng.randrange(len(pool))
+        else:
+            r = rng.random() * total
+            cum = 0.0
+            idx = len(pool) - 1
+            for i, (_, w) in enumerate(pool):
+                cum += w
+                if r < cum:
+                    idx = i
+                    break
+        winners.append(pool[idx][0])
+        pool.pop(idx)
+    return winners
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -383,26 +413,24 @@ def build_giveaway_embed(guild_id: int, g: dict, entry_count: int, client=None) 
         inline=True,
     )
 
-    # Tasks section (Fix 6). Numbered, no result markers (those are per-user).
+    # Tasks section. Fixed labels, no per-user verdict markers (public view).
     # Hidden entirely when there are no tasks, so task-free giveaways look
-    # identical to before. Truncates defensively to stay under the 1024 field
-    # cap on the rare very long task list.
+    # identical to before. Truncates defensively to the 1024 field cap.
     if tasks:
-        units  = _merge_tasks_for_display(tasks)
+        units  = _display_units(tasks)
         out    = []
         used   = 0
         shown  = 0
-        for idx, u in enumerate(units, 1):
-            ulines = _unit_lines(u, client)
-            block  = '\n'.join([f'{idx}. {ulines[0]}'] + [f'   {e}' for e in ulines[1:]])
-            if shown > 0 and used + len(block) + 1 > 980:
+        for u in units:
+            block = '\n'.join(_unit_block(u, client))
+            if shown > 0 and used + len(block) + 2 > 980:
                 break
             out.append(block)
-            used += len(block) + 1
+            used += len(block) + 2
             shown += 1
         if shown < len(units):
             out.append(f'... and {len(units) - shown} more')
-        embed.add_field(name='Tasks', value='\n'.join(out)[:1024], inline=False)
+        embed.add_field(name='Tasks', value='\n\n'.join(out)[:1024], inline=False)
 
     winners = _winner_ids(g)
     if status == 'ended':
@@ -686,14 +714,15 @@ class Giveaway(commands.Cog):
     # ── Shared entry finalize (cost source aware) ────────────────────────
 
     async def _finalize_entry(self, interaction: discord.Interaction, g: dict,
-                              guild_id: int, user) -> tuple[bool, str]:
+                              guild_id: int, user, ticket_count: int = 1) -> tuple[bool, str]:
         """Charge the configured cost source and insert the entry atomically.
-        Returns (ok, message). Used by the no-tasks path and the post-verify
-        path. cost_source selects the pool only when cost > 0; 'community' keeps
-        the legacy raid_user_points behavior, 'engage' charges the guild's
-        primary engage pool."""
+        Returns (ok, message). Used by the no-tasks path (ticket_count 1) and the
+        post-verify path (computed tickets). cost_source selects the pool only
+        when cost > 0; 'community' keeps the legacy raid_user_points behavior,
+        'engage' charges the guild's primary engage pool."""
         giveaway_id = int(g['id'])
         cost        = max(0, int(g.get('entry_cost_points') or 0))
+        ticket_count = max(1, int(ticket_count or 1))
         cost_source = (g.get('cost_source') or 'community').strip().lower()
         if cost_source not in ('community', 'engage'):
             cost_source = 'community'
@@ -704,9 +733,9 @@ class Giveaway(commands.Cog):
                 pool_id = resolve_primary_engage_pool_id(guild_id)
                 if not pool_id:
                     return False, 'Engage points are not set up in this server. Contact an admin.'
-                res = enter_giveaway_atomic_engage(giveaway_id, guild_id, user.id, cost, pool_id)
+                res = enter_giveaway_atomic_engage(giveaway_id, guild_id, user.id, cost, pool_id, ticket_count)
             else:
-                res = enter_giveaway_atomic(giveaway_id, guild_id, user.id, cost)
+                res = enter_giveaway_atomic(giveaway_id, guild_id, user.id, cost, ticket_count)
         except GiveawayInsufficientPoints as e:
             need = max(0, e.required - e.balance)
             log_event(guild_id, 'admin_action', 'giveaway_entry_skipped',
@@ -730,53 +759,53 @@ class Giveaway(commands.Cog):
         balance_line = (
             f'\n**Balance:** {res["new_balance"]:,} {unit}' if cost > 0 else ''
         )
+        tickets_line = f'\n**Your tickets:** {ticket_count}' if ticket_count > 1 else ''
 
         log_event(guild_id, 'admin_action', 'giveaway_entered',
                   f'Giveaway #{giveaway_id} entered by {user}',
                   actor_user_id=user.id, actor_username=str(user),
                   module='giveaway', severity='info',
                   details={'giveaway_id': giveaway_id, 'user_id': user.id,
-                           'cost': cost, 'cost_source': cost_source, 'entries_after': total})
+                           'cost': cost, 'cost_source': cost_source,
+                           'ticket_count': ticket_count, 'entries_after': total})
 
         await self._schedule_refresh(giveaway_id, guild_id)
-        return True, f'You are in! 🎉\n**Entries:** {total:,}\n**Your odds:** {odds}{balance_line}'
+        return True, f'You are in! 🎉\n**Entries:** {total:,}\n**Your odds:** {odds}{tickets_line}{balance_line}'
 
     # ── Task verification + gated entry ──────────────────────────────────
 
-    def _check_discord_member(self, target_guild_id: str, user_id: int):
-        """True member / False not member / None unverifiable (bot not in guild)."""
+    def _verify_discord_task(self, task: dict, user_id: int):
+        """Verify one unified discord task. Returns (ok, contribution, matched_names).
+        ok: True passed / False failed / None unverifiable (bot not in server).
+        Membership is always required; a role check applies only when the task
+        has role_multipliers (user must hold at least one). contribution is the
+        ticket value for this task (0 when no roles configured)."""
         try:
-            gid = int(str(target_guild_id).strip())
+            gid = int(str(task.get('server_id')).strip())
         except (TypeError, ValueError):
-            return False
+            return False, 0, []
         guild = self.bot.get_guild(gid)
         if guild is None:
-            return None
-        return guild.get_member(int(user_id)) is not None
-
-    def _check_discord_role(self, target: str, user_id: int):
-        """target is 'guild_id:role_id'. True has role / False not / None unverifiable."""
-        raw = str(target or '').strip()
-        if ':' not in raw:
-            return False
-        gid_s, role_s = raw.split(':', 1)
-        try:
-            gid = int(gid_s.strip())
-        except (TypeError, ValueError):
-            return False
-        role_id = role_s.strip()
-        guild = self.bot.get_guild(gid)
-        if guild is None:
-            return None
+            return None, 0, []                       # bot not in server
         member = guild.get_member(int(user_id))
         if member is None:
-            return False
-        return any(str(r.id) == role_id for r in member.roles)
+            return False, 0, []                      # not a member
+        rms = task.get('role_multipliers') or []
+        if not rms:
+            return True, 0, []                       # membership only
+        user_role_ids = {str(r.id) for r in member.roles}
+        matched = [rm for rm in rms if str(rm.get('role_id')) in user_role_ids]
+        if not matched:
+            return False, 0, []                      # holds none of the required roles
+        contribution = _discord_task_contribution(rms, user_role_ids)
+        matched_names = [(_role_name(self.bot, gid, rm['role_id']) or str(rm['role_id'])) for rm in matched]
+        return True, contribution, matched_names
 
     async def _verify_all_tasks(self, interaction: discord.Interaction, g: dict) -> dict:
-        """Run every task once. Returns either {'status':'need_handle'} or
-        {'status':'done', 'results':[...], 'all_passed':bool, 'any_unverifiable':bool}.
-        Each result: {'task', 'ok': True|False|None, 'source': 'api_verified'|'self_attested'}."""
+        """Run every task once. Returns {'status':'need_handle'} or
+        {'status':'done', 'results', 'all_passed', 'any_unverifiable',
+         'ticket_count', 'role_matches'}. Each result carries 'ok',
+        'contribution', and (for discord) 'matched_roles'."""
         tasks = _entry_tasks(g)
         needs_handle = any(t['type'] in ('twitter_follow', 'twitter_retweet') for t in tasks)
         handle = get_user_x_username(interaction.user.id) if needs_handle else None
@@ -784,34 +813,36 @@ class Giveaway(commands.Cog):
             return {'status': 'need_handle'}
 
         results: list[dict] = []
+        role_matches: dict = {}
         for t in tasks:
-            ttype, target = t['type'], t['target']
+            ttype = t['type']
             if ttype == 'twitter_like':
                 # Self-attested per owner decision: clicking verify passes it.
-                results.append({'task': t, 'ok': True, 'source': 'self_attested'})
+                results.append({'task': t, 'ok': True, 'source': 'self_attested', 'contribution': 0})
             elif ttype == 'twitter_follow':
-                r = await check_user_follows(target, handle)
-                results.append({'task': t, 'ok': r.get('verified') is True, 'source': 'api_verified'})
+                r = await check_user_follows(t['target'], handle)
+                results.append({'task': t, 'ok': r.get('verified') is True, 'source': 'api_verified', 'contribution': 0})
             elif ttype == 'twitter_retweet':
-                tid = extract_tweet_id(target) or (target if target.isdigit() else None)
-                if not tid:
-                    results.append({'task': t, 'ok': False, 'source': 'api_verified'})
-                else:
+                tid = extract_tweet_id(t['target']) or (t['target'] if str(t['target']).isdigit() else None)
+                ok = False
+                if tid:
                     r = await check_retweet(tid, handle)
-                    results.append({'task': t, 'ok': r.get('verified') is True, 'source': 'api_verified'})
-            elif ttype == 'discord_member':
-                results.append({'task': t, 'ok': self._check_discord_member(target, interaction.user.id),
-                                'source': 'api_verified'})
-            elif ttype == 'discord_role':
-                results.append({'task': t, 'ok': self._check_discord_role(target, interaction.user.id),
-                                'source': 'api_verified'})
+                    ok = r.get('verified') is True
+                results.append({'task': t, 'ok': ok, 'source': 'api_verified', 'contribution': 0})
+            elif ttype == 'discord':
+                ok, contrib, matched = self._verify_discord_task(t, interaction.user.id)
+                results.append({'task': t, 'ok': ok, 'source': 'api_verified',
+                                'contribution': contrib, 'matched_roles': matched})
+                role_matches[str(t.get('server_id'))] = matched
             else:
-                results.append({'task': t, 'ok': False, 'source': 'unknown'})
+                results.append({'task': t, 'ok': False, 'source': 'unknown', 'contribution': 0})
 
         all_passed       = bool(results) and all(r['ok'] is True for r in results)
         any_unverifiable = any(r['ok'] is None for r in results)
+        ticket_count     = max(1, sum(int(r.get('contribution') or 0) for r in results))
         return {'status': 'done', 'results': results,
-                'all_passed': all_passed, 'any_unverifiable': any_unverifiable}
+                'all_passed': all_passed, 'any_unverifiable': any_unverifiable,
+                'ticket_count': ticket_count, 'role_matches': role_matches}
 
     async def handle_verify_and_enter(self, interaction: discord.Interaction,
                                       giveaway_id: int, view: 'GiveawayTasksView'):
@@ -855,9 +886,10 @@ class Giveaway(commands.Cog):
         results       = vres['results']
         tasks_checked = len(results)
         tasks_passed  = sum(1 for r in results if r['ok'] is True)
+        ticket_count  = int(vres.get('ticket_count') or 1)
 
         if vres['all_passed']:
-            ok, text = await self._finalize_entry(interaction, g, guild_id, user)
+            ok, text = await self._finalize_entry(interaction, g, guild_id, user, ticket_count)
             embed = _render_tasks_embed(g, results, client=interaction.client)
             embed.description += f'\n\n{"✅ " if ok else ""}{text}'
             await interaction.edit_original_response(embed=embed, view=None if ok else view)
@@ -878,6 +910,8 @@ class Giveaway(commands.Cog):
                   module='giveaway', severity='info',
                   details={'giveaway_id': giveaway_id, 'user_id': str(user.id),
                            'tasks_checked': tasks_checked, 'tasks_passed': tasks_passed,
+                           'ticket_count': (ticket_count if outcome == 'entered' else 0),
+                           'role_matches': vres.get('role_matches', {}),
                            'cost_source': cost_source, 'outcome': outcome})
 
     # ── Status button handler ───────────────────────────────────────────
@@ -1018,6 +1052,8 @@ class Giveaway(commands.Cog):
         entries = list_giveaway_entries(gid, guild_id)
         user_ids = [int(e['user_id']) for e in entries
                     if e.get('user_id') is not None]
+        weights = [max(1, int(e.get('ticket_count') or 1)) for e in entries
+                   if e.get('user_id') is not None]
 
         winner_count = max(1, int(g.get('winner_count') or 1))
         seed = g.get('random_seed') or ''
@@ -1027,11 +1063,7 @@ class Giveaway(commands.Cog):
             seed = f'gid={gid}|started={g.get("started_at") or ""}'
 
         rng = random.Random(seed)
-        if user_ids:
-            n = min(winner_count, len(user_ids))
-            winner_ids = rng.sample(user_ids, n)
-        else:
-            winner_ids = []
+        winner_ids = _weighted_draw_no_repeat(user_ids, weights, winner_count, rng)
 
         ended_at = _now_iso()
         update_giveaway(

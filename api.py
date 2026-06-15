@@ -2918,19 +2918,65 @@ def _check_giveaway_owner(giveaway_id: int, server_id: int) -> dict:
 
 
 _GIVEAWAY_TASK_TYPES = {
-    'twitter_follow', 'twitter_like', 'twitter_retweet',
+    'twitter_follow', 'twitter_like', 'twitter_retweet', 'discord',
+    # legacy types still accepted on save (migrated to 'discord')
     'discord_member', 'discord_role',
 }
 _RE_X_USERNAME = re.compile(r'^[A-Za-z0-9_]{1,15}$')
 _RE_SNOWFLAKE  = re.compile(r'^\d{17,19}$')
 _RE_TWEET_ID   = re.compile(r'(?:status/)?(\d{10,25})')
-_RE_DISCORD_INVITE = re.compile(r'^https://(discord\.gg/|discord\.com/invite/)\S+$')
+# Flexible invite acceptance + canonical extraction (Issue 5).
+_RE_DISCORD_INVITE = re.compile(r'^(https?://)?(www\.)?discord\.(gg|com/invite)/[a-zA-Z0-9]+/?$', re.IGNORECASE)
+_RE_INVITE_CODE    = re.compile(r'(?:discord\.gg/|discord\.com/invite/)([a-zA-Z0-9]+)', re.IGNORECASE)
+
+# Per-giveaway task-type caps (Issue 7).
+_GIVEAWAY_MAX_FOLLOW  = 5
+_GIVEAWAY_MAX_ENGAGE  = 1   # one tweet (like and/or retweet)
+_GIVEAWAY_MAX_DISCORD = 2
+
+
+def _normalize_discord_invite(raw: str) -> str:
+    """Validate a flexible Discord invite and return canonical
+    https://discord.gg/{code}. Raises HTTPException(400) on a bad value."""
+    s = str(raw or '').strip()
+    if not _RE_DISCORD_INVITE.match(s):
+        raise HTTPException(status_code=400, detail='Enter a valid Discord invite URL')
+    m = _RE_INVITE_CODE.search(s)
+    if not m:
+        raise HTTPException(status_code=400, detail='Enter a valid Discord invite URL')
+    return f'https://discord.gg/{m.group(1)}'
+
+
+def _validate_role_multipliers(rms, idx: int) -> list:
+    out = []
+    if rms in (None, ''):
+        return out
+    if not isinstance(rms, list):
+        raise HTTPException(status_code=400, detail=f'Task {idx}: role_multipliers must be a list')
+    for r in rms:
+        if not isinstance(r, dict):
+            raise HTTPException(status_code=400, detail=f'Task {idx}: each role must be an object')
+        rid = str(r.get('role_id', '') or '').strip()
+        if not _RE_SNOWFLAKE.match(rid):
+            raise HTTPException(status_code=400, detail=f'Task {idx}: role ID "{rid}" is not a valid snowflake')
+        try:
+            mult = int(r.get('multiplier', 1))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f'Task {idx}: multiplier must be a positive integer')
+        if mult < 1 or mult > 100:
+            raise HTTPException(status_code=400, detail=f'Task {idx}: multiplier must be 1 to 100')
+        rtype = str(r.get('type', 'BASE')).strip().upper()
+        if rtype not in ('BASE', 'STACK'):
+            raise HTTPException(status_code=400, detail=f'Task {idx}: role type must be BASE or STACK')
+        out.append({'role_id': rid, 'multiplier': mult, 'type': rtype})
+    return out
 
 
 def _validate_entry_tasks(value) -> str:
     """Validate + normalize the entry_tasks payload into a JSON string for
-    storage. Accepts a list of task dicts. Raises HTTPException(400) with an
-    inline-friendly message on any malformed task. Empty/None => '[]'."""
+    storage. Custom labels are dropped. Legacy discord_member/discord_role are
+    migrated to the unified 'discord' type. Enforces per-type caps. Raises
+    HTTPException(400) with an inline-friendly message. Empty/None => '[]'."""
     if value in (None, ''):
         return '[]'
     if isinstance(value, str):
@@ -2940,55 +2986,59 @@ def _validate_entry_tasks(value) -> str:
             raise HTTPException(status_code=400, detail='entry_tasks must be a JSON array')
     if not isinstance(value, list):
         raise HTTPException(status_code=400, detail='entry_tasks must be a list')
-    if len(value) > 10:
-        raise HTTPException(status_code=400, detail='At most 10 entry tasks are allowed')
+    if len(value) > 12:
+        raise HTTPException(status_code=400, detail='Too many entry tasks')
 
     out: list[dict] = []
     for idx, t in enumerate(value, 1):
         if not isinstance(t, dict):
             raise HTTPException(status_code=400, detail=f'Task {idx} is not an object')
-        ttype  = str(t.get('type', '')).strip()
-        target = str(t.get('target', '')).strip()
-        label  = str(t.get('label', '') or '').strip()[:200]
-        if ttype not in _GIVEAWAY_TASK_TYPES:
-            raise HTTPException(status_code=400, detail=f'Task {idx}: unknown type "{ttype}"')
-        if not target:
-            raise HTTPException(status_code=400, detail=f'Task {idx}: target is required')
+        ttype = str(t.get('type', '')).strip()
 
         if ttype == 'twitter_follow':
-            handle = target.lstrip('@')
+            handle = str(t.get('target', '')).strip().lstrip('@')
             if not _RE_X_USERNAME.match(handle):
-                raise HTTPException(status_code=400,
-                    detail=f'Task {idx}: "{target}" is not a valid X username')
-            target = handle
-        elif ttype in ('twitter_like', 'twitter_retweet'):
-            if not _RE_TWEET_ID.search(target):
-                raise HTTPException(status_code=400,
-                    detail=f'Task {idx}: "{target}" is not a valid tweet URL or ID')
-        elif ttype == 'discord_member':
-            if not _RE_SNOWFLAKE.match(target):
-                raise HTTPException(status_code=400,
-                    detail=f'Task {idx}: "{target}" is not a valid Discord server ID')
-        elif ttype == 'discord_role':
-            parts = target.split(':', 1)
-            if len(parts) != 2 or not _RE_SNOWFLAKE.match(parts[0].strip()) \
-                    or not _RE_SNOWFLAKE.match(parts[1].strip()):
-                raise HTTPException(status_code=400,
-                    detail=f'Task {idx}: role target must be "serverID:roleID" (both numeric)')
-            target = f'{parts[0].strip()}:{parts[1].strip()}'
+                raise HTTPException(status_code=400, detail=f'Task {idx}: not a valid X username')
+            out.append({'type': 'twitter_follow', 'target': handle})
 
-        row = {'type': ttype, 'target': target, 'label': label}
-        # Discord tasks carry an optional invite URL (display only). Optional in
-        # the schema for back-compat; validated for shape when present. The
-        # dashboard requires it on new/edited tasks.
-        if ttype in ('discord_member', 'discord_role'):
-            invite = str(t.get('invite_url', '') or '').strip()
-            if invite:
-                if not _RE_DISCORD_INVITE.match(invite):
-                    raise HTTPException(status_code=400,
-                        detail=f'Task {idx}: invite URL must be a discord.gg or discord.com/invite link')
-                row['invite_url'] = invite
-        out.append(row)
+        elif ttype in ('twitter_like', 'twitter_retweet'):
+            target = str(t.get('target', '')).strip()
+            if not _RE_TWEET_ID.search(target):
+                raise HTTPException(status_code=400, detail=f'Task {idx}: not a valid tweet URL or ID')
+            out.append({'type': ttype, 'target': target})
+
+        elif ttype in ('discord', 'discord_member', 'discord_role'):
+            # Resolve server id + role_multipliers from any of the shapes.
+            if ttype == 'discord':
+                sid = str(t.get('server_id', '') or t.get('target', '')).strip()
+                rms = _validate_role_multipliers(t.get('role_multipliers'), idx)
+            elif ttype == 'discord_member':
+                sid = str(t.get('target', '') or t.get('server_id', '')).strip()
+                rms = []
+            else:  # discord_role
+                sid, _, rid = str(t.get('target', '')).partition(':')
+                sid = sid.strip()
+                rms = _validate_role_multipliers(
+                    [{'role_id': rid.strip(), 'multiplier': 1, 'type': 'BASE'}] if rid.strip() else [], idx)
+            if not _RE_SNOWFLAKE.match(sid):
+                raise HTTPException(status_code=400, detail=f'Task {idx}: not a valid Discord server ID')
+            invite = _normalize_discord_invite(t.get('invite_url')) if str(t.get('invite_url') or '').strip() else ''
+            out.append({'type': 'discord', 'server_id': sid, 'invite_url': invite,
+                        'role_multipliers': rms})
+        else:
+            raise HTTPException(status_code=400, detail=f'Task {idx}: unknown type "{ttype}"')
+
+    # Per-type caps (Issue 7). Engagement counts distinct tweets across like/retweet.
+    n_follow  = sum(1 for r in out if r['type'] == 'twitter_follow')
+    n_discord = sum(1 for r in out if r['type'] == 'discord')
+    tweets    = {r['target'] for r in out if r['type'] in ('twitter_like', 'twitter_retweet')}
+    if n_follow > _GIVEAWAY_MAX_FOLLOW:
+        raise HTTPException(status_code=400, detail=f'At most {_GIVEAWAY_MAX_FOLLOW} Follow tasks')
+    if len(tweets) > _GIVEAWAY_MAX_ENGAGE:
+        raise HTTPException(status_code=400, detail='At most 1 Like / Retweet task')
+    if n_discord > _GIVEAWAY_MAX_DISCORD:
+        raise HTTPException(status_code=400, detail=f'At most {_GIVEAWAY_MAX_DISCORD} Discord tasks')
+
     return json.dumps(out)
 
 
@@ -3141,12 +3191,11 @@ def _giveaway_row_to_dict(g: dict) -> dict:
     if not mentions and g.get('mention_role_id'):
         mentions = [str(g['mention_role_id'])]
     mentions = [str(m) for m in mentions if str(m).strip()]
-    try:
-        entry_tasks = json.loads(g.get('entry_tasks') or '[]')
-        if not isinstance(entry_tasks, list):
-            entry_tasks = []
-    except (ValueError, TypeError):
-        entry_tasks = []
+    # Normalize on read so the editor always sees the canonical shape (legacy
+    # discord_member/discord_role migrated to the unified discord type, labels
+    # dropped).
+    from database import normalize_entry_tasks as _normalize_entry_tasks
+    entry_tasks = _normalize_entry_tasks(g.get('entry_tasks') or '[]')
     color_int = g.get('color')
     color_hex = f'#{int(color_int):06x}' if color_int is not None else None
     return {
@@ -3563,8 +3612,12 @@ async def giveaways_reroll(
     previous_ids = {str(w) for w in previous}
 
     entries = db_list_giveaway_entries(giveaway_id, server_id)
-    pool = [int(e['user_id']) for e in entries
-            if str(e['user_id']) not in previous_ids and e.get('user_id') is not None]
+    pool, pool_weights = [], []
+    for e in entries:
+        if e.get('user_id') is None or str(e['user_id']) in previous_ids:
+            continue
+        pool.append(int(e['user_id']))
+        pool_weights.append(max(1, int(e.get('ticket_count') or 1)))
     if not pool:
         raise HTTPException(status_code=400,
             detail='No more entrants to reroll from.')
@@ -3572,9 +3625,9 @@ async def giveaways_reroll(
     winner_count = max(1, int(g.get('winner_count') or 1))
     seed = (g.get('random_seed') or '') + f':reroll:{len(previous_ids)}'
     import random as _random
+    from cogs.giveaway import _weighted_draw_no_repeat
     rng = _random.Random(seed)
-    n = min(winner_count, len(pool))
-    new_winners = rng.sample(pool, n)
+    new_winners = _weighted_draw_no_repeat(pool, pool_weights, winner_count, rng)
 
     all_winners = [str(w) for w in previous] + [str(w) for w in new_winners]
     db_update_giveaway(
