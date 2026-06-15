@@ -60,11 +60,18 @@ def build_wallet_collection_embed(collection: dict) -> discord.Embed:
         color_int = int(color) if color is not None else GOLD
     except (TypeError, ValueError):
         color_int = GOLD
-    return discord.Embed(
+    embed = discord.Embed(
         title       = (collection.get('embed_title') or 'Submit Your Wallet')[:256],
         description = (collection.get('embed_description') or '')[:4096],
         color       = color_int,
     )
+    thumb = (collection.get('embed_thumbnail_url') or '').strip()
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    image = (collection.get('embed_image_url') or '').strip()
+    if image:
+        embed.set_image(url=image)
+    return embed
 
 
 def build_wallet_collection_view(collection: dict) -> discord.ui.View:

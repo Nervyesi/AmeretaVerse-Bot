@@ -498,6 +498,11 @@ def init_db():
             # (engage_user_points on the guild's primary pool).
             "ALTER TABLE giveaways ADD COLUMN entry_tasks TEXT",
             "ALTER TABLE giveaways ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'community'",
+            # Wallet Collection embed images. Set via the standard upload UI
+            # (asset URLs stored as text), gated to premium guilds in the
+            # dashboard. NULL on existing rows => no image, brand default color.
+            "ALTER TABLE wallet_collections ADD COLUMN embed_thumbnail_url TEXT",
+            "ALTER TABLE wallet_collections ADD COLUMN embed_image_url TEXT",
             # Radar Phase 1 polish: per-guild role mentions for digest + alerts,
             # plus manual-digest-send quota counters. JSON-array strings parsed
             # via the existing tolerant role-id parser shared by giveaway /
@@ -1266,6 +1271,8 @@ def init_db():
                 embed_title TEXT NOT NULL,
                 embed_description TEXT NOT NULL,
                 embed_color INTEGER,
+                embed_thumbnail_url TEXT,
+                embed_image_url TEXT,
                 button_label TEXT NOT NULL,
                 modal_title TEXT NOT NULL,
                 modal_field_label TEXT NOT NULL,
@@ -2303,6 +2310,8 @@ def create_wallet_collection(guild_id, **fields) -> int:
         'embed_title':       fields.get('embed_title')       or 'Submit Your Wallet',
         'embed_description': fields.get('embed_description')  or 'Click the button below to submit your wallet address.',
         'embed_color':       fields.get('embed_color') if fields.get('embed_color') is not None else _WALLET_BRAND_GOLD,
+        'embed_thumbnail_url': fields.get('embed_thumbnail_url') or None,
+        'embed_image_url':     fields.get('embed_image_url') or None,
         'button_label':      fields.get('button_label')      or 'Submit Wallet',
         'modal_title':       fields.get('modal_title')       or 'Submit Your Wallet',
         'modal_field_label': fields.get('modal_field_label') or 'Your wallet address',
@@ -2315,12 +2324,14 @@ def create_wallet_collection(guild_id, **fields) -> int:
                 """INSERT INTO wallet_collections (
                        guild_id, name, channel_id, message_id, ping_role_ids,
                        required_role_id, blockchain, embed_title, embed_description,
-                       embed_color, button_label, modal_title, modal_field_label,
+                       embed_color, embed_thumbnail_url, embed_image_url,
+                       button_label, modal_title, modal_field_label,
                        modal_placeholder, status
                    ) VALUES (
                        :guild_id, :name, :channel_id, :message_id, :ping_role_ids,
                        :required_role_id, :blockchain, :embed_title, :embed_description,
-                       :embed_color, :button_label, :modal_title, :modal_field_label,
+                       :embed_color, :embed_thumbnail_url, :embed_image_url,
+                       :button_label, :modal_title, :modal_field_label,
                        :modal_placeholder, :status
                    )""",
                 row,
@@ -2335,6 +2346,7 @@ def create_wallet_collection(guild_id, **fields) -> int:
 _WALLET_COLLECTION_EDITABLE = (
     'name', 'channel_id', 'message_id', 'ping_role_ids', 'required_role_id',
     'blockchain', 'embed_title', 'embed_description', 'embed_color',
+    'embed_thumbnail_url', 'embed_image_url',
     'button_label', 'modal_title', 'modal_field_label', 'modal_placeholder',
     'status',
 )

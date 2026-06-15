@@ -5726,6 +5726,8 @@ class _WalletCollectionCreate(BaseModel):
     embed_title: Optional[str] = None
     embed_description: Optional[str] = None
     embed_color: Optional[str] = None
+    embed_thumbnail_url: Optional[str] = None
+    embed_image_url: Optional[str] = None
     button_label: Optional[str] = None
     modal_title: Optional[str] = None
     modal_field_label: Optional[str] = None
@@ -5741,6 +5743,8 @@ class _WalletCollectionUpdate(BaseModel):
     embed_title: Optional[str] = None
     embed_description: Optional[str] = None
     embed_color: Optional[str] = None
+    embed_thumbnail_url: Optional[str] = None
+    embed_image_url: Optional[str] = None
     button_label: Optional[str] = None
     modal_title: Optional[str] = None
     modal_field_label: Optional[str] = None
@@ -5770,6 +5774,8 @@ def _wallet_collection_to_dict(c: dict) -> dict:
         'embed_title':       c.get('embed_title') or '',
         'embed_description': c.get('embed_description') or '',
         'embed_color':       color_hex,
+        'embed_thumbnail_url': c.get('embed_thumbnail_url') or '',
+        'embed_image_url':     c.get('embed_image_url') or '',
         'button_label':      c.get('button_label') or '',
         'modal_title':       c.get('modal_title') or '',
         'modal_field_label': c.get('modal_field_label') or '',
@@ -5808,6 +5814,12 @@ def _wallet_normalize_payload(payload: dict) -> dict:
     if 'embed_color' in payload:
         col = _coerce_giveaway_color(payload['embed_color'])
         out['embed_color'] = col
+    if 'embed_thumbnail_url' in payload:
+        out['embed_thumbnail_url'] = _validate_giveaway_url(
+            payload['embed_thumbnail_url'] or '', 'embed_thumbnail_url') or None
+    if 'embed_image_url' in payload:
+        out['embed_image_url'] = _validate_giveaway_url(
+            payload['embed_image_url'] or '', 'embed_image_url') or None
     for key, limit in (
         ('embed_title', 256), ('embed_description', 4000),
         ('button_label', 80), ('modal_title', 45),
