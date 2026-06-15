@@ -33,6 +33,7 @@ from database import (
     get_wallet_collection_by_name,
     update_wallet_collection,
     list_wallet_submissions,
+    get_wallet_submission,
     upsert_wallet_submission,
     log_event,
 )
@@ -41,6 +42,9 @@ from cogs._wallet_validation import validate_wallet, CHAIN_LABELS
 from cogs._engagers_view import _resolve_discord_name
 
 GOLD       = 0xC8A84E
+# Posted wallet collection embeds default to the darker brand gold (scoped to
+# this module; the admin list embeds keep GOLD).
+_DEFAULT_EMBED_COLOR = 0x94730D
 PAGE_SIZE  = 15
 _NO_PING   = discord.AllowedMentions(roles=False, users=False, everyone=False)
 _PING_ROLES = discord.AllowedMentions(roles=True, users=False, everyone=False)
@@ -57,9 +61,9 @@ _WALLET_MAX      = 256
 def build_wallet_collection_embed(collection: dict) -> discord.Embed:
     color = collection.get('embed_color')
     try:
-        color_int = int(color) if color is not None else GOLD
+        color_int = int(color) if color is not None else _DEFAULT_EMBED_COLOR
     except (TypeError, ValueError):
-        color_int = GOLD
+        color_int = _DEFAULT_EMBED_COLOR
     embed = discord.Embed(
         title       = (collection.get('embed_title') or 'Submit Your Wallet')[:256],
         description = (collection.get('embed_description') or '')[:4096],
@@ -135,23 +139,59 @@ async def post_collection_embed(collection: dict, guild: discord.Guild):
 # ── Submit modal ────────────────────────────────────────────────────────────
 
 class WalletSubmitModal(discord.ui.Modal):
-    def __init__(self, collection: dict):
+    def __init__(self, collection: dict, existing_wallet: str | None = None):
         super().__init__(title=(collection.get('modal_title') or 'Submit Your Wallet')[:_MODAL_TITLE_MAX])
         self.collection = collection
-        self.wallet_input = discord.ui.TextInput(
-            label=(collection.get('modal_field_label') or 'Your wallet address')[:_LABEL_MAX],
-            placeholder=(collection.get('modal_placeholder') or '')[:_PLACEHOLDER_MAX] or None,
-            max_length=_WALLET_MAX,
-            style=discord.TextStyle.short,
-            required=True,
-        )
-        self.add_item(self.wallet_input)
+        self.existing_wallet = existing_wallet
+        placeholder = (collection.get('modal_placeholder') or '')[:_PLACEHOLDER_MAX] or None
+
+        if existing_wallet:
+            # Resubmit layout: show the current wallet (prefilled, edits ignored)
+            # and a separate empty field for the new wallet. Discord modals have
+            # no true read only input, so the first field is informational and
+            # its value is discarded on submit.
+            self.current_input = discord.ui.TextInput(
+                label='Your current wallet (read only, edits ignored)'[:_LABEL_MAX],
+                default=existing_wallet[:_WALLET_MAX],
+                max_length=_WALLET_MAX,
+                style=discord.TextStyle.short,
+                required=False,
+            )
+            self.add_item(self.current_input)
+            self.wallet_input = discord.ui.TextInput(
+                label='New wallet'[:_LABEL_MAX],
+                placeholder=placeholder,
+                max_length=_WALLET_MAX,
+                style=discord.TextStyle.short,
+                required=False,
+            )
+            self.add_item(self.wallet_input)
+        else:
+            self.current_input = None
+            self.wallet_input = discord.ui.TextInput(
+                label=(collection.get('modal_field_label') or 'Your wallet address')[:_LABEL_MAX],
+                placeholder=placeholder,
+                max_length=_WALLET_MAX,
+                style=discord.TextStyle.short,
+                required=True,
+            )
+            self.add_item(self.wallet_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             col = self.collection
             chain = col.get('blockchain') or 'other'
-            ok, result = validate_wallet(self.wallet_input.value, chain)
+            # Only ever the new wallet field is used; the prefilled current
+            # wallet (if shown) is ignored entirely.
+            new_value = (self.wallet_input.value or '').strip()
+            if self.existing_wallet and not new_value:
+                await interaction.response.send_message(
+                    'Type the new wallet address in the New wallet field to update.',
+                    ephemeral=True,
+                )
+                return
+
+            ok, result = validate_wallet(new_value, chain)
             if not ok:
                 await interaction.response.send_message(f'❌ {result}', ephemeral=True)
                 return
@@ -218,7 +258,11 @@ async def _handle_submit_click(interaction: discord.Interaction, collection_id: 
             )
             return
 
-    await interaction.response.send_modal(WalletSubmitModal(col))
+    # Resubmit aware: if the user already submitted, the modal shows their
+    # current wallet (prefilled, ignored) plus a New wallet field.
+    existing = get_wallet_submission(collection_id, interaction.user.id)
+    existing_wallet = (existing or {}).get('wallet_address')
+    await interaction.response.send_modal(WalletSubmitModal(col, existing_wallet=existing_wallet))
 
 
 class WalletSubmitButton(

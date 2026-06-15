@@ -2237,9 +2237,10 @@ def list_due_giveaways(now_iso: str) -> list:
 # per collection via UNIQUE(collection_id, user_id), and the submit path upserts
 # through that constraint so a member can resubmit to update their address.
 
-# Defaults applied at create time so a collection is always postable once a
-# channel is set. Brand gold matches the rest of the bot.
-_WALLET_BRAND_GOLD = 0xC8A84E
+# Default embed color applied at create time so a collection is always postable
+# once a channel is set. Wallet collections use the darker brand gold (#94730D),
+# scoped to this module only (does not change the global brand color constant).
+_WALLET_BRAND_GOLD = 0x94730D
 
 
 class WalletCollectionNameExists(Exception):
@@ -2400,6 +2401,17 @@ def list_wallet_submissions(collection_id: int, guild_id) -> list:
             (int(collection_id), str(guild_id)),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_wallet_submission(collection_id: int, user_id) -> dict | None:
+    """One user's existing submission for a collection, or None. Used to decide
+    whether the submit modal shows the resubmit (two field) layout."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM wallet_submissions WHERE collection_id = ? AND user_id = ?",
+            (int(collection_id), str(user_id)),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def upsert_wallet_submission(collection_id: int, guild_id, user_id, wallet_address: str) -> str:

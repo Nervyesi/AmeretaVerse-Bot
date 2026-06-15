@@ -2924,6 +2924,7 @@ _GIVEAWAY_TASK_TYPES = {
 _RE_X_USERNAME = re.compile(r'^[A-Za-z0-9_]{1,15}$')
 _RE_SNOWFLAKE  = re.compile(r'^\d{17,19}$')
 _RE_TWEET_ID   = re.compile(r'(?:status/)?(\d{10,25})')
+_RE_DISCORD_INVITE = re.compile(r'^https://(discord\.gg/|discord\.com/invite/)\S+$')
 
 
 def _validate_entry_tasks(value) -> str:
@@ -2976,7 +2977,18 @@ def _validate_entry_tasks(value) -> str:
                     detail=f'Task {idx}: role target must be "serverID:roleID" (both numeric)')
             target = f'{parts[0].strip()}:{parts[1].strip()}'
 
-        out.append({'type': ttype, 'target': target, 'label': label})
+        row = {'type': ttype, 'target': target, 'label': label}
+        # Discord tasks carry an optional invite URL (display only). Optional in
+        # the schema for back-compat; validated for shape when present. The
+        # dashboard requires it on new/edited tasks.
+        if ttype in ('discord_member', 'discord_role'):
+            invite = str(t.get('invite_url', '') or '').strip()
+            if invite:
+                if not _RE_DISCORD_INVITE.match(invite):
+                    raise HTTPException(status_code=400,
+                        detail=f'Task {idx}: invite URL must be a discord.gg or discord.com/invite link')
+                row['invite_url'] = invite
+        out.append(row)
     return json.dumps(out)
 
 
@@ -3427,7 +3439,7 @@ async def giveaways_start(
     entry_count = db_count_giveaway_entries(giveaway_id, server_id)
 
     from cogs.giveaway import build_giveaway_embed, build_giveaway_view
-    embed = build_giveaway_embed(server_id, primed, entry_count)
+    embed = build_giveaway_embed(server_id, primed, entry_count, client=bot)
     view  = build_giveaway_view(primed)
 
     # Multi-role mention. Prefer mention_role_ids (new); fall back to wrapping
