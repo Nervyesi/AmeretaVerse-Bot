@@ -3721,13 +3721,14 @@ async def giveaways_delete(
     giveaway_id: int,
     user: dict = Depends(get_current_user),
 ):
-    """Delete a DRAFT giveaway. Active / drawing / ended / cancelled rows are
-    kept as an audit trail — admins should Cancel instead."""
+    """Delete a giveaway and all its entries. Allowed for draft, ended, and
+    cancelled rows. Active / drawing giveaways cannot be deleted (cancel or wait
+    for the draw first) so an in-flight giveaway is never yanked out."""
     require_module_access(user, server_id, 'giveaway')
     g = _check_giveaway_owner(giveaway_id, server_id)
-    if g.get('status') != 'draft':
+    if g.get('status') in ('active', 'drawing'):
         raise HTTPException(status_code=400,
-            detail='Only draft giveaways can be deleted. Cancel an active one instead.')
+            detail='Active giveaways cannot be deleted. Cancel or wait for it to end first.')
 
     db_delete_giveaway(giveaway_id, server_id)
     log_event(
@@ -3739,6 +3740,100 @@ async def giveaways_delete(
         details={'giveaway_id': giveaway_id},
     )
     return {'ok': True}
+
+
+# ── Discord server resolution for giveaway Discord tasks ──────────────────────
+# Lets an admin paste an invite URL or a raw server ID and get back the server
+# name, icon, member count and whether the bot is in it. Invite resolution works
+# even when the bot is not in the target server (Discord's public invite
+# endpoint); raw server IDs require the bot to be present. Privacy: nothing about
+# the target server is returned beyond name/icon/member-count/roles, and there
+# is never a list of all servers the bot is in.
+
+@app.get('/api/servers/{server_id}/discord-servers/resolve')
+async def discord_server_resolve(
+    server_id: int, q: str = '', user: dict = Depends(get_current_user),
+):
+    require_module_access(user, server_id, 'giveaway')
+    rate_limit(f'discord_resolve:{server_id}', 30, 60.0)
+    raw = (q or '').strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail='Enter an invite URL or server ID')
+
+    m = _RE_INVITE_CODE.search(raw)
+    if m:
+        code = m.group(1)
+        token = (os.getenv('DISCORD_TOKEN') or '').strip()
+        url = f'{DISCORD_API}/invites/{code}?with_counts=true'
+        headers = {'Authorization': f'Bot {token}'} if token else {}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        raise HTTPException(status_code=400,
+                            detail='Could not resolve that invite. Check the link and try again.')
+                    data = await resp.json()
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f'[discord_resolve] invite fetch failed: {type(e).__name__}: {e}')
+            raise HTTPException(status_code=502, detail='Could not reach Discord to resolve the invite.')
+        guild = data.get('guild') or {}
+        gid = str(guild.get('id') or '')
+        if not gid:
+            raise HTTPException(status_code=400, detail='That invite does not point to a server.')
+        icon = guild.get('icon')
+        bot_in = bool(bot.is_ready() and bot.get_guild(int(gid)) is not None)
+        return {
+            'server_id':     gid,
+            'name':          guild.get('name') or 'Unknown server',
+            'icon_url':      f'https://cdn.discordapp.com/icons/{gid}/{icon}.png' if icon else None,
+            'member_count':  data.get('approximate_member_count'),
+            'bot_in_server': bot_in,
+            'invite_url':    f'https://discord.gg/{code}',
+        }
+
+    if re.fullmatch(r'\d{17,20}', raw):
+        if not bot.is_ready():
+            raise HTTPException(status_code=503, detail='Bot not ready yet')
+        guild = bot.get_guild(int(raw))
+        if guild is None:
+            raise HTTPException(status_code=400,
+                detail='Bot must be in this server to use a server ID. Paste the invite URL instead.')
+        return {
+            'server_id':     str(guild.id),
+            'name':          guild.name,
+            'icon_url':      str(guild.icon.url) if guild.icon else None,
+            'member_count':  guild.member_count,
+            'bot_in_server': True,
+            'invite_url':    '',
+        }
+
+    raise HTTPException(status_code=400, detail='Enter a valid Discord invite URL or server ID')
+
+
+@app.get('/api/servers/{server_id}/discord-servers/{target_server_id}/roles')
+async def discord_server_roles(
+    server_id: int, target_server_id: str, user: dict = Depends(get_current_user),
+):
+    """Roles in the target server, for the giveaway Discord-task role dropdown.
+    Only succeeds when the bot is in the target server. Returns just role id +
+    name (nothing else about the server)."""
+    require_module_access(user, server_id, 'giveaway')
+    if not bot.is_ready():
+        raise HTTPException(status_code=503, detail='Bot not ready yet')
+    try:
+        tgid = int(str(target_server_id).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail='Invalid server ID')
+    guild = bot.get_guild(tgid)
+    if guild is None:
+        return {'bot_in_server': False, 'roles': []}
+    # Top roles first; exclude @everyone. id + name only (privacy).
+    roles = [{'id': str(r.id), 'name': r.name}
+             for r in sorted(guild.roles, key=lambda x: x.position, reverse=True)
+             if not r.is_default()]
+    return {'bot_in_server': True, 'roles': roles}
 
 
 @app.get('/api/servers/{server_id}/giveaways/{giveaway_id}/entries')

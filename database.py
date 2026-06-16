@@ -2020,7 +2020,14 @@ def update_giveaway(giveaway_id: int, guild_id: int, **fields) -> bool:
 
 
 def delete_giveaway(giveaway_id: int, guild_id: int) -> bool:
+    """Delete a giveaway and all its entries. SQLite does not enforce the FK
+    cascade by default (PRAGMA foreign_keys is off per connection), so the
+    child rows are removed explicitly first."""
     with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM giveaway_entries WHERE giveaway_id=? AND guild_id=?",
+            (int(giveaway_id), int(guild_id)),
+        )
         c = conn.execute(
             "DELETE FROM giveaways WHERE id=? AND guild_id=?",
             (int(giveaway_id), int(guild_id)),
