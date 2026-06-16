@@ -3485,6 +3485,23 @@ async def giveaways_start(
     )
 
     primed = db_get_giveaway(giveaway_id, server_id)
+
+    # Auto-generate Discord invites for any discord task that has no invite_url,
+    # at the moment the giveaway goes live (so the posted task is clickable).
+    # Admin-provided invites are left untouched; silent on failure (the task
+    # then renders without a link). Persisted so the verification embed sees it.
+    try:
+        from database import normalize_entry_tasks as _norm_tasks
+        from cogs.giveaway import ensure_task_invites
+        _tasks = _norm_tasks(primed.get('entry_tasks') or '[]')
+        if any(t.get('type') == 'discord' and not (t.get('invite_url') or '').strip() for t in _tasks):
+            _tasks, _changed = await ensure_task_invites(bot, _tasks)
+            if _changed:
+                db_update_giveaway(giveaway_id, server_id, entry_tasks=json.dumps(_tasks))
+                primed = db_get_giveaway(giveaway_id, server_id)
+    except Exception as e:  # noqa: BLE001
+        print(f'[giveaway] auto-invite step failed gid={giveaway_id}: {type(e).__name__}: {e}')
+
     entry_count = db_count_giveaway_entries(giveaway_id, server_id)
 
     from cogs.giveaway import build_giveaway_embed, build_giveaway_view

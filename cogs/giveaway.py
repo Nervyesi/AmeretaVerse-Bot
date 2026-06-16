@@ -264,6 +264,76 @@ def _weighted_draw_no_repeat(items: list, weights: list, k: int, rng) -> list:
     return winners
 
 
+# ── Discord invite auto-generation for Discord tasks ─────────────────────────
+# When a Discord task has no invite_url, the bot tries to supply one so the
+# posted task is clickable: reuse a never-expiring existing invite, else create
+# one (system channel first, then the first channel where the bot may create
+# invites). All failures are silent and leave invite_url empty, in which case
+# the embed renders the task without a trailing link.
+
+async def _generate_invite_for_server(bot, server_id) -> str:
+    """Best effort invite URL for a server the bot is in, or '' if not possible."""
+    try:
+        guild = bot.get_guild(int(str(server_id).strip()))
+    except (TypeError, ValueError):
+        return ''
+    if guild is None:
+        return ''
+
+    # 1. Reuse a never-expiring existing invite (max_age 0) if the bot can list them.
+    try:
+        existing = await guild.invites()
+        for inv in existing:
+            if getattr(inv, 'max_age', None) in (0, None) and inv.url:
+                return inv.url
+    except Exception:  # noqa: BLE001  (silent: missing perms / API error)
+        pass
+
+    # 2. Create a fresh permanent invite. System channel first, then any text
+    #    channel where the bot has create_instant_invite.
+    me = guild.me
+    candidates = []
+    if guild.system_channel is not None:
+        candidates.append(guild.system_channel)
+    candidates.extend(c for c in guild.text_channels if c is not guild.system_channel)
+    for ch in candidates:
+        try:
+            perms = ch.permissions_for(me) if me is not None else None
+            if perms is not None and not perms.create_instant_invite:
+                continue
+            inv = await ch.create_invite(
+                max_age=0, max_uses=0, unique=False,
+                reason='AVbot giveaway task auto-invite',
+            )
+            if inv and inv.url:
+                return inv.url
+        except Exception:  # noqa: BLE001  (silent: missing perms / API error)
+            continue
+    return ''
+
+
+async def ensure_task_invites(bot, tasks: list) -> tuple[list, bool]:
+    """For each Discord task missing an invite_url, try to generate one in place.
+    Returns (tasks, changed). Tasks are mutated; an admin-provided invite is left
+    untouched. Never raises."""
+    changed = False
+    for t in tasks:
+        if t.get('type') != 'discord':
+            continue
+        if (t.get('invite_url') or '').strip():
+            continue
+        try:
+            url = await _generate_invite_for_server(bot, t.get('server_id'))
+        except Exception as e:  # noqa: BLE001
+            print(f'[giveaway] auto-invite failed server={t.get("server_id")}: '
+                  f'{type(e).__name__}: {e}')
+            url = ''
+        if url:
+            t['invite_url'] = url
+            changed = True
+    return tasks, changed
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _now_iso() -> str:
@@ -576,9 +646,15 @@ class GiveawayTasksView(discord.ui.View):
         if interaction.user.id != self.original_user_id:
             await interaction.response.send_message('This is not your entry.', ephemeral=True)
             return
-        # Defer the component update so the (multi-second) verification has room.
+        # State 2: immediate feedback. Edit the ephemeral message in place to
+        # "Verifying tasks…" and drop the button so the user cannot double click
+        # while the parallel checks run. This is the synchronous interaction ack
+        # (well within the 3s window); the result is written via
+        # edit_original_response once verification finishes.
         try:
-            await interaction.response.defer()
+            await interaction.response.edit_message(
+                content='⏳ Verifying tasks…', embed=None, view=None,
+            )
         except discord.HTTPException:
             pass
         await self.cog.handle_verify_and_enter(interaction, self.giveaway_id, self)
@@ -813,30 +889,48 @@ class Giveaway(commands.Cog):
         if needs_handle and not handle:
             return {'status': 'need_handle'}
 
-        results: list[dict] = []
-        role_matches: dict = {}
-        for t in tasks:
+        # One coroutine per task, all awaited concurrently, so the total wait is
+        # the slowest single check (the follow check, ~1s) rather than the sum.
+        # Like is self-attested and Discord checks read the cache, so both are
+        # effectively instant; only the Twitter API calls actually block.
+        uid = interaction.user.id
+
+        async def verify_one(t: dict) -> dict:
             ttype = t['type']
             if ttype == 'twitter_like':
-                # Self-attested per owner decision: clicking verify passes it.
-                results.append({'task': t, 'ok': True, 'source': 'self_attested', 'contribution': 0})
-            elif ttype == 'twitter_follow':
+                return {'task': t, 'ok': True, 'source': 'self_attested', 'contribution': 0}
+            if ttype == 'twitter_follow':
                 r = await check_user_follows(t['target'], handle)
-                results.append({'task': t, 'ok': r.get('verified') is True, 'source': 'api_verified', 'contribution': 0})
-            elif ttype == 'twitter_retweet':
+                return {'task': t, 'ok': r.get('verified') is True, 'source': 'api_verified', 'contribution': 0}
+            if ttype == 'twitter_retweet':
                 tid = extract_tweet_id(t['target']) or (t['target'] if str(t['target']).isdigit() else None)
                 ok = False
                 if tid:
                     r = await check_retweet(tid, handle)
                     ok = r.get('verified') is True
-                results.append({'task': t, 'ok': ok, 'source': 'api_verified', 'contribution': 0})
-            elif ttype == 'discord':
-                ok, contrib, matched = self._verify_discord_task(t, interaction.user.id)
-                results.append({'task': t, 'ok': ok, 'source': 'api_verified',
-                                'contribution': contrib, 'matched_roles': matched})
-                role_matches[str(t.get('server_id'))] = matched
-            else:
-                results.append({'task': t, 'ok': False, 'source': 'unknown', 'contribution': 0})
+                return {'task': t, 'ok': ok, 'source': 'api_verified', 'contribution': 0}
+            if ttype == 'discord':
+                ok, contrib, matched = self._verify_discord_task(t, uid)
+                return {'task': t, 'ok': ok, 'source': 'api_verified',
+                        'contribution': contrib, 'matched_roles': matched}
+            return {'task': t, 'ok': False, 'source': 'unknown', 'contribution': 0}
+
+        gathered = await asyncio.gather(
+            *(verify_one(t) for t in tasks), return_exceptions=True,
+        )
+
+        results: list[dict] = []
+        role_matches: dict = {}
+        for t, res in zip(tasks, gathered):
+            if isinstance(res, Exception):
+                # A transient API error counts as not verified (the user can
+                # retry by clicking again), never a crash and never a free pass.
+                print(f'[giveaway] verify task error type={t.get("type")}: '
+                      f'{type(res).__name__}: {res}')
+                res = {'task': t, 'ok': False, 'source': 'error', 'contribution': 0}
+            results.append(res)
+            if t['type'] == 'discord':
+                role_matches[str(t.get('server_id'))] = res.get('matched_roles', [])
 
         all_passed       = bool(results) and all(r['ok'] is True for r in results)
         any_unverifiable = any(r['ok'] is None for r in results)
@@ -874,7 +968,7 @@ class Giveaway(commands.Cog):
             embed = _render_tasks_embed(g, client=interaction.client)
             embed.description += ('\n\nYou need to link your X account first. '
                                   'Use `/setx <username>` to link it, then try again.')
-            await interaction.edit_original_response(embed=embed, view=view)
+            await interaction.edit_original_response(content=None, embed=embed, view=view)
             log_event(guild_id, 'admin_action', 'giveaway_entry_attempt',
                       f'Giveaway #{giveaway_id} entry blocked: no_x_handle',
                       actor_user_id=user.id, actor_username=str(user),
@@ -893,7 +987,7 @@ class Giveaway(commands.Cog):
             ok, text = await self._finalize_entry(interaction, g, guild_id, user, ticket_count)
             embed = _render_tasks_embed(g, results, client=interaction.client)
             embed.description += f'\n\n{"✅ " if ok else ""}{text}'
-            await interaction.edit_original_response(embed=embed, view=None if ok else view)
+            await interaction.edit_original_response(content=None, embed=embed, view=None if ok else view)
             outcome = 'entered' if ok else 'failed_entry'
         else:
             embed = _render_tasks_embed(g, results, client=interaction.client)
@@ -902,7 +996,7 @@ class Giveaway(commands.Cog):
                 note += ("\nSome checks couldn’t run because AVbot isn’t in that server. "
                          'Contact the giveaway admin.')
             embed.description += f'\n\n{note}'
-            await interaction.edit_original_response(embed=embed, view=view)
+            await interaction.edit_original_response(content=None, embed=embed, view=view)
             outcome = 'partial_unverifiable' if vres['any_unverifiable'] else 'failed_tasks'
 
         log_event(guild_id, 'admin_action', 'giveaway_entry_attempt',
