@@ -122,8 +122,12 @@ def _discord_header(client, task: dict) -> str:
 
 
 def _discord_invite_detail(task: dict) -> str:
-    invite = (task.get('invite_url') or '').strip()
-    return f'[{invite}]({invite})' if invite else '(no invite link configured)'
+    # Bare URL: Discord auto-links it in embed descriptions and field values.
+    # A masked link [url](url) whose visible text is itself a URL is rendered
+    # as literal text by Discord (anti-spoofing), so it must NOT be masked here.
+    # Empty when there is no invite, so the line shows just the task text (no
+    # "(no invite link configured)" leaking to users).
+    return (task.get('invite_url') or '').strip()
 
 
 def _display_units(tasks: list, results: list | None = None) -> list:
@@ -187,7 +191,13 @@ def _unit_line(unit: dict, client=None, *, marker: str | None = None) -> str:
     else:
         label, detail = 'Task:', ''
 
-    line = f'{label} {detail}'.strip()
+    # When there is no detail (Discord task with no invite), drop the trailing
+    # colon so the line reads cleanly, e.g. "Join Discord (Server) and have the
+    # role (Verified 1x)" with nothing dangling after it.
+    if detail:
+        line = f'{label} {detail}'
+    else:
+        line = label[:-1] if label.endswith(':') else label
     if marker:
         line = f'{marker} {line}'
     if marker and kind == 'discord' and unit['oks'] and unit['oks'][0] is None:

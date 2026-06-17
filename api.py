@@ -6170,7 +6170,7 @@ async def wallet_collections_submissions(
             try:
                 m = guild.get_member(int(uid))
                 if m is not None:
-                    username = m.name
+                    username = m.display_name   # what the user goes by in the guild
             except (TypeError, ValueError):
                 pass
         out.append({

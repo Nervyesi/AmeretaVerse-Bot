@@ -69,7 +69,16 @@ def build_wallet_collection_embed(collection: dict) -> discord.Embed:
         description = (collection.get('embed_description') or '')[:4096],
         color       = color_int,
     )
+    # Top-right logo. Prefer the admin's custom thumbnail; otherwise fall back
+    # to the guild's brand logo (same source/method every other module uses via
+    # build_branded_embed), so wallet embeds carry the standard AVbot branding.
     thumb = (collection.get('embed_thumbnail_url') or '').strip()
+    if not thumb:
+        try:
+            from cogs._branding import get_brand_value
+            thumb = (get_brand_value(int(collection.get('guild_id') or 0), 'thumbnail_url') or '').strip()
+        except Exception:
+            thumb = ''
     if thumb:
         embed.set_thumbnail(url=thumb)
     image = (collection.get('embed_image_url') or '').strip()
@@ -139,58 +148,29 @@ async def post_collection_embed(collection: dict, guild: discord.Guild):
 # ── Submit modal ────────────────────────────────────────────────────────────
 
 class WalletSubmitModal(discord.ui.Modal):
-    def __init__(self, collection: dict, existing_wallet: str | None = None):
+    """Single field wallet entry. Used for both first time submit and (via the
+    Update Wallet button) resubmit. is_update only changes the field label."""
+    def __init__(self, collection: dict, is_update: bool = False):
         super().__init__(title=(collection.get('modal_title') or 'Submit Your Wallet')[:_MODAL_TITLE_MAX])
         self.collection = collection
-        self.existing_wallet = existing_wallet
+        self.is_update = is_update
         placeholder = (collection.get('modal_placeholder') or '')[:_PLACEHOLDER_MAX] or None
-
-        if existing_wallet:
-            # Resubmit layout: show the current wallet (prefilled, edits ignored)
-            # and a separate empty field for the new wallet. Discord modals have
-            # no true read only input, so the first field is informational and
-            # its value is discarded on submit.
-            self.current_input = discord.ui.TextInput(
-                label='Your current wallet (read only, edits ignored)'[:_LABEL_MAX],
-                default=existing_wallet[:_WALLET_MAX],
-                max_length=_WALLET_MAX,
-                style=discord.TextStyle.short,
-                required=False,
-            )
-            self.add_item(self.current_input)
-            self.wallet_input = discord.ui.TextInput(
-                label='New wallet'[:_LABEL_MAX],
-                placeholder=placeholder,
-                max_length=_WALLET_MAX,
-                style=discord.TextStyle.short,
-                required=False,
-            )
-            self.add_item(self.wallet_input)
-        else:
-            self.current_input = None
-            self.wallet_input = discord.ui.TextInput(
-                label=(collection.get('modal_field_label') or 'Your wallet address')[:_LABEL_MAX],
-                placeholder=placeholder,
-                max_length=_WALLET_MAX,
-                style=discord.TextStyle.short,
-                required=True,
-            )
-            self.add_item(self.wallet_input)
+        label = ('New wallet address' if is_update
+                 else (collection.get('modal_field_label') or 'Your wallet address'))
+        self.wallet_input = discord.ui.TextInput(
+            label=label[:_LABEL_MAX],
+            placeholder=placeholder,
+            max_length=_WALLET_MAX,
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.add_item(self.wallet_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             col = self.collection
             chain = col.get('blockchain') or 'other'
-            # Only ever the new wallet field is used; the prefilled current
-            # wallet (if shown) is ignored entirely.
             new_value = (self.wallet_input.value or '').strip()
-            if self.existing_wallet and not new_value:
-                await interaction.response.send_message(
-                    'Type the new wallet address in the New wallet field to update.',
-                    ephemeral=True,
-                )
-                return
-
             ok, result = validate_wallet(new_value, chain)
             if not ok:
                 await interaction.response.send_message(f'❌ {result}', ephemeral=True)
@@ -258,11 +238,39 @@ async def _handle_submit_click(interaction: discord.Interaction, collection_id: 
             )
             return
 
-    # Resubmit aware: if the user already submitted, the modal shows their
-    # current wallet (prefilled, ignored) plus a New wallet field.
+    # First time -> single field modal directly. Already submitted -> an
+    # ephemeral message showing the current wallet plus an Update Wallet button
+    # (no awkward prefilled read only modal field).
     existing = get_wallet_submission(collection_id, interaction.user.id)
-    existing_wallet = (existing or {}).get('wallet_address')
-    await interaction.response.send_modal(WalletSubmitModal(col, existing_wallet=existing_wallet))
+    if existing and (existing.get('wallet_address') or '').strip():
+        addr = existing['wallet_address']
+        await interaction.response.send_message(
+            f'Your current wallet: `{addr}`\n\nClick **Update Wallet** below to change it.',
+            view=WalletUpdateView(col, interaction.user.id),
+            ephemeral=True, allowed_mentions=_NO_PING,
+        )
+        return
+    await interaction.response.send_modal(WalletSubmitModal(col))
+
+
+class WalletUpdateView(discord.ui.View):
+    """Ephemeral, five minute view shown to a member who already submitted.
+    The Update Wallet button opens the single field modal. Locked to the
+    member who triggered it."""
+
+    def __init__(self, collection: dict, user_id: int):
+        super().__init__(timeout=300)
+        self.collection = collection
+        self.user_id = int(user_id)
+        btn = discord.ui.Button(label='Update Wallet', style=discord.ButtonStyle.success, emoji='✏️')
+        btn.callback = self._update_cb
+        self.add_item(btn)
+
+    async def _update_cb(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your submission.", ephemeral=True)
+            return
+        await interaction.response.send_modal(WalletSubmitModal(self.collection, is_update=True))
 
 
 class WalletSubmitButton(
@@ -540,10 +548,20 @@ class WalletCollectionCog(commands.Cog, name='WalletCollection'):
                 original_user_id=interaction.user.id,
             )
 
-        # Copy-all: a code block members can drag-select, or a .txt attachment
-        # when the list is large enough to risk Discord's message length limit.
-        wallets = [r.get('wallet_address') or '' for r in rows]
-        joined  = '\n'.join(wallets)
+        # Copy-all: one "display name <TAB> wallet" per line so a paste into a
+        # spreadsheet lands the name in column A and the wallet in column B.
+        # Names resolve from the guild cache (display name); members who left
+        # show as (left server). Code block for drag-select, or a .txt
+        # attachment when large enough to risk Discord's message length limit.
+        def _copy_name(uid):
+            try:
+                m = interaction.guild.get_member(int(uid)) if interaction.guild else None
+            except (TypeError, ValueError):
+                m = None
+            return m.display_name if m is not None else '(left server)'
+
+        tsv_lines = [f'{_copy_name(r.get("user_id"))}\t{r.get("wallet_address") or ""}' for r in rows]
+        joined  = '\n'.join(tsv_lines)
         copy_block = f'```\n{joined}\n```' if joined else None
         use_file = len(rows) > 50 or len(joined) > 1800
 
@@ -561,13 +579,13 @@ class WalletCollectionCog(commands.Cog, name='WalletCollection'):
             buf = io.BytesIO(joined.encode('utf-8'))
             fname = f'wallets_{col.get("name")}.txt'.replace(' ', '_')
             await interaction.followup.send(
-                content='Copy all wallets (open the file and select all):',
+                content='Copy all (name and wallet, tab separated for spreadsheets). Open the file and select all:',
                 file=discord.File(buf, filename=fname),
                 ephemeral=True, allowed_mentions=_NO_PING,
             )
         else:
             await interaction.followup.send(
-                content=f'Copy all wallets:\n{copy_block}',
+                content=f'Copy all (name and wallet, tab separated for spreadsheets):\n{copy_block}',
                 ephemeral=True, allowed_mentions=_NO_PING,
             )
 
