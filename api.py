@@ -6435,6 +6435,78 @@ async def public_bot_info(request: Request):
     }
 
 
+# ── Public live stats (landing hero counters) ─────────────────────────────────
+# Aggregated across every guild the bot is in. Cached 60s in-process so the
+# public landing can poll without hammering the DB. Never raises: any failure
+# returns zeros + a warning so the marketing page can degrade gracefully.
+
+_public_stats_cache = {'at': 0.0, 'data': None}
+_PUBLIC_STATS_TTL = 60.0
+
+
+@app.get('/api/public/stats')
+async def public_stats(request: Request):
+    """Public read-only community stats for the landing hero. No auth."""
+    rate_limit_public(request, 'public-stats', max_calls=60, window_secs=60.0)
+
+    now = time.time()
+    if _public_stats_cache['data'] is not None and (now - _public_stats_cache['at']) < _PUBLIC_STATS_TTL:
+        return _public_stats_cache['data']
+
+    try:
+        bot_instance = _get_bot_instance()
+    except Exception:
+        bot_instance = None
+
+    members_total = 0
+    servers_count = 0
+    if bot_instance is not None and bot_instance.is_ready():
+        guilds = list(bot_instance.guilds)
+        servers_count = len(guilds)
+        members_total = sum(int(g.member_count or 0) for g in guilds)
+
+    tasks_verified_total = 0
+    engagements_tracked  = 0
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM engage_actions "
+                " WHERE like_verified=1 OR comment_verified=1 OR retweet_verified=1"
+            ).fetchone()
+            engage_verified = int(row['c'] or 0) if row else 0
+
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM raid_participation WHERE verification_status='verified'"
+            ).fetchone()
+            raid_verified = int(row['c'] or 0) if row else 0
+
+            tasks_verified_total = engage_verified + raid_verified
+
+            row = conn.execute("SELECT COUNT(*) AS c FROM engage_actions").fetchone()
+            engagements_tracked = int(row['c'] or 0) if row else 0
+    except Exception as e:  # noqa: BLE001
+        print(f'[public-stats] DB query error: {type(e).__name__}: {e}')
+        data = {
+            'members_total': members_total,
+            'servers_count': servers_count,
+            'tasks_verified_total': 0,
+            'engagements_tracked': 0,
+            'warning': 'stats temporarily unavailable',
+        }
+        # Do not cache a degraded payload, so we recover as soon as the DB is back.
+        return data
+
+    data = {
+        'members_total':        members_total,
+        'servers_count':        servers_count,
+        'tasks_verified_total': tasks_verified_total,
+        'engagements_tracked':  engagements_tracked,
+    }
+    _public_stats_cache['at'] = now
+    _public_stats_cache['data'] = data
+    return data
+
+
 # ── Public overview endpoint ──────────────────────────────────────────────────
 
 @app.get('/api/public/ameretaverse-overview')
