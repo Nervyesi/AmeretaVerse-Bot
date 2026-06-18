@@ -103,31 +103,38 @@ def _role_name(client, guild_id, role_id) -> str | None:
     return role.name if role else None
 
 
+def _md_escape(text: str) -> str:
+    """Escape Discord markdown in a plain string (role/server names) so a name
+    like *VIP* renders literally instead of turning into italics."""
+    try:
+        return discord.utils.escape_markdown(text)
+    except Exception:
+        return text
+
+
 def _role_tag(client, server_id, rm: dict) -> str:
-    """A single role multiplier tag: BASE -> (Name Nx), STACK -> (Name +N)."""
-    rname = _role_name(client, server_id, rm.get('role_id')) or 'the configured role'
+    """A single role multiplier tag. BASE -> (**Name** Nx). STACK gets a ticket
+    emoji and a plus to read as "extra tickets on top": (🎟️ **Name** +N)."""
+    rname = _md_escape(_role_name(client, server_id, rm.get('role_id')) or 'the configured role')
     mult  = int(rm.get('multiplier') or 1)
     if str(rm.get('type')).upper() == 'STACK':
-        return f'({rname} +{mult})'
-    return f'({rname} {mult}x)'
+        return f'(🎟️ **{rname}** +{mult})'
+    return f'(**{rname}** {mult}x)'
 
 
 def _discord_header(client, task: dict) -> str:
-    name = _guild_name(client, task.get('server_id')) or 'the Discord server'
-    rms  = task.get('role_multipliers') or []
+    """The full Discord task line. The server name is hyperlinked to the invite
+    INSIDE the parentheses (display text is the name, not the URL, so Discord
+    renders it as a clickable link). No trailing colon, no trailing raw URL.
+    Falls back to the plain name in parens when there is no invite."""
+    name   = _guild_name(client, task.get('server_id')) or 'the Discord server'
+    invite = (task.get('invite_url') or '').strip()
+    name_md = f'[{name}]({invite})' if invite else name
+    rms = task.get('role_multipliers') or []
     if not rms:
-        return f'Join Discord ({name}):'
+        return f'Join Discord ({name_md})'
     tags = ' '.join(_role_tag(client, task.get('server_id'), rm) for rm in rms)
-    return f'Join Discord ({name}) and have the role {tags}:'
-
-
-def _discord_invite_detail(task: dict) -> str:
-    # Bare URL: Discord auto-links it in embed descriptions and field values.
-    # A masked link [url](url) whose visible text is itself a URL is rendered
-    # as literal text by Discord (anti-spoofing), so it must NOT be masked here.
-    # Empty when there is no invite, so the line shows just the task text (no
-    # "(no invite link configured)" leaking to users).
-    return (task.get('invite_url') or '').strip()
+    return f'Join Discord ({name_md}) and have the role {tags}'
 
 
 def _display_units(tasks: list, results: list | None = None) -> list:
@@ -186,8 +193,10 @@ def _unit_line(unit: dict, client=None, *, marker: str | None = None) -> str:
         link   = _tweet_link(unit['target'])
         detail = f'[this tweet]({link})' if link else 'this tweet'
     elif kind == 'discord':
+        # The header already contains the linked server name and role tags;
+        # there is no separate trailing detail/URL.
         label  = _discord_header(client, unit['task'])
-        detail = _discord_invite_detail(unit['task'])
+        detail = ''
     else:
         label, detail = 'Task:', ''
 
