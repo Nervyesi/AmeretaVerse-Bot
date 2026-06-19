@@ -3620,6 +3620,62 @@ def get_engage_leaderboard(pool_id: int, limit: int = 10) -> list:
     return [dict(r) for r in rows]
 
 
+def get_unified_points(guild_id) -> list:
+    """Per-guild combined points for the unified /leaderboard.
+
+    Reads CURRENT balances and sums raid (community) points from
+    raid_user_points with engage points from engage_user_points (across every
+    pool in the guild). No new tables; computed on the fly, so spending engage
+    points naturally lowers the combined total on the next read. Returns every
+    user that has any row in either table (callers filter total <= 0). Each
+    item: {user_id:int, username, raid:int, engage:int, total:int}.
+    """
+    gid_int = int(guild_id)
+    gid_str = str(gid_int)
+    with get_connection() as conn:
+        raid_rows = conn.execute(
+            "SELECT rup.user_id AS user_id, rup.total_points AS pts, u.username AS username "
+            "FROM raid_user_points rup LEFT JOIN users u ON u.user_id = rup.user_id "
+            "WHERE rup.guild_id = ?",
+            (gid_int,),
+        ).fetchall()
+        eng_rows = conn.execute(
+            "SELECT eup.user_id AS user_id, SUM(eup.points) AS pts, MAX(u.username) AS username "
+            "FROM engage_user_points eup LEFT JOIN users u ON CAST(u.user_id AS TEXT) = eup.user_id "
+            "WHERE eup.guild_id = ? GROUP BY eup.user_id",
+            (gid_str,),
+        ).fetchall()
+    agg: dict = {}
+    for r in raid_rows:
+        try:
+            uid = int(r['user_id'])
+        except (TypeError, ValueError):
+            continue
+        a = agg.setdefault(uid, {'raid': 0, 'engage': 0, 'username': None})
+        a['raid'] = max(0, int(r['pts'] or 0))
+        if r['username']:
+            a['username'] = r['username']
+    for r in eng_rows:
+        try:
+            uid = int(r['user_id'])
+        except (TypeError, ValueError):
+            continue
+        a = agg.setdefault(uid, {'raid': 0, 'engage': 0, 'username': None})
+        a['engage'] = max(0, int(r['pts'] or 0))
+        if r['username'] and not a['username']:
+            a['username'] = r['username']
+    out = []
+    for uid, a in agg.items():
+        out.append({
+            'user_id': uid,
+            'username': a['username'],
+            'raid': a['raid'],
+            'engage': a['engage'],
+            'total': a['raid'] + a['engage'],
+        })
+    return out
+
+
 def sample_pending_engage_actions(pool_id: int, limit: int) -> list:
     with get_connection() as conn:
         rows = conn.execute(
