@@ -31,14 +31,11 @@ MAX_RANKS = 100  # top 100 ranks => 10 pages of 10
 # ── Rendering ─────────────────────────────────────────────────────────────────
 
 def _row(global_rank: int, entry: dict) -> str:
-    """One leaderboard line, matching the /raid + /engage row format with the
-    combined breakdown appended in parens."""
+    """One leaderboard line, identical to the /raid + /engage row format.
+    The raid/engage split lives in the title and in Find Me, not per row."""
     rank = _MEDALS[global_rank] if global_rank < 3 else f'`{global_rank + 1}.`'
     name = entry.get('username') or f'<@{entry["user_id"]}>'
-    return (
-        f'{rank} **{name}** — `{entry["total"]:,} pts` '
-        f'(raid: {entry["raid"]:,} · engage: {entry["engage"]:,})'
-    )
+    return f'{rank} **{name}** — `{entry["total"]:,} pts`'
 
 
 def _build_leaderboard_embed(guild_id, combined, page) -> discord.Embed:
@@ -47,7 +44,7 @@ def _build_leaderboard_embed(guild_id, combined, page) -> discord.Embed:
     lines = [_row(start + i, e) for i, e in enumerate(chunk)]
     return build_branded_embed(
         guild_id,
-        title='🏆 AVbot Leaderboard',
+        title='🏆 AVbot Leaderboard (raid + engage)',
         description='\n'.join(lines),
         use_thumbnail=True,
         use_image=False,
