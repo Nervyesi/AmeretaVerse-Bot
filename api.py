@@ -6465,8 +6465,8 @@ async def public_stats(request: Request):
         servers_count = len(guilds)
         members_total = sum(int(g.member_count or 0) for g in guilds)
 
-    tasks_verified_total = 0
-    engagements_tracked  = 0
+    tasks_verified_total     = 0
+    protection_actions_total = 0
     try:
         with get_connection() as conn:
             row = conn.execute(
@@ -6482,25 +6482,27 @@ async def public_stats(request: Request):
 
             tasks_verified_total = engage_verified + raid_verified
 
-            row = conn.execute("SELECT COUNT(*) AS c FROM engage_actions").fetchone()
-            engagements_tracked = int(row['c'] or 0) if row else 0
+            # Every protection event (phishing deletes, spam, suspicious users,
+            # anti-raid lockdowns, banned words) is one row in protection_actions.
+            row = conn.execute("SELECT COUNT(*) AS c FROM protection_actions").fetchone()
+            protection_actions_total = int(row['c'] or 0) if row else 0
     except Exception as e:  # noqa: BLE001
         print(f'[public-stats] DB query error: {type(e).__name__}: {e}')
         data = {
             'members_total': members_total,
             'servers_count': servers_count,
             'tasks_verified_total': 0,
-            'engagements_tracked': 0,
+            'protection_actions_total': 0,
             'warning': 'stats temporarily unavailable',
         }
         # Do not cache a degraded payload, so we recover as soon as the DB is back.
         return data
 
     data = {
-        'members_total':        members_total,
-        'servers_count':        servers_count,
-        'tasks_verified_total': tasks_verified_total,
-        'engagements_tracked':  engagements_tracked,
+        'members_total':            members_total,
+        'servers_count':            servers_count,
+        'tasks_verified_total':     tasks_verified_total,
+        'protection_actions_total': protection_actions_total,
     }
     _public_stats_cache['at'] = now
     _public_stats_cache['data'] = data
