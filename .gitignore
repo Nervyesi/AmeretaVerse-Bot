@@ -1,4 +1,28 @@
+# Environment / secrets
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
+venv/
+.venv/
+
+# Databases (never commit bot data)
+*.db
+*.sqlite
+*.sqlite3
+data/
+/data/
+
+# Claude Code local state
 .claude/worktrees/
+.claude/settings.local.json
+
+# Logs / temp / editor / OS
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
