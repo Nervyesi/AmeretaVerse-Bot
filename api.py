@@ -493,30 +493,6 @@ async def auth_callback(request: Request, code: str = '', state: str = '', error
     return resp
 
 
-# ── TEMP: dependency freeze capture (remove after pinning requirements) ───────
-# One-time, key-gated endpoint that returns the exact installed package versions
-# from the running Python 3.13 production container, so requirements.txt can be
-# pinned to what production actually runs. Returns 404 without the correct key.
-# This whole block is removed in the same change that pins requirements.txt.
-_DEPS_FREEZE_KEY = 'pin313-7b1e9f3a2c4d8e6f'
-
-
-@app.get('/api/_internal/deps-freeze')
-async def _deps_freeze(key: str = ''):
-    if not _DEPS_FREEZE_KEY or key != _DEPS_FREEZE_KEY:
-        raise HTTPException(status_code=404, detail='Not Found')
-    import sys
-    import importlib.metadata as _md
-    skip = {'pip', 'setuptools', 'wheel', 'distribute'}
-    seen = {}
-    for dist in _md.distributions():
-        name = (dist.metadata['Name'] or '').strip()
-        if not name or name.lower() in skip:
-            continue
-        seen[name.lower()] = f'{name}=={dist.version}'
-    return {'python': sys.version.split()[0], 'freeze': sorted(seen.values(), key=str.lower)}
-
-
 @app.get('/auth/me')
 async def auth_me(user: dict = Depends(get_current_user)):
     """Return current user info decoded from JWT."""
