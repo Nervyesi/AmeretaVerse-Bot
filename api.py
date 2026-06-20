@@ -283,19 +283,13 @@ def decode_jwt(token: str) -> dict:
         raise HTTPException(status_code=401, detail='Invalid token')
 
 
-def get_bearer(request: Request) -> str:
-    auth = request.headers.get('Authorization', '')
-    if not auth.startswith('Bearer '):
-        raise HTTPException(status_code=401, detail='Missing authorization header')
-    return auth[7:]
-
-
 async def get_current_user(request: Request) -> dict:
-    # Cookie first (cookie-based auth); Authorization header is the fallback
-    # during the migration window.
+    # Cookie-only auth: the JWT is read solely from the HttpOnly auth_token
+    # cookie. The Authorization Bearer fallback was removed after the cookie
+    # migration completed.
     token = request.cookies.get(_AUTH_TOKEN_COOKIE)
     if not token:
-        token = get_bearer(request)
+        raise HTTPException(status_code=401, detail='Not authenticated')
     return decode_jwt(token)
 
 # ── Discord OAuth helpers ─────────────────────────────────────────────────────
