@@ -19,6 +19,7 @@ import json
 import time
 import asyncio
 import sqlite3
+import secrets
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 
@@ -125,6 +126,11 @@ CLIENT_SECRET   = os.getenv('DISCORD_CLIENT_SECRET')
 REDIRECT_URI    = os.getenv('DISCORD_REDIRECT_URI')
 JWT_SECRET      = os.getenv('JWT_SECRET',            'change-me-in-production')
 FRONTEND_URL    = os.getenv('FRONTEND_URL',          'http://localhost:3000')
+
+# OAuth state cookie. Marked Secure only when the callback runs over HTTPS
+# (production) so local http development still works.
+_OAUTH_STATE_COOKIE  = 'oauth_state'
+_OAUTH_COOKIE_SECURE = (REDIRECT_URI or '').lower().startswith('https')
 
 print(f"DISCORD_CLIENT_ID loaded: {bool(CLIENT_ID)}")
 print(f"DISCORD_REDIRECT_URI: {REDIRECT_URI}")
@@ -401,20 +407,57 @@ def require_module_access(user: dict, server_id: int, module: str) -> dict:
 
 @app.get('/auth/login')
 async def auth_login():
-    """Redirect browser to Discord OAuth2 consent screen."""
+    """Redirect browser to Discord OAuth2 consent screen.
+
+    Generates a cryptographically random `state` per attempt, stores it in an
+    HttpOnly cookie, and includes it in the authorize URL. The callback rejects
+    any response whose state does not match the cookie, which blocks the OAuth
+    login-CSRF / account-takeover vector (an attacker cannot forge a state that
+    also lands in the victim's browser as this cookie).
+    """
+    state = secrets.token_urlsafe(32)
     url = (
         f'https://discord.com/oauth2/authorize'
         f'?client_id={CLIENT_ID}'
         f'&redirect_uri={REDIRECT_URI}'
         f'&response_type=code'
         f'&scope={OAUTH_SCOPES.replace(" ", "%20")}'
+        f'&state={state}'
     )
-    return RedirectResponse(url)
+    resp = RedirectResponse(url)
+    resp.set_cookie(
+        key=_OAUTH_STATE_COOKIE,
+        value=state,
+        max_age=600,              # 10 minutes to complete the flow
+        httponly=True,
+        secure=_OAUTH_COOKIE_SECURE,
+        samesite='lax',           # sent on the top-level GET redirect back from Discord
+        path='/',
+    )
+    return resp
 
 
 @app.get('/auth/callback')
-async def auth_callback(code: str):
-    """Exchange OAuth2 code for access token, create JWT, redirect to frontend."""
+async def auth_callback(request: Request, code: str = '', state: str = '', error: str = ''):
+    """Exchange OAuth2 code for access token, create JWT, redirect to frontend.
+
+    Validates the `state` against the cookie set at /auth/login before doing any
+    token exchange. Mismatch, missing state, or a user-cancelled flow redirect
+    back to the dashboard with an error (never a 500).
+    """
+    # User cancelled / Discord returned an error.
+    if error:
+        resp = RedirectResponse(f'{FRONTEND_URL}/dashboard?auth_error=denied')
+        resp.delete_cookie(_OAUTH_STATE_COOKIE, path='/')
+        return resp
+
+    stored_state = request.cookies.get(_OAUTH_STATE_COOKIE)
+    if (not code or not state or not stored_state
+            or not secrets.compare_digest(str(stored_state), str(state))):
+        resp = RedirectResponse(f'{FRONTEND_URL}/dashboard?auth_error=state')
+        resp.delete_cookie(_OAUTH_STATE_COOKIE, path='/')
+        return resp
+
     token_data = await discord_token_exchange(code)
     access_token  = token_data['access_token']
     refresh_token = token_data.get('refresh_token', '')
@@ -445,7 +488,9 @@ async def auth_callback(code: str):
         'guilds':      admin_guilds,
     }
     token = create_jwt(jwt_payload)
-    return RedirectResponse(f'{FRONTEND_URL}/dashboard?token={token}')
+    resp = RedirectResponse(f'{FRONTEND_URL}/dashboard?token={token}')
+    resp.delete_cookie(_OAUTH_STATE_COOKIE, path='/')
+    return resp
 
 
 @app.get('/auth/me')
