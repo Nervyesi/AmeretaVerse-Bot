@@ -496,10 +496,9 @@ async def auth_callback(request: Request, code: str = '', state: str = '', error
         'guilds':      admin_guilds,
     }
     token = create_jwt(jwt_payload)
-    resp = RedirectResponse(f'{FRONTEND_URL}/dashboard?token={token}')
+    # Phase 3: deliver the JWT only via the HttpOnly cookie — no token in the URL.
+    resp = RedirectResponse(f'{FRONTEND_URL}/dashboard')
     resp.delete_cookie(_OAUTH_STATE_COOKIE, path='/')
-    # Phase 1: also deliver the JWT as an HttpOnly cookie, parallel to the URL
-    # token + Authorization header which still work during the migration.
     resp.set_cookie(
         key=_AUTH_TOKEN_COOKIE, value=token, max_age=_AUTH_TOKEN_MAX_AGE,
         httponly=True, secure=_OAUTH_COOKIE_SECURE, samesite='lax', path='/',
