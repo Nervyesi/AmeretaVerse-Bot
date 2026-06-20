@@ -132,6 +132,10 @@ FRONTEND_URL    = os.getenv('FRONTEND_URL',          'http://localhost:3000')
 _OAUTH_STATE_COOKIE  = 'oauth_state'
 _OAUTH_COOKIE_SECURE = (REDIRECT_URI or '').lower().startswith('https')
 
+# Auth session cookie (cookie-based JWT). Same Secure rule as above.
+_AUTH_TOKEN_COOKIE   = 'auth_token'
+_AUTH_TOKEN_MAX_AGE  = 86400  # 24h; the JWT itself still expires per JWT_EXPIRE_DAYS
+
 print(f"DISCORD_CLIENT_ID loaded: {bool(CLIENT_ID)}")
 print(f"DISCORD_REDIRECT_URI: {REDIRECT_URI}")
 JWT_EXPIRE_DAYS = 7
@@ -287,7 +291,11 @@ def get_bearer(request: Request) -> str:
 
 
 async def get_current_user(request: Request) -> dict:
-    token = get_bearer(request)
+    # Cookie first (cookie-based auth); Authorization header is the fallback
+    # during the migration window.
+    token = request.cookies.get(_AUTH_TOKEN_COOKIE)
+    if not token:
+        token = get_bearer(request)
     return decode_jwt(token)
 
 # ── Discord OAuth helpers ─────────────────────────────────────────────────────
@@ -490,6 +498,20 @@ async def auth_callback(request: Request, code: str = '', state: str = '', error
     token = create_jwt(jwt_payload)
     resp = RedirectResponse(f'{FRONTEND_URL}/dashboard?token={token}')
     resp.delete_cookie(_OAUTH_STATE_COOKIE, path='/')
+    # Phase 1: also deliver the JWT as an HttpOnly cookie, parallel to the URL
+    # token + Authorization header which still work during the migration.
+    resp.set_cookie(
+        key=_AUTH_TOKEN_COOKIE, value=token, max_age=_AUTH_TOKEN_MAX_AGE,
+        httponly=True, secure=_OAUTH_COOKIE_SECURE, samesite='lax', path='/',
+    )
+    return resp
+
+
+@app.post('/auth/logout')
+async def auth_logout():
+    """Clear the auth cookie (cookie-based logout)."""
+    resp = JSONResponse({'ok': True})
+    resp.delete_cookie(_AUTH_TOKEN_COOKIE, path='/')
     return resp
 
 
