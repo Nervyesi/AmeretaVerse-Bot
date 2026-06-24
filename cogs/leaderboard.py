@@ -18,7 +18,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from database import get_unified_points, log_event
+from database import get_unified_points, log_event, reset_leaderboard_ameretaverse
 from cogs._branding import build_branded_embed
 
 _NO_PING = discord.AllowedMentions(roles=False, users=False, everyone=False)
@@ -26,6 +26,9 @@ _MEDALS = ['🥇', '🥈', '🥉']
 
 PAGE_SIZE = 10
 MAX_RANKS = 100  # top 100 ranks => 10 pages of 10
+
+# /secret-reset-leaderboard is hardcoded to the AmeretaVerse main guild only.
+AMERETAVERSE_GUILD_ID = 1199707792706117642
 
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
@@ -211,5 +214,83 @@ class LeaderboardCog(commands.Cog, name='Leaderboard'):
             view.message = None
 
 
+# ── Leaderboard reset (AmeretaVerse only) ─────────────────────────────────────
+
+class _ResetConfirmModal(discord.ui.Modal, title='Reset Leaderboard'):
+    confirm = discord.ui.TextInput(
+        label='Type CONFIRM to proceed',
+        placeholder='CONFIRM',
+        required=True,
+        max_length=16,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if (self.confirm.value or '').strip().upper() != 'CONFIRM':
+            await interaction.response.send_message(
+                'Cancelled. No changes were made.', ephemeral=True,
+            )
+            return
+        # Defense in depth: re-check the guild gate at execution time.
+        if interaction.guild_id != AMERETAVERSE_GUILD_ID:
+            await interaction.response.send_message(
+                'This command is not available in this server.', ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = reset_leaderboard_ameretaverse(interaction.guild_id, interaction.user.id)
+        except Exception as e:  # noqa: BLE001
+            print(f'[secret-reset-leaderboard] failed: {type(e).__name__}: {e}')
+            await interaction.followup.send(
+                'Reset failed. No changes were committed.', ephemeral=True,
+            )
+            return
+        log_event(
+            interaction.guild_id, 'admin_action', 'leaderboard_reset',
+            f'{interaction.user} reset the leaderboard '
+            f'(snapshot #{result["snapshot_id"]}, {result["affected_users"]} users)',
+            actor_user_id=interaction.user.id,
+            actor_username=str(interaction.user),
+            module='leaderboard', severity='critical',
+            details={'snapshot_id': result['snapshot_id'],
+                     'affected_users': result['affected_users']},
+        )
+        await interaction.followup.send(
+            '✅ Leaderboard reset complete.\n'
+            f'Snapshot saved: **#{result["snapshot_id"]}**\n'
+            f'Users in snapshot: **{result["affected_users"]}**\n'
+            'Raid points zeroed. Engage balances are untouched; their leaderboard '
+            'contribution is reset to 0.',
+            ephemeral=True,
+        )
+
+
+class LeaderboardAdminCog(commands.Cog, name='LeaderboardAdmin'):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(
+        name='secret-reset-leaderboard',
+        description='Admin: reset this server\'s leaderboard standings (AmeretaVerse only).',
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def secret_reset_leaderboard(self, interaction: discord.Interaction):
+        # Hard gate: AmeretaVerse only. Every other server gets a polite refusal
+        # and the destructive path never opens.
+        if interaction.guild_id != AMERETAVERSE_GUILD_ID:
+            await interaction.response.send_message(
+                'This command is not available in this server.', ephemeral=True,
+            )
+            return
+        perms = getattr(interaction.user, 'guild_permissions', None)
+        if not perms or not perms.administrator:
+            await interaction.response.send_message(
+                'Administrator permission is required to use this command.', ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(_ResetConfirmModal())
+
+
 async def setup(bot):
     await bot.add_cog(LeaderboardCog(bot))
+    await bot.add_cog(LeaderboardAdminCog(bot))

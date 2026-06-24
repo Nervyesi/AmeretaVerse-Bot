@@ -574,11 +574,28 @@ def init_db():
             # snowflake-precision, so stored as TEXT.
             "ALTER TABLE engage_actions ADD COLUMN reply_tweet_id TEXT",
             "ALTER TABLE raid_participation ADD COLUMN reply_tweet_id TEXT",
+            # Leaderboard reset (offset approach). baseline defaults to 0 for
+            # every existing row, so leaderboard contribution = max(0, points -
+            # baseline) = points = current behavior for all servers until a
+            # reset runs. Earn/spend never touch baseline.
+            "ALTER TABLE engage_user_points ADD COLUMN baseline INTEGER NOT NULL DEFAULT 0",
         ]:
             try:
                 conn.execute(migration)
             except sqlite3.OperationalError:
                 pass
+
+        # Leaderboard reset snapshots: a record-keeping copy of pre-reset
+        # standings written atomically when /secret-reset-leaderboard runs.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id             INTEGER NOT NULL,
+                taken_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                triggered_by_user_id INTEGER,
+                snapshot_data        TEXT NOT NULL
+            )
+        """)
 
         # assets_library table for R2 uploads
         conn.execute("""
@@ -3609,12 +3626,21 @@ def get_engage_user_points(pool_id: int, user_id: str) -> dict:
 
 
 def get_engage_leaderboard(pool_id: int, limit: int = 10) -> list:
+    # Leaderboard contribution = max(0, points - baseline). baseline defaults to
+    # 0, so `points` (the contribution, aliased for back-compat) == balance for
+    # every server until a reset sets baseline. `balance` is also returned for
+    # callers that need the spendable amount.
     with get_connection() as conn:
         rows = conn.execute(
-            """SELECT eup.user_id, u.username, eup.points, eup.total_engaged, eup.total_submitted
+            """SELECT eup.user_id, u.username,
+                      MAX(0, eup.points - eup.baseline) AS points,
+                      eup.points AS balance,
+                      eup.total_engaged, eup.total_submitted
                FROM engage_user_points eup
                LEFT JOIN users u ON u.user_id = eup.user_id
-               WHERE eup.pool_id=? ORDER BY eup.points DESC LIMIT ?""",
+               WHERE eup.pool_id=?
+               ORDER BY MAX(0, eup.points - eup.baseline) DESC
+               LIMIT ?""",
             (pool_id, limit)
         ).fetchall()
     return [dict(r) for r in rows]
@@ -3639,8 +3665,11 @@ def get_unified_points(guild_id) -> list:
             "WHERE rup.guild_id = ?",
             (gid_int,),
         ).fetchall()
+        # Engage leaderboard contribution per pool = max(0, points - baseline),
+        # summed across the guild's pools. baseline defaults to 0, so this
+        # equals SUM(points) for every server until a reset runs.
         eng_rows = conn.execute(
-            "SELECT eup.user_id AS user_id, SUM(eup.points) AS pts, MAX(u.username) AS username "
+            "SELECT eup.user_id AS user_id, SUM(MAX(0, eup.points - eup.baseline)) AS pts, MAX(u.username) AS username "
             "FROM engage_user_points eup LEFT JOIN users u ON CAST(u.user_id AS TEXT) = eup.user_id "
             "WHERE eup.guild_id = ? GROUP BY eup.user_id",
             (gid_str,),
@@ -3888,6 +3917,93 @@ def reset_all_engage_points_in_guild(guild_id: int) -> int:
             (str(guild_id),),
         )
     return c.rowcount
+
+
+LEADERBOARD_SNAPSHOT_VERSION = 1
+
+
+def reset_leaderboard_ameretaverse(guild_id: int, actor_user_id: int) -> dict:
+    """Atomic leaderboard reset for a single guild (caller gates to AmeretaVerse).
+
+    In ONE transaction:
+      1. Snapshot pre-reset standings (raid points, per-pool engage points, and
+         the pre-reset combined leaderboard contribution) into
+         leaderboard_snapshots.
+      2. Zero raid_user_points for the guild.
+      3. Set engage baseline = points for every pool row in the guild, so each
+         user's engage leaderboard contribution (max(0, points - baseline))
+         flips to 0 while their spendable balance (points) is untouched.
+
+    Spendable engage balances are NOT changed. Returns
+    {'snapshot_id': int, 'affected_users': int}. Snapshot is built and inserted
+    BEFORE the updates; the whole thing commits or rolls back together.
+    """
+    gid_int = int(guild_id)
+    gid_str = str(gid_int)
+    with get_connection() as conn:
+        raid_rows = conn.execute(
+            "SELECT user_id, total_points FROM raid_user_points WHERE guild_id=?",
+            (gid_int,),
+        ).fetchall()
+        eng_rows = conn.execute(
+            "SELECT pool_id, user_id, points, baseline FROM engage_user_points WHERE guild_id=?",
+            (gid_str,),
+        ).fetchall()
+
+        per_user: dict = {}
+        for r in raid_rows:
+            try:
+                uid = int(r['user_id'])
+            except (TypeError, ValueError):
+                continue
+            u = per_user.setdefault(uid, {'raid': 0, 'engage_by_pool': {}, 'engage_contrib': 0})
+            u['raid'] = max(0, int(r['total_points'] or 0))
+        for r in eng_rows:
+            try:
+                uid = int(r['user_id'])
+            except (TypeError, ValueError):
+                continue
+            u = per_user.setdefault(uid, {'raid': 0, 'engage_by_pool': {}, 'engage_contrib': 0})
+            pts = int(r['points'] or 0)
+            base = int(r['baseline'] or 0)
+            u['engage_by_pool'][str(int(r['pool_id']))] = pts
+            u['engage_contrib'] += max(0, pts - base)
+
+        snapshot_users = []
+        for uid, u in per_user.items():
+            has_engage = any(v for v in u['engage_by_pool'].values())
+            if u['raid'] <= 0 and not has_engage:
+                continue
+            snapshot_users.append({
+                'user_id': uid,
+                'raid_points': u['raid'],
+                'engage_by_pool': u['engage_by_pool'],
+                'combined_score': u['raid'] + u['engage_contrib'],
+            })
+
+        snapshot = {
+            'snapshot_version': LEADERBOARD_SNAPSHOT_VERSION,
+            'guild_id': gid_int,
+            'triggered_by_user_id': int(actor_user_id),
+            'users': snapshot_users,
+        }
+        cur = conn.execute(
+            "INSERT INTO leaderboard_snapshots (guild_id, triggered_by_user_id, snapshot_data) "
+            "VALUES (?,?,?)",
+            (gid_int, int(actor_user_id), json.dumps(snapshot, default=str)),
+        )
+        snapshot_id = cur.lastrowid
+
+        conn.execute(
+            "UPDATE raid_user_points SET total_points=0 WHERE guild_id=?",
+            (gid_int,),
+        )
+        conn.execute(
+            "UPDATE engage_user_points SET baseline=points WHERE guild_id=?",
+            (gid_str,),
+        )
+
+    return {'snapshot_id': int(snapshot_id), 'affected_users': len(snapshot_users)}
 
 
 # ── Guild settings + module access ──────────────────────────────────────────

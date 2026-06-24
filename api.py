@@ -1603,14 +1603,25 @@ async def leaderboard(
     user: dict = Depends(get_current_user),
 ):
     require_guild_admin(user, server_id)
+    # Per-guild community (raid) points leaderboard, sourced from
+    # raid_user_points filtered by guild_id — the same source the bot's
+    # /leaderboard uses. (Previously this read the legacy global `users` table
+    # with no guild filter, which showed cross-server data.) Response shape is
+    # unchanged: total_points carries the raid balance; the engage_points /
+    # creator_engage_points keys are retained for back-compat.
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT user_id, username, total_points,
-                   engage_points, creator_engage_points
-            FROM users
-            ORDER BY total_points DESC
+            SELECT rup.user_id        AS user_id,
+                   u.username         AS username,
+                   rup.total_points   AS total_points,
+                   0                  AS engage_points,
+                   0                  AS creator_engage_points
+            FROM raid_user_points rup
+            LEFT JOIN users u ON u.user_id = rup.user_id
+            WHERE rup.guild_id = ?
+            ORDER BY rup.total_points DESC
             LIMIT ?
-        """, (min(limit, 100),)).fetchall()
+        """, (server_id, min(limit, 100))).fetchall()
     return [dict(r) for r in rows]
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
