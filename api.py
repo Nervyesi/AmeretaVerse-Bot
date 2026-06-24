@@ -1624,6 +1624,54 @@ async def leaderboard(
         """, (server_id, min(limit, 100))).fetchall()
     return [dict(r) for r in rows]
 
+
+@app.get('/api/servers/{server_id}/engage/leaderboard')
+async def engage_leaderboard_api(
+    server_id: int, pool_id: int, limit: int = 100,
+    user: dict = Depends(get_current_user),
+):
+    """Per-pool engage leaderboard. Uses the offset-aware contribution
+    (max(0, points - baseline)); `balance` is the spendable amount. The pool
+    must belong to this guild (per-guild isolation)."""
+    require_guild_admin(user, server_id)
+    from database import get_engage_pool_by_id, get_engage_leaderboard
+    pool = get_engage_pool_by_id(pool_id)
+    if not pool or str(pool.get('guild_id')) != str(server_id):
+        raise HTTPException(status_code=404, detail='Pool not found in this server')
+    rows = get_engage_leaderboard(pool_id, min(limit, 100))
+    return {
+        'pool_id': pool_id,
+        'pool_name': pool.get('display_name') or pool.get('name'),
+        'leaderboard': [
+            {'user_id': str(r['user_id']), 'username': r.get('username'),
+             'points': int(r.get('points') or 0), 'balance': int(r.get('balance') or 0)}
+            for r in rows
+        ],
+    }
+
+
+@app.get('/api/servers/{server_id}/leaderboard/combined')
+async def combined_leaderboard_api(
+    server_id: int, limit: int = 100, user: dict = Depends(get_current_user),
+):
+    """Combined raid + engage-contribution leaderboard, matching the bot's
+    /leaderboard: per-guild, engage aggregated across pools with the baseline
+    offset applied."""
+    require_guild_admin(user, server_id)
+    from database import get_unified_points
+    data = get_unified_points(server_id)
+    ranked = sorted(
+        [d for d in data if d['total'] > 0],
+        key=lambda d: (-d['total'], d['user_id']),
+    )[:min(limit, 100)]
+    return {
+        'leaderboard': [
+            {'user_id': str(d['user_id']), 'username': d.get('username'),
+             'raid': int(d['raid']), 'engage': int(d['engage']), 'total': int(d['total'])}
+            for d in ranked
+        ],
+    }
+
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 #  TICKETS ENDPOINTS
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
