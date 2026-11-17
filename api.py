@@ -79,7 +79,6 @@ from database import (
     update_guild_settings,
     list_module_access,
     set_module_access,
-    user_can_access_module,
     MODULES,
     log_event,
     list_events,
@@ -366,10 +365,93 @@ def _get_bot_instance():
     return _bot
 
 
-def require_guild_admin(user: dict, server_id: int) -> dict:
+# ── Member resolution (cache-first, with REST fallback) ──────────────────────
+# discord.py's guild.get_member() only reads the in-memory cache, which is
+# populated by gateway events (member chunking at startup, presence updates,
+# message events). For large guilds (10K+ members), chunking may still be in
+# progress when a dashboard request arrives, and quiet admins never trigger a
+# gateway event that would hydrate them. The result: an Administrator who
+# loads the dashboard right after a bot restart gets a 403 even though their
+# role is correct on Discord's side.
+#
+# This resolver tries the gateway cache first (free, instant) and falls back
+# to a REST fetch on a miss. A short in-process TTL cache keeps the API call
+# from firing on every request for the same user, while still picking up role
+# changes within a minute.
+_MEMBER_CACHE: dict = {}
+_MEMBER_CACHE_TTL_SECS = 60.0
+_MEMBER_CACHE_LOCK = asyncio.Lock()
+
+
+async def _resolve_guild_member(guild, user_id: int):
+    """Return a discord.Member for this user in this guild, or None if the
+    user is not a member. Tries the gateway cache first, then falls back to
+    a REST fetch. Both positive and negative results are cached for a short
+    window so a non-member does not hit the API on every poll."""
+    if guild is None:
+        return None
+    user_id = int(user_id)
+    gid = int(guild.id)
+    key = (gid, user_id)
+    now = _time.monotonic()
+    cached = _MEMBER_CACHE.get(key)
+    if cached and (now - cached[0]) < _MEMBER_CACHE_TTL_SECS:
+        return cached[1]
+    # Try the gateway cache first.
+    member = guild.get_member(user_id)
+    if member is not None:
+        _MEMBER_CACHE[key] = (now, member)
+        return member
+    # Cache miss. Fetch from REST (one call per user per TTL window).
+    async with _MEMBER_CACHE_LOCK:
+        cached = _MEMBER_CACHE.get(key)
+        if cached and (_time.monotonic() - cached[0]) < _MEMBER_CACHE_TTL_SECS:
+            return cached[1]
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.NotFound:
+            member = None
+        except discord.HTTPException as e:
+            print(f'[member_resolve] HTTP error fetching member {user_id} in guild {gid}: {e}')
+            member = None
+        except Exception as e:
+            print(f'[member_resolve] Unexpected error fetching member {user_id} in guild {gid}: {type(e).__name__}: {e}')
+            member = None
+        _MEMBER_CACHE[key] = (_time.monotonic(), member)
+        # Opportunistic prune to keep the cache bounded.
+        if len(_MEMBER_CACHE) > 20000:
+            cutoff = _time.monotonic() - _MEMBER_CACHE_TTL_SECS
+            stale = [k for k, (t, _m) in list(_MEMBER_CACHE.items()) if t < cutoff]
+            for k in stale[:5000]:
+                _MEMBER_CACHE.pop(k, None)
+        return member
+
+
+def _check_module_grants(guild_id: int, member, module: str) -> bool:
+    """Given a pre-resolved admin member, decide module access against the
+    guild_module_access table. The owner/admin check happens at the caller;
+    this helper only applies module-level role restrictions. Returns True
+    when the module has no restrictions, or when the member holds at least
+    one granted role."""
+    if member is None:
+        return False
+    user_role_ids = {str(r.id) for r in member.roles}
+    with get_connection() as conn:
+        grants = conn.execute(
+            "SELECT role_id FROM guild_module_access WHERE guild_id=? AND module=? AND granted=1",
+            (str(guild_id), module)
+        ).fetchall()
+    granted_ids = {str(g['role_id']) for g in grants}
+    if not granted_ids:
+        return True  # no restrictions configured, every admin can access
+    return bool(user_role_ids & granted_ids)
+
+
+async def require_guild_admin(user: dict, server_id: int) -> dict:
     """Raise HTTPException if user is not the guild owner or does not have Administrator.
-    Returns permission info dict on success.
-    Uses discord.py's in-memory guild/member cache — updated in real-time by Discord gateway."""
+    Returns permission info dict on success. Resolves the member via the
+    gateway cache first, then falls back to a REST fetch so freshly-restarted
+    bots and quiet admins still authenticate."""
     user_id = int(user.get('user_id') or user.get('id') or 0)
     if not user_id:
         raise HTTPException(status_code=401, detail='Not authenticated')
@@ -381,23 +463,26 @@ def require_guild_admin(user: dict, server_id: int) -> dict:
 
     is_owner = (str(guild.owner_id) == str(user_id))
 
-    member = guild.get_member(user_id)
+    member = await _resolve_guild_member(guild, user_id)
     is_admin = bool(member and member.guild_permissions.administrator)
     has_access = is_owner or is_admin
 
     if not has_access:
-        print(f'[security] DENIED: user_id={user_id} attempted access to guild={server_id} — not owner, not admin')
+        print(f'[security] DENIED: user_id={user_id} attempted access to guild={server_id} — not owner, not admin (member_resolved={member is not None})')
         raise HTTPException(status_code=403, detail='You need the Administrator permission (or be the server owner) to access this server\'s dashboard.')
 
-    return {'is_owner': is_owner, 'is_admin': is_admin, 'has_access': True}
+    return {'is_owner': is_owner, 'is_admin': is_admin, 'has_access': True, 'member': member}
 
 
-def require_module_access(user: dict, server_id: int, module: str) -> dict:
+async def require_module_access(user: dict, server_id: int, module: str) -> dict:
     """Guild admin check + module-level role grant check."""
-    perm = require_guild_admin(user, server_id)
+    perm = await require_guild_admin(user, server_id)
+    # Owner bypasses module restrictions entirely.
+    if perm.get('is_owner'):
+        return perm
     user_id = int(user.get('user_id') or user.get('id') or 0)
-    bot = _get_bot_instance()
-    if not user_can_access_module(server_id, user_id, module, bot):
+    member = perm.get('member')
+    if not _check_module_grants(int(server_id), member, module):
         print(f'[security] DENIED: user_id={user_id} module={module} guild={server_id} — role not granted')
         raise HTTPException(status_code=403,
             detail=f'You do not have access to the {module} module in this server.')
@@ -529,7 +614,9 @@ async def auth_me(user: dict = Depends(get_current_user)):
 
 @app.get('/api/servers')
 async def list_servers(user: dict = Depends(get_current_user)):
-    """Return servers where the bot is present AND the user is the guild owner or has Administrator."""
+    """Return servers where the bot is present AND the user is the guild owner or has Administrator.
+    Uses the cache-first member resolver so admins show up even when the bot
+    has not yet chunked the guild or has never seen a gateway event for them."""
     bot_instance = _get_bot_instance()
     user_id = int(user.get('user_id') or user.get('id') or 0)
     result = []
@@ -546,7 +633,7 @@ async def list_servers(user: dict = Depends(get_current_user)):
                 'role':       'owner',
             })
             continue
-        member = guild.get_member(user_id)
+        member = await _resolve_guild_member(guild, user_id)
         if member and member.guild_permissions.administrator:
             result.append({
                 'id':         str(guild.id),
@@ -562,7 +649,7 @@ async def list_servers(user: dict = Depends(get_current_user)):
 @app.get('/api/servers/{server_id}/stats')
 async def server_stats(server_id: int, user: dict = Depends(get_current_user)):
     """Live stats for a guild via the bot's cache."""
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
 
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready yet')
@@ -630,7 +717,7 @@ async def server_analytics(
     Multi-timeframe analytics. Returns all four timeframe arrays at once.
     Reads from analytics_snapshots + message_counters (populated by cogs/analytics.py).
     """
-    require_module_access(user, server_id, 'analytics')
+    await require_module_access(user, server_id, 'analytics')
 
     today = date.today()
 
@@ -1215,11 +1302,15 @@ async def server_analytics(
 @app.get('/api/servers/{server_id}/config')
 async def get_server_config(server_id: int, user: dict = Depends(get_current_user)):
     """Return all config key/value pairs for this guild (defaults merged with overrides)."""
-    require_guild_admin(user, server_id)
+    perm = await require_guild_admin(user, server_id)
     result = db_get_all_config(server_id)
-    user_id = int(user.get('user_id') or user.get('id') or 0)
-    bot_instance = _get_bot_instance()
-    accessible = [m for m in MODULES if user_can_access_module(server_id, user_id, m, bot_instance)]
+    # Build the per-user accessible module list from the resolved member.
+    # Owner has access to everything; non-owner admin applies grant checks.
+    if perm.get('is_owner'):
+        accessible = list(MODULES)
+    else:
+        member = perm.get('member')
+        accessible = [m for m in MODULES if _check_module_grants(int(server_id), member, m)]
     result['user_accessible_modules'] = accessible
     return result
 
@@ -1227,7 +1318,7 @@ async def get_server_config(server_id: int, user: dict = Depends(get_current_use
 @app.post('/api/servers/{server_id}/config')
 async def set_server_config(server_id: int, body: dict, user: dict = Depends(get_current_user)):
     """Update one or more config values for this guild. Body: {"key": "value", ...}"""
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     for key, value in body.items():
         db_set_config(server_id, key, str(value))
     return {'updated': list(body.keys())}
@@ -1238,7 +1329,7 @@ async def set_server_config(server_id: int, body: dict, user: dict = Depends(get
 
 @app.get('/api/servers/{server_id}/protection/stats')
 async def protection_stats(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'protection')
+    await require_module_access(user, server_id, 'protection')
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT action_type, COUNT(*) as count
@@ -1292,7 +1383,7 @@ async def protection_stats(server_id: int, user: dict = Depends(get_current_user
 @app.post('/api/servers/{server_id}/protection/send-message')
 async def protection_send_message(server_id: int, user: dict = Depends(get_current_user)):
     """Send the configured protection embed to the configured channel."""
-    require_module_access(user, server_id, 'protection')
+    await require_module_access(user, server_id, 'protection')
 
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready yet')
@@ -1343,7 +1434,7 @@ async def protection_log(
     limit: int = 50,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'protection')
+    await require_module_access(user, server_id, 'protection')
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT id, action_type, user_id, detail, created_at
@@ -1371,7 +1462,7 @@ async def logs_list(
     offset: int = 0,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'logs')
+    await require_module_access(user, server_id, 'logs')
     limit  = max(1, min(int(limit or 50), 500))
     offset = max(0, int(offset or 0))
     events = list_events(
@@ -1401,7 +1492,7 @@ async def logs_export(
     module: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'logs')
+    await require_module_access(user, server_id, 'logs')
     import io as _io
     import csv as _csv
     from fastapi.responses import Response as _Response
@@ -1439,7 +1530,7 @@ async def flags_list(
     module: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'logs')
+    await require_module_access(user, server_id, 'logs')
     return list_flags(server_id, status=status, module=module)
 
 
@@ -1450,7 +1541,7 @@ async def flag_resolve(
     body: dict,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'logs')
+    await require_module_access(user, server_id, 'logs')
     note = (body.get('note') or '').strip() or None
     actor_id = user.get('user_id') or user.get('id') or 0
     ok = resolve_flag(flag_id, actor_id, note)
@@ -1462,7 +1553,7 @@ async def flag_resolve(
 @app.get('/api/servers/{server_id}/flagged')
 async def flagged_users(server_id: int, user: dict = Depends(get_current_user)):
     """Flagged raid participants for this guild."""
-    require_module_access(user, server_id, 'flagged')
+    await require_module_access(user, server_id, 'flagged')
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT u.user_id, u.username, u.x_username,
@@ -1511,7 +1602,7 @@ async def audit_log(
     Normalized view of protection_actions — field names match what the frontend expects.
     Does NOT replace /protection/log; that endpoint remains unchanged.
     """
-    require_module_access(user, server_id, 'audit_log')
+    await require_module_access(user, server_id, 'audit_log')
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT id, action_type, user_id, detail, created_at
@@ -1542,7 +1633,7 @@ async def list_raids(
     active_only: bool = False,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     with get_connection() as conn:
         query = 'SELECT * FROM raids'
         if active_only:
@@ -1567,7 +1658,7 @@ async def list_raids(
 
 @app.get('/api/servers/{server_id}/engage')
 async def engage_stats(server_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     with get_connection() as conn:
         links = conn.execute("""
             SELECT l.link_id, l.user_id, u.username, l.tweet_link,
@@ -1602,7 +1693,7 @@ async def leaderboard(
     limit: int = 25,
     user: dict = Depends(get_current_user),
 ):
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     # Per-guild community (raid) points leaderboard, sourced from
     # raid_user_points filtered by guild_id — the same source the bot's
     # /leaderboard uses. (Previously this read the legacy global `users` table
@@ -1633,7 +1724,7 @@ async def engage_leaderboard_api(
     """Per-pool engage leaderboard. Uses the offset-aware contribution
     (max(0, points - baseline)); `balance` is the spendable amount. The pool
     must belong to this guild (per-guild isolation)."""
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     from database import get_engage_pool_by_id, get_engage_leaderboard
     pool = get_engage_pool_by_id(pool_id)
     if not pool or str(pool.get('guild_id')) != str(server_id):
@@ -1657,7 +1748,7 @@ async def combined_leaderboard_api(
     """Combined raid + engage-contribution leaderboard, matching the bot's
     /leaderboard: per-guild, engage aggregated across pools with the baseline
     offset applied."""
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     from database import get_unified_points
     data = get_unified_points(server_id)
     ranked = sorted(
@@ -1679,7 +1770,7 @@ async def combined_leaderboard_api(
 @app.post('/api/servers/{server_id}/tickets/send-panel')
 async def tickets_send_panel(server_id: int, user: dict = Depends(get_current_user)):
     """Post the Open Ticket panel embed to the configured panel channel."""
-    require_module_access(user, server_id, 'tickets')
+    await require_module_access(user, server_id, 'tickets')
 
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready yet')
@@ -1741,7 +1832,7 @@ async def list_tickets(
     user: dict = Depends(get_current_user),
 ):
     """Return tickets for this guild, filtered by status."""
-    require_module_access(user, server_id, 'tickets')
+    await require_module_access(user, server_id, 'tickets')
     limit = min(limit, 200)
     with get_connection() as conn:
         if status == 'all':
@@ -1760,7 +1851,7 @@ async def list_tickets(
 @app.get('/api/servers/{server_id}/tickets/stats')
 async def tickets_stats(server_id: int, user: dict = Depends(get_current_user)):
     """Aggregate ticket metrics for this guild."""
-    require_module_access(user, server_id, 'tickets')
+    await require_module_access(user, server_id, 'tickets')
     with get_connection() as conn:
         open_count = conn.execute(
             "SELECT COUNT(*) FROM tickets WHERE guild_id=? AND status='open'",
@@ -1815,7 +1906,7 @@ async def verify_send_message(
     user: dict = Depends(get_current_user),
 ):
     """Post the verification embed with Verify button to the specified channel."""
-    require_module_access(user, server_id, 'verify')
+    await require_module_access(user, server_id, 'verify')
 
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready yet')
@@ -1935,7 +2026,7 @@ def _get_rs_panel(panel_id: int, server_id: int) -> dict:
 
 @app.get('/api/servers/{server_id}/roleselect/panels')
 async def rs_list_panels(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     panels = db_get_panels(server_id)
     for panel in panels:
         panel['buttons'] = db_get_buttons(panel['panel_id'])
@@ -1948,7 +2039,7 @@ async def rs_create_panel(
     body: _PanelCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     if body.style not in ('buttons', 'dropdown'):
         raise HTTPException(status_code=400, detail="style must be 'buttons' or 'dropdown'")
     panel_id = db_create_panel(server_id, body.title, body.description, body.style)
@@ -1964,7 +2055,7 @@ async def rs_update_panel(
     body: _PanelUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     _get_rs_panel(panel_id, server_id)
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if 'style' in updates and updates['style'] not in ('buttons', 'dropdown'):
@@ -1990,7 +2081,7 @@ async def rs_delete_panel(
     panel_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     panel = _get_rs_panel(panel_id, server_id)
 
     if panel.get('message_id') and panel.get('channel_id') and bot.is_ready():
@@ -2015,7 +2106,7 @@ async def rs_create_button(
     body: _ButtonCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     _get_rs_panel(panel_id, server_id)
     if body.mode not in ('give', 'take', 'toggle'):
         raise HTTPException(status_code=400, detail="mode must be 'give', 'take', or 'toggle'")
@@ -2034,7 +2125,7 @@ async def rs_update_button(
     body: _ButtonUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     _get_rs_panel(panel_id, server_id)
     btn = db_get_button(button_id)
     if btn is None or btn['panel_id'] != panel_id:
@@ -2054,7 +2145,7 @@ async def rs_delete_button(
     button_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     _get_rs_panel(panel_id, server_id)
     btn = db_get_button(button_id)
     if btn is None or btn['panel_id'] != panel_id:
@@ -2070,7 +2161,7 @@ async def rs_send_panel(
     body: _SendPanelBody,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     panel = _get_rs_panel(panel_id, server_id)
 
     if not bot.is_ready():
@@ -2144,7 +2235,7 @@ async def rs_refresh_panel(
     panel_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'roleselect')
+    await require_module_access(user, server_id, 'roleselect')
     panel = _get_rs_panel(panel_id, server_id)
 
     if not panel.get('message_id') or not panel.get('channel_id'):
@@ -2276,7 +2367,7 @@ def _check_form_owner(form_id: int, server_id: int) -> dict:
 
 @app.get('/api/servers/{server_id}/forms')
 async def forms_list(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     forms = db_list_forms(server_id)
     for f in forms:
         f['fields'] = db_list_form_fields(f['form_id'])
@@ -2289,7 +2380,7 @@ async def forms_create(
     body: _FormCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     if not body.name.strip():
         raise HTTPException(status_code=400, detail='name is required')
     form_id = db_create_form(server_id, body.name.strip())
@@ -2304,7 +2395,7 @@ async def forms_get(
     form_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     form = _check_form_owner(form_id, server_id)
     form['fields'] = db_list_form_fields(form_id)
     return form
@@ -2317,7 +2408,7 @@ async def forms_update(
     body: _FormUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if updates:
@@ -2333,7 +2424,7 @@ async def forms_delete(
     form_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     db_delete_form(form_id, server_id)
     return {'ok': True}
@@ -2346,7 +2437,7 @@ async def forms_add_field(
     body: _FieldCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     _validate_field_type(body.field_type)
     if not body.label.strip():
@@ -2378,7 +2469,7 @@ async def forms_update_field(
     body: _FieldUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if 'field_type' in updates:
@@ -2404,7 +2495,7 @@ async def forms_delete_field(
     field_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     _check_form_owner(form_id, server_id)
     db_delete_form_field(field_id, form_id)
     form = db_get_form(form_id, server_id)
@@ -2419,7 +2510,7 @@ async def forms_send(
     body: _FormSendBody,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'forms')
+    await require_module_access(user, server_id, 'forms')
     form = _check_form_owner(form_id, server_id)
 
     if not bot.is_ready():
@@ -2639,7 +2730,7 @@ def _check_embed_owner(embed_id: int, server_id: int) -> dict:
 
 @app.get('/api/servers/{server_id}/embeds')
 async def embeds_list(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'embed_message')
+    await require_module_access(user, server_id, 'embed_message')
     rows = db_list_embed_messages(server_id)
     return {'embeds': [_embed_row_to_dict(r) for r in rows]}
 
@@ -2650,7 +2741,7 @@ async def embeds_create(
     body: _EmbedCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'embed_message')
+    await require_module_access(user, server_id, 'embed_message')
     rate_limit(f'embed_create:{server_id}', 30, 60.0)
 
     title       = (body.title       or '')[:_EMBED_TITLE_MAX]
@@ -2693,7 +2784,7 @@ async def embeds_update(
     body: _EmbedUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'embed_message')
+    await require_module_access(user, server_id, 'embed_message')
     rate_limit(f'embed_update:{server_id}', 120, 60.0)
     row = _check_embed_owner(embed_id, server_id)
 
@@ -2795,7 +2886,7 @@ async def embeds_send(
     """Send (or resend) this embed to a channel. If the embed is already
     posted, sending again creates a NEW message; for in-place updates use
     PATCH (which edits the live message)."""
-    require_module_access(user, server_id, 'embed_message')
+    await require_module_access(user, server_id, 'embed_message')
     # Generous per-guild rate cap on a write-to-Discord op; per-user limit
     # blunts a single admin hammering "Send" by accident.
     rate_limit(f'embed_send:{server_id}', 30, 60.0)
@@ -2858,7 +2949,7 @@ async def embeds_delete_message(
 ):
     """Delete only the live Discord message; keep the draft row so the admin
     can edit and re-send. No-op (200) if the row was never posted."""
-    require_module_access(user, server_id, 'embed_message')
+    await require_module_access(user, server_id, 'embed_message')
     rate_limit(f'embed_dmsg:{server_id}', 30, 60.0)
     row = _check_embed_owner(embed_id, server_id)
 
@@ -2919,7 +3010,7 @@ async def embeds_delete(
 ):
     """Delete the draft row. Pass ?delete_message=true to ALSO delete the
     live Discord message; otherwise the posted message is left intact."""
-    require_module_access(user, server_id, 'embed_message')
+    await require_module_access(user, server_id, 'embed_message')
     row = _check_embed_owner(embed_id, server_id)
 
     qs_flag = (request.query_params.get('delete_message') or '').lower()
@@ -3349,7 +3440,7 @@ def _giveaway_row_to_dict(g: dict) -> dict:
 
 @app.get('/api/servers/{server_id}/giveaways')
 async def giveaways_list(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     rows = db_list_giveaways(server_id)
     return {'giveaways': [_giveaway_row_to_dict(r) for r in rows]}
 
@@ -3360,7 +3451,7 @@ async def giveaways_create(
     body: _GiveawayCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     rate_limit(f'giveaway_create:{server_id}', 30, 60.0)
 
     _validate_giveaway_payload(
@@ -3437,7 +3528,7 @@ async def giveaways_update(
     body: _GiveawayUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     rate_limit(f'giveaway_update:{server_id}', 120, 60.0)
     g = _check_giveaway_owner(giveaway_id, server_id)
     status = g.get('status') or 'draft'
@@ -3561,7 +3652,7 @@ async def giveaways_start(
     ends_at = now + duration_seconds, flip status to 'active'. Idempotent
     failure modes: if Discord post fails, status stays 'draft' and nothing
     permanent is written."""
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     rate_limit(f'giveaway_start:{server_id}', 30, 60.0)
     g = _check_giveaway_owner(giveaway_id, server_id)
 
@@ -3686,7 +3777,7 @@ async def giveaways_end_now(
 ):
     """Force the draw immediately. The cog's _finalize_one handles the
     transition atomically (claim_giveaway_for_draw guards the race)."""
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     rate_limit(f'giveaway_end:{server_id}', 30, 60.0)
     g = _check_giveaway_owner(giveaway_id, server_id)
 
@@ -3728,7 +3819,7 @@ async def giveaways_reroll(
     Uses a derived seed (random_seed + ':reroll:N') so the same admin clicking
     Reroll a second time gets a different result while a single click is still
     reproducible."""
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     rate_limit(f'giveaway_reroll:{server_id}', 10, 60.0)
     uid = int(user.get('user_id') or user.get('id') or 0)
     if uid:
@@ -3806,7 +3897,7 @@ async def giveaways_cancel(
     """Cancel a draft or active giveaway. If active AND entry_cost_points > 0,
     refund every entry's points_charged atomically through the existing
     community-points table before flipping status."""
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     rate_limit(f'giveaway_cancel:{server_id}', 30, 60.0)
     g = _check_giveaway_owner(giveaway_id, server_id)
 
@@ -3860,7 +3951,7 @@ async def giveaways_delete(
     """Delete a giveaway and all its entries. Allowed for draft, ended, and
     cancelled rows. Active / drawing giveaways cannot be deleted (cancel or wait
     for the draw first) so an in-flight giveaway is never yanked out."""
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     g = _check_giveaway_owner(giveaway_id, server_id)
     if g.get('status') in ('active', 'drawing'):
         raise HTTPException(status_code=400,
@@ -3890,7 +3981,7 @@ async def giveaways_delete(
 async def discord_server_resolve(
     server_id: int, q: str = '', user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     rate_limit(f'discord_resolve:{server_id}', 30, 60.0)
     raw = (q or '').strip()
     if not raw:
@@ -3955,7 +4046,7 @@ async def discord_server_roles(
     """Roles in the target server, for the giveaway Discord-task role dropdown.
     Only succeeds when the bot is in the target server. Returns just role id +
     name (nothing else about the server)."""
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail='Bot not ready yet')
     try:
@@ -3978,7 +4069,7 @@ async def giveaways_entries(
     giveaway_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'giveaway')
+    await require_module_access(user, server_id, 'giveaway')
     _check_giveaway_owner(giveaway_id, server_id)
     rows = db_list_giveaway_entries(giveaway_id, server_id)
     return {
@@ -4240,7 +4331,7 @@ def _radar_mask_topic(row: dict) -> dict:
 async def radar_settings_get(
     server_id: int, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     glob = db_get_radar_settings(server_id)
     topics_raw = db_list_radar_topic_settings(server_id)
     return {
@@ -4438,7 +4529,7 @@ async def radar_settings_patch(
     body: _RadarSettingsUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     rate_limit(f'radar_settings:{server_id}', 60, 60.0)
 
     payload = body.model_dump(exclude_unset=True, by_alias=False)
@@ -4495,7 +4586,7 @@ async def radar_watchlist_list(
     asset_kind: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     kind = (asset_kind or '').strip().lower() or None
     if kind and kind not in _RADAR_ALL_KINDS:
         raise HTTPException(status_code=400, detail=f'unknown asset_kind: {kind}')
@@ -4537,7 +4628,7 @@ async def radar_watchlist_add(
     body: _RadarWatchlistCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     rate_limit(f'radar_watchlist:{server_id}', 30, 60.0)
 
     kind  = (body.asset_kind or '').strip().lower()
@@ -4763,7 +4854,7 @@ async def radar_watchlist_delete(
     server_id: int, entry_id: int,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     ok = db_remove_radar_watchlist_entry(server_id, entry_id)
     if not ok:
         raise HTTPException(status_code=404, detail='entry not found')
@@ -4835,7 +4926,7 @@ async def radar_watchlist_resolve(
     dexscreener.com URL. NFT: a '<chain>:<slug>' (or a separate `chain` plus a
     `query` slug). Returns a snapshot preview so the admin can confirm before
     saving via POST /watchlist."""
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     rate_limit(f'radar_resolve:{server_id}', 30, 60.0)
 
     kind = (body.get('kind') or body.get('topic') or 'meme').strip().lower()
@@ -4914,7 +5005,7 @@ async def radar_search_asset(
     NFT via OpenSea (resolves a 'chain:slug' directly — OpenSea has no fuzzy
     name search); Forex via Frankfurter /currencies (filtered). Memecoin uses
     paste-and-resolve (see /watchlist/resolve)."""
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     rate_limit(f'radar_search:{server_id}', 30, 60.0)
     kind = (kind or 'crypto').strip().lower()
     query = (q or '').strip()
@@ -4981,7 +5072,7 @@ async def radar_preview(
     user: dict = Depends(get_current_user),
 ):
     """Current cache snapshot for the dashboard live-preview card."""
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     kind = (kind or 'crypto').strip().lower()
     ident = (identifier or '').strip().lower()
     if not ident:
@@ -5028,7 +5119,7 @@ async def radar_preview_refresh(
     field `topic` scopes the refresh to a single kind; omitted/null
     refreshes every kind that has watchlist entries. Rate-limited
     per-user AND per-guild."""
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     uid = int(user.get('user_id') or user.get('id') or 0)
     if uid:
         rate_limit(f'radar_preview_refresh_u:{uid}', 4, 60.0)
@@ -5102,8 +5193,8 @@ async def radar_digest_send_now(
     """Admin-triggered immediate per-topic digest. Body: {"topic":
     "crypto"|"nft"|"meme"|"forex"}. Per-(guild, topic) 5/UTC-day cap +
     5-min cooldown. Quota is consumed ONLY on successful send."""
-    require_guild_admin(user, server_id)
-    require_module_access(user, server_id, 'radar')
+    await require_guild_admin(user, server_id)
+    await require_module_access(user, server_id, 'radar')
 
     topic = ((body or {}).get('topic') or '').strip().lower()
     if topic not in _RADAR_TOPIC_NAMES:
@@ -5223,7 +5314,7 @@ async def radar_alerts_recent(
     limit: int = 50,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'radar')
+    await require_module_access(user, server_id, 'radar')
     rows = db_list_recent_radar_alerts(server_id, limit=max(1, min(int(limit), 200)))
     out = []
     for r in rows:
@@ -5295,7 +5386,7 @@ class _RaidManualCheck(BaseModel):
 
 @app.get('/api/servers/{server_id}/raid/settings')
 async def raid_get_settings(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     from cogs.raidbot import LIVE_VERIFICATION_GUILD_IDS as _LIVE_VER_GUILDS
     s = db_get_raid_settings(server_id)
     return {
@@ -5309,7 +5400,7 @@ async def raid_get_settings(server_id: int, user: dict = Depends(get_current_use
 async def raid_update_settings(
     server_id: int, body: _RaidSettingsUpdate, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
 
     ratio_keys = {'point_ratio_like', 'point_ratio_comment', 'point_ratio_retweet'}
@@ -5338,7 +5429,7 @@ async def raid_list(
     limit: int = 50,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     raids = db_list_guild_raids(server_id, status=status, limit=min(limit, 200))
     for r in raids:
         with get_connection() as conn:
@@ -5354,7 +5445,7 @@ async def raid_list(
 async def raid_create(
     server_id: int, body: _RaidCreate, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     _validate_tweet_url(body.tweet_url)
 
     if body.total_points < 1:
@@ -5427,7 +5518,7 @@ async def raid_create(
 async def raid_end(
     server_id: int, raid_id: int, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     raid = db_get_guild_raid(raid_id, server_id)
     if not raid:
         raise HTTPException(status_code=404, detail='Raid not found')
@@ -5439,7 +5530,7 @@ async def raid_end(
 async def raid_leaderboard_api(
     server_id: int, limit: int = 10, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     return {'leaderboard': db_get_raid_leaderboard(server_id, min(limit, 100))}
 
 
@@ -5451,7 +5542,7 @@ async def raid_verification_log(
     user: dict = Depends(get_current_user),
 ):
     """Return aggregated verification flags — one row per (user, raid) with task details."""
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     guild = bot.get_guild(server_id) if bot.is_ready() else None
 
     having_clause = (
@@ -5504,7 +5595,7 @@ async def raid_verification_log(
 async def raid_manual_check(
     server_id: int, body: _RaidManualCheck, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     print(f'[raid] manual-check endpoint: server={server_id} raid_id={body.raid_id} identifier={body.identifier!r}')
 
     is_unlimited = server_id in _UNLIMITED_MC_GUILDS
@@ -5538,7 +5629,7 @@ async def raid_manual_check(
 
 @app.get('/api/servers/{server_id}/raid/scraping-health')
 async def raid_scraping_health(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     try:
         from cogs._twitter import get_scraping_health
         return get_scraping_health()
@@ -5548,7 +5639,7 @@ async def raid_scraping_health(server_id: int, user: dict = Depends(get_current_
 
 @app.post('/api/servers/{server_id}/raid/send-guide')
 async def raid_send_guide(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'raid')
+    await require_module_access(user, server_id, 'raid')
     settings = db_get_raid_settings(server_id)
 
     if not bot.is_ready():
@@ -5612,7 +5703,7 @@ async def raid_guide_defaults():
 @app.get('/api/servers/{server_id}/assets')
 async def list_assets(server_id: int, user: dict = Depends(get_current_user)):
     """List all non-deleted assets for this guild."""
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     return {'assets': db_list_guild_assets(server_id)}
 
 
@@ -5623,7 +5714,7 @@ async def upload_asset(
     user: dict = Depends(get_current_user),
 ):
     """Upload a file to R2 and record it in the assets library."""
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
 
     contents = await file.read()
     if not contents:
@@ -5673,7 +5764,7 @@ async def delete_asset(
     user: dict = Depends(get_current_user),
 ):
     """Soft-delete an asset record and remove it from R2."""
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
 
     record = db_soft_delete_asset(server_id, asset_id)
     if record is None:
@@ -5940,7 +6031,7 @@ _AMERETAVERSE_GID = 1199707792706117642
 
 @app.get('/api/servers/{server_id}/engage/pools')
 async def engage_pools_get(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     import json as _json
     from database import list_engage_pools, ensure_default_pool
     pools = list_engage_pools(server_id)
@@ -5964,7 +6055,7 @@ async def engage_pool_update(
     server_id: int, pool_id: int, body: dict,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     import json as _json
     from database import get_engage_pool_by_id, update_engage_pool
     pool = get_engage_pool_by_id(pool_id)
@@ -6128,7 +6219,7 @@ def _wallet_normalize_payload(payload: dict) -> dict:
 
 @app.get('/api/servers/{server_id}/wallet-collections')
 async def wallet_collections_list(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     from database import list_wallet_collections
     rows = list_wallet_collections(server_id)
     return {'collections': [_wallet_collection_to_dict(r) for r in rows]}
@@ -6140,7 +6231,7 @@ async def wallet_collections_create(
     body: _WalletCollectionCreate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     rate_limit(f'wallet_coll_create:{server_id}', 30, 60.0)
     from database import (
         create_wallet_collection, get_wallet_collection, WalletCollectionNameExists,
@@ -6172,7 +6263,7 @@ async def wallet_collections_create(
 async def wallet_collections_get(
     server_id: int, collection_id: int, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     from database import get_wallet_collection
     c = get_wallet_collection(collection_id, server_id)
     if c is None:
@@ -6186,7 +6277,7 @@ async def wallet_collections_update(
     body: _WalletCollectionUpdate,
     user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     rate_limit(f'wallet_coll_update:{server_id}', 120, 60.0)
     from database import (
         get_wallet_collection, update_wallet_collection, WalletCollectionNameExists,
@@ -6246,7 +6337,7 @@ async def wallet_collections_update(
 async def wallet_collections_delete(
     server_id: int, collection_id: int, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     rate_limit(f'wallet_coll_delete:{server_id}', 30, 60.0)
     from database import get_wallet_collection, delete_wallet_collection
     c = get_wallet_collection(collection_id, server_id)
@@ -6269,7 +6360,7 @@ async def wallet_collections_delete(
 async def wallet_collections_submissions(
     server_id: int, collection_id: int, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     from database import get_wallet_collection, list_wallet_submissions
     c = get_wallet_collection(collection_id, server_id)
     if c is None:
@@ -6307,7 +6398,7 @@ async def wallet_collections_submissions(
 async def wallet_collections_post(
     server_id: int, collection_id: int, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     rate_limit(f'wallet_coll_post:{server_id}', 30, 60.0)
     from database import get_wallet_collection
     c = get_wallet_collection(collection_id, server_id)
@@ -6347,7 +6438,7 @@ async def wallet_collections_post(
 async def wallet_collections_close(
     server_id: int, collection_id: int, user: dict = Depends(get_current_user),
 ):
-    require_module_access(user, server_id, 'engage')
+    await require_module_access(user, server_id, 'engage')
     rate_limit(f'wallet_coll_close:{server_id}', 30, 60.0)
     from database import get_wallet_collection, update_wallet_collection
     c = get_wallet_collection(collection_id, server_id)
@@ -6386,7 +6477,7 @@ async def wallet_collections_close(
 
 @app.get('/api/servers/{server_id}/settings')
 async def settings_get(server_id: int, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'settings')
+    await require_module_access(user, server_id, 'settings')
     bot_instance = _get_bot_instance()
     guild = bot_instance.get_guild(server_id)
     brand  = get_guild_settings(server_id)
@@ -6418,7 +6509,7 @@ async def settings_get(server_id: int, user: dict = Depends(get_current_user)):
 
 @app.put('/api/servers/{server_id}/settings/brand')
 async def settings_brand_update(server_id: int, body: dict, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'settings')
+    await require_module_access(user, server_id, 'settings')
     # Strip server-owned or read-only fields that must not be passed as kwargs
     for _strip in ('guild_id', 'updated_at'):
         body.pop(_strip, None)
@@ -6492,7 +6583,7 @@ async def settings_brand_update(server_id: int, body: dict, user: dict = Depends
 
 @app.put('/api/servers/{server_id}/settings/levels')
 async def settings_levels_update(server_id: int, body: dict, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'settings')
+    await require_module_access(user, server_id, 'settings')
     allowed = {
         'level_enabled', 'xp_per_message', 'xp_cooldown_seconds',
         'level_up_message_enabled', 'level_up_channel_id',
@@ -6525,7 +6616,7 @@ async def settings_levels_update(server_id: int, body: dict, user: dict = Depend
 
 @app.put('/api/servers/{server_id}/settings/access')
 async def settings_access_update(server_id: int, body: dict, user: dict = Depends(get_current_user)):
-    require_module_access(user, server_id, 'settings')
+    await require_module_access(user, server_id, 'settings')
     role_id = str(body.get('role_id', '')).strip()
     module  = str(body.get('module',  '')).strip()
     granted = bool(body.get('granted', False))
@@ -6695,7 +6786,7 @@ async def public_ameretaverse_overview(request: Request):
 
 @app.get('/api/servers/{server_id}/admin/points/user/{target_user_id}')
 async def admin_get_user_points(server_id: int, target_user_id: int, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     from database import get_raid_user_points, get_engage_user_points, list_engage_pools
     community = get_raid_user_points(server_id, target_user_id) or {'total_points': 0}
     pools = list_engage_pools(server_id)
@@ -6717,7 +6808,7 @@ async def admin_get_user_points(server_id: int, target_user_id: int, user: dict 
 
 @app.post('/api/servers/{server_id}/admin/points/adjust')
 async def admin_adjust_points(server_id: int, body: dict, user: dict = Depends(get_current_user)):
-    require_guild_admin(user, server_id)
+    await require_guild_admin(user, server_id)
     from database import (
         upsert_raid_user_points, get_raid_user_points,
         upsert_engage_user_points, get_engage_user_points,
